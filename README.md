@@ -719,6 +719,60 @@ cd ../frontend && npm install && npm run build
 pm2 restart 9drive-backend
 ```
 
+## WebDAV (Read-Only) Access for rclone & Jellyfin
+
+9Drive exposes its **database-backed virtual filesystem** (virtual folders + files, not the physical Google Drive layout) over a read-only WebDAV endpoint for external clients such as rclone and Jellyfin.
+
+### Setup
+
+Set a shared password in the backend environment:
+
+```env
+WEBDAV_PASSWORD=replace-with-a-long-random-password
+```
+
+When `WEBDAV_PASSWORD` is blank/unset, the WebDAV interface is disabled (endpoint returns `503`).
+
+The WebDAV endpoint is served by the backend at:
+
+```txt
+http://<host>:4000/webdav
+```
+
+Authentication uses HTTP Basic auth with **any username** and the shared `WEBDAV_PASSWORD` as the password.
+
+### rclone
+
+Add a WebDAV remote:
+
+```bash
+rclone config create 9drive webdav \
+  url http://localhost:4000/webdav \
+  vendor other \
+  user 9drive \
+  pass $(rclone obscure 'your-webdav-password')
+```
+
+Then mount or copy:
+
+```bash
+rclone mount 9drive:/ ~/9drive-mount
+rclone ls 9drive:/
+```
+
+### Jellyfin
+
+1. Dashboard → **Libraries** → **Add Media Library**.
+2. Choose **WebDAV** as the media folder type.
+3. Enter `http://<host>:4000/webdav` as the folder URL, with any username and the shared WebDAV password.
+4. Scan and browse the virtual folder/file tree.
+
+### Security notes
+
+- The WebDAV interface is **read-only**: write methods (PUT, MKCOL, DELETE, MOVE, COPY, PROPPATCH) are rejected.
+- With a single shared password, the WebDAV tree shows files/folders from **all users** of the 9Drive instance. Use this feature only for **single-tenant / trusted deployments**, or put the endpoint behind a VPN/reverse-proxy with access control.
+- Prefer `https` in production; credentials are sent with Basic auth (base64, not encrypted).
+
 ## Build
 
 Backend:
