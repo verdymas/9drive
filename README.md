@@ -660,6 +660,7 @@ Upload is `multipart/form-data`. Metadata fields should be appended before the f
 Remote imports (requires `Authorization: Bearer <token>`):
 
 ```txt
+POST   /remote-imports/probe          Detect remote filename + metadata (server-side)
 POST   /remote-imports                Start a new import from a URL
 GET    /remote-imports                List my imports (cursor pagination)
 GET    /remote-imports/:id            Get one import

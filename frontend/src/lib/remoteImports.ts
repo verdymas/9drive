@@ -32,8 +32,35 @@ export type CreateRemoteImportInput = {
   url: string
   folderId?: string | null
   connectedAccountId?: string | null
+  /** User-entered filename (wins over any detection). */
   fileName?: string | null
+  /** Server-side detected filename from the probe (fallback when no custom). */
+  detectedFileName?: string | null
   mimeType?: string | null
+}
+
+export type ProbeResult = {
+  originalUrl: string
+  finalUrl: string
+  fileName: string
+  fileNameSource: 'content-disposition-filename-star' | 'content-disposition-filename' | 'final-url-path' | 'original-url-path' | 'generated-fallback'
+  mimeType: string | null
+  contentLength: number | null
+  supportsRange: boolean
+}
+
+/**
+ * Ask the backend to inspect a remote URL (server-side only — the browser
+ * never contacts the remote host). `signal` lets the caller cancel a
+ * superseded probe; an aborted fetch rejects with an AbortError which the
+ * modal ignores.
+ */
+export function probeRemoteUrl(url: string, signal?: AbortSignal) {
+  return apiFetch<{ data: ProbeResult }>('/remote-imports/probe', {
+    method: 'POST',
+    body: JSON.stringify({ url }),
+    signal,
+  })
 }
 
 export function createRemoteImport(input: CreateRemoteImportInput) {

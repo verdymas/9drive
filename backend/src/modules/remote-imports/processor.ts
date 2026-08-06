@@ -41,13 +41,13 @@ async function updateStage(importId: string, stage: Stage, progress: Record<stri
 }
 
 /** Throttle a stage-update call to REMOTE_IMPORT_PROGRESS_UPDATE_INTERVAL_MS. */
-function throttledProgressUpdater(importId: string) {
+function throttledProgressUpdater(importId: string, stage: Stage) {
   let lastWrite = 0
   return async (progress: Record<string, unknown>) => {
     const now = Date.now()
     if (now - lastWrite < env.REMOTE_IMPORT_PROGRESS_UPDATE_INTERVAL_MS) return
     lastWrite = now
-    await updateStage(importId, STAGES.DOWNLOADING, progress)
+    await updateStage(importId, stage, progress)
   }
 }
 
@@ -85,7 +85,7 @@ async function downloadToTemp(importId: string, startUrl: string, maxBytes: bigi
       }
 
       const fileStream = appendStreamToTemp(partPath)
-      const writeProgress = throttledProgressUpdater(importId)
+      const writeProgress = throttledProgressUpdater(importId, STAGES.DOWNLOADING)
 
       try {
         for await (const chunk of res.body) {
@@ -99,6 +99,9 @@ async function downloadToTemp(importId: string, startUrl: string, maxBytes: bigi
           }
           await writeProgress({ downloadedBytes: totalBytes.toString() })
         }
+        // Final write is NOT throttled: the bar reaches 100% the moment the
+        // download finishes rather than up to one interval later.
+        await updateStage(importId, STAGES.DOWNLOADING, { downloadedBytes: totalBytes.toString() })
         await new Promise<void>((resolve, reject) => fileStream.end((err: Error | null) => (err ? reject(err) : resolve())))
       } catch (error) {
         fileStream.destroy()
@@ -113,7 +116,16 @@ async function downloadToTemp(importId: string, startUrl: string, maxBytes: bigi
 }
 
 /** Stream the temp part file into the destination provider and return provider metadata. */
-async function uploadTempFile(importId: string, account: { id: string; provider: string }, userId: string, folderId: string | null, fileName: string, mimeType: string, tempPartPath: string) {
+async function uploadTempFile(
+  importId: string,
+  account: { id: string; provider: string },
+  userId: string,
+  folderId: string | null,
+  fileName: string,
+  mimeType: string,
+  tempPartPath: string,
+  onUploadProgress?: (uploadedBytes: bigint) => void,
+) {
   const fileStream = fs.createReadStream(tempPartPath)
   await updateStage(importId, STAGES.UPLOADING)
 
@@ -125,6 +137,10 @@ async function uploadTempFile(importId: string, account: { id: string; provider:
     const providerFileId = buildS3ObjectKey(config, userId, provisionalFile.id, fileName)
     try {
       await uploadS3Object(config, providerFileId, fileStream, mimeType)
+      // S3 has no granular progress hook — this final write makes the bar
+      // reach 100% the moment the object lands, before registration.
+      const s3Size = BigInt((await fsp.stat(tempPartPath)).size)
+      await prisma.remoteImport.update({ where: { id: importId }, data: { uploadedBytes: s3Size } }).catch(() => undefined)
       await prisma.file.update({ where: { id: provisionalFile.id }, data: { providerFileId, status: 'active' } })
       return { providerFileId, fileId: provisionalFile.id }
     } catch (error) {
@@ -134,8 +150,12 @@ async function uploadTempFile(importId: string, account: { id: string; provider:
   }
 
   // Google Drive — resumable upload streams the temp file directly, records
-  // the session encrypted (for crash-resume), and returns provider metadata.
-  const uploaded = await uploadToGoogleResumable(importId, account.id, userId, folderId, fileName, mimeType, tempPartPath)
+  // the session encrypted (for crash-safe), and returns provider metadata.
+  // Upload progress is throttled like download progress to keep the UI live.
+  const uploadProgress = throttledProgressUpdater(importId, STAGES.UPLOADING)
+  const uploaded = await uploadToGoogleResumable(importId, account.id, userId, folderId, fileName, mimeType, tempPartPath, (bytes) => {
+    void uploadProgress({ uploadedBytes: bytes.toString() })
+  })
   return { providerFileId: uploaded.providerFileId, fileId: null }
 }
 

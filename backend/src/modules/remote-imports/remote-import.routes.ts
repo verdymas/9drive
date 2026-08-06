@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
 import { AppError } from '../../utils/app-error.js'
+import { probeRemoteUrl } from './probe.js'
 import {
   cancelRemoteImport,
   createRemoteImport,
@@ -14,6 +15,27 @@ import {
 
 export const remoteImportRouter = Router()
 
+/**
+ * Probe a remote URL for filename + metadata without downloading the file.
+ * Registered BEFORE the `/:id` routes so the literal segment `probe` never
+ * matches a record id. Authenticated; the probe is user-scoped by design (no
+ * record is touched). The returned URLs have sensitive query params redacted.
+ */
+remoteImportRouter.post('/probe', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const body = z.object({
+      url: z.string().min(1).max(4096),
+    }).parse(req.body)
+
+    const result = await probeRemoteUrl(body.url, req.user!.id)
+    return res.json({ data: result })
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ code: 'INVALID_REQUEST', message: error.issues[0]?.message ?? 'Invalid request.' })
+    if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
+    return next(error)
+  }
+})
+
 remoteImportRouter.post('/', requireAuth, async (req: AuthRequest, res, next) => {
   try {
     const body = z.object({
@@ -21,6 +43,9 @@ remoteImportRouter.post('/', requireAuth, async (req: AuthRequest, res, next) =>
       folderId: z.string().nullable().optional(),
       connectedAccountId: z.string().nullable().optional(),
       fileName: z.string().max(255).nullable().optional(),
+      // Server-side detected name from the probe; used only when the user did
+      // not type one. Never trusted as-is — sanitized again at creation.
+      detectedFileName: z.string().max(255).nullable().optional(),
       mimeType: z.string().max(191).nullable().optional(),
     }).parse(req.body)
 
@@ -30,6 +55,7 @@ remoteImportRouter.post('/', requireAuth, async (req: AuthRequest, res, next) =>
       folderId: body.folderId,
       connectedAccountId: body.connectedAccountId,
       fileName: body.fileName,
+      detectedFileName: body.detectedFileName,
       mimeType: body.mimeType,
     })
     return res.status(201).json(serializeRemoteImport(created))

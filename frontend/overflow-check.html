@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Remote Imports overflow check harness</title>
+  <script src="https://cdn.tailwindcss.com/3.4.16"></script>
+  <style>
+    /* Reproduce the app's structural base: body overflow hidden like DriveLayout's
+       <main> and the section that hosts the page. */
+    body { margin: 0; background: #fafcfd; }
+    .page-main { overflow-x: hidden; }
+    .page-section { min-width: 0; flex: 1 1 0%; max-width: 100%; }
+    .app-row { display: flex; min-height: 100vh; }
+    .sidebar { width: 16rem; flex-shrink: 0; background: #f8fafc; border-right: 1px solid #e2e8f0; padding: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="app-row">
+    <aside class="sidebar">
+      <p class="font-bold text-slate-800">9Drive</p>
+      <p class="text-xs text-slate-500">Sidebar (persistent)</p>
+      <p class="mt-4 text-xs text-slate-400">All Files</p>
+      <p class="mt-1 text-xs text-slate-400">Quota Tracker</p>
+      <p class="mt-1 text-xs text-slate-400">Remote Imports</p>
+    </aside>
+
+    <main class="page-main min-h-screen w-full bg-white">
+      <div class="app-row flex-col lg:h-screen lg:flex-row lg:overflow-hidden">
+        <section class="page-section p-4 sm:p-6 lg:p-8">
+          <header class="flex w-full min-w-0 flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <h1 class="text-xl font-extrabold text-slate-900">Remote Imports</h1>
+            <button class="rounded-xl bg-blue-600 px-3 py-2 text-sm font-semibold text-white">Import from URL</button>
+          </header>
+
+          <div class="mt-4 rounded-2xl border border-slate-200 bg-white p-4 sm:p-5">
+            <!-- grid-cols-[minmax(0,1fr)] like the real page -->
+            <div class="grid grid-cols-[minmax(0,1fr)] gap-3">
+              <!-- 1. LONG FILENAME + LONG SIGNED URL + COMPLETED -->
+              <div class="w-full max-w-full min-w-0 overflow-hidden rounded-2xl border border-slate-100 bg-slate-50/60 p-3 sm:p-3.5">
+                <div class="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start">
+                  <div class="min-w-0 max-w-full flex-1">
+                    <div class="flex min-w-0 items-center gap-2">
+                      <p class="min-w-0 flex-1 truncate text-sm font-extrabold text-slate-900" title="ultra-very-very-long-filename-${'x'.repeat(300)}.mkv">ultra-very-very-long-filename-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.mkv</p>
+                      <span class="shrink-0 rounded-full bg-emerald-50 px-2.5 py-0.5 text-[11px] font-bold text-emerald-700">Completed</span>
+                    </div>
+                    <p class="mt-1 min-w-0 truncate text-xs text-slate-400" title="files.example.com/download/…">files.example.com/download/…</p>
+                    <p class="mt-0.5 min-w-0 truncate text-xs text-slate-500">Created Aug 6, 2026 · 1.35 GB</p>
+                  </div>
+                  <div class="flex shrink-0 flex-wrap items-center gap-1.5">
+                    <button class="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-sm font-semibold text-slate-950" aria-label="Delete remote import ultra-long-file">×</button>
+                  </div>
+                </div>
+                <div class="mt-2.5 flex min-w-0 w-full max-w-full items-center gap-3">
+                  <div class="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-slate-200"><div class="h-full rounded-full bg-emerald-500" style="width:100%"></div></div>
+                  <span class="shrink-0 text-right text-[11px] font-bold text-slate-500">Complete</span>
+                </div>
+              </div>
+
+              <!-- 2. FAILED WITH LONG ERROR MESSAGE + RETRY -->
+              <div class="w-full max-w-full min-w-0 overflow-hidden rounded-2xl border border-slate-100 bg-slate-50/60 p-3 sm:p-3.5">
+                <div class="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start">
+                  <div class="min-w-0 max-w-full flex-1">
+                    <div class="flex min-w-0 items-center gap-2">
+                      <p class="min-w-0 flex-1 truncate text-sm font-extrabold text-slate-900">failed-import.mkv</p>
+                      <span class="shrink-0 rounded-full bg-red-50 px-2.5 py-0.5 text-[11px] font-bold text-red-700">Failed</span>
+                    </div>
+                    <p class="mt-1 min-w-0 truncate text-xs text-slate-400">cdn.example.com/videos/…</p>
+                    <p class="mt-0.5 min-w-0 truncate text-xs text-slate-500">Created Aug 6, 2026 · 2.10 GB</p>
+                  </div>
+                  <div class="flex shrink-0 flex-wrap items-center gap-1.5">
+                    <button class="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-sm font-semibold text-slate-950">Retry</button>
+                    <button class="rounded-xl px-3 py-1.5 text-sm font-semibold text-orange-600" aria-label="Delete remote import failed-import.mkv">×</button>
+                  </div>
+                </div>
+                <p class="mt-2 line-clamp-2 break-words rounded-xl bg-red-50 p-2 text-xs font-semibold text-red-700" style="overflow-wrap:anywhere">The remote server returned an error while downloading the requested resource: connection timed out after 30000ms at address 10.0.0.254 port 443 after 3 retries with exponential backoff (error code: DOWNLOAD_HTTP_ERROR). The source URL could not be fetched because the remote host failed to respond within the configured idle timeout window and closed the connection.</p>
+              </div>
+
+              <!-- 3. ACTIVE DOWNLOAD + CANCEL + PROGRESS -->
+              <div class="w-full max-w-full min-w-0 overflow-hidden rounded-2xl border border-slate-100 bg-slate-50/60 p-3 sm:p-3.5">
+                <div class="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start">
+                  <div class="min-w-0 max-w-full flex-1">
+                    <div class="flex min-w-0 items-center gap-2">
+                      <p class="min-w-0 flex-1 truncate text-sm font-extrabold text-slate-900">active-download.zip</p>
+                      <span class="shrink-0 rounded-full bg-blue-50 px-2.5 py-0.5 text-[11px] font-bold text-blue-700">Downloading</span>
+                    </div>
+                    <p class="mt-1 min-w-0 truncate text-xs text-slate-400">dl.example.com/archive/…</p>
+                    <p class="mt-0.5 min-w-0 truncate text-xs text-slate-500">Created Aug 6, 2026 · 512.00 MB</p>
+                  </div>
+                  <div class="flex shrink-0 flex-wrap items-center gap-1.5">
+                    <button class="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-sm font-semibold text-slate-950">Cancel</button>
+                    <button class="rounded-xl px-3 py-1.5 text-sm font-semibold text-orange-600" aria-label="Delete remote import active-download.zip">×</button>
+                  </div>
+                </div>
+                <div class="mt-2.5 flex min-w-0 w-full max-w-full items-center gap-3">
+                  <div class="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-slate-200"><div class="h-full rounded-full bg-blue-600" style="width:42%"></div></div>
+                  <span class="shrink-0 text-right text-[11px] font-bold text-slate-500">42% · 215.04 MB</span>
+                </div>
+              </div>
+
+              <!-- 4. QUEUED + UNKNOWN LENGTH (no bar) -->
+              <div class="w-full max-w-full min-w-0 overflow-hidden rounded-2xl border border-slate-100 bg-slate-50/60 p-3 sm:p-3.5">
+                <div class="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start">
+                  <div class="min-w-0 max-w-full flex-1">
+                    <div class="flex min-w-0 items-center gap-2">
+                      <p class="min-w-0 flex-1 truncate text-sm font-extrabold text-slate-900">queued-no-length.bin</p>
+                      <span class="shrink-0 rounded-full bg-slate-100 px-2.5 py-0.5 text-[11px] font-bold text-slate-600">Queued</span>
+                    </div>
+                    <p class="mt-1 min-w-0 truncate text-xs text-slate-400">unknown.example.com/data/…</p>
+                    <p class="mt-0.5 min-w-0 truncate text-xs text-slate-500">Created Aug 6, 2026</p>
+                  </div>
+                  <div class="flex shrink-0 flex-wrap items-center gap-1.5">
+                    <button class="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-sm font-semibold text-slate-950">Cancel</button>
+                    <button class="rounded-xl px-3 py-1.5 text-sm font-semibold text-orange-600" aria-label="Delete remote import queued-no-length.bin">×</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <pre id="results" style="display:none"></pre>
+  <script>
+    // Measure every viewport dimension required by the spec and report
+    // overflow violations. Results are written into the DOM so headless
+    // Chrome --dump-dom can extract them.
+    function report() {
+      const results = {
+        viewport: [window.innerWidth, window.innerHeight],
+        documentScrollWidth: document.documentElement.scrollWidth,
+        documentClientWidth: document.documentElement.clientWidth,
+        mainScrollWidth: document.querySelector('.page-main').scrollWidth,
+        mainClientWidth: document.querySelector('.page-main').clientWidth,
+        cards: [],
+      }
+      document.querySelectorAll('.overflow-hidden.rounded-2xl').forEach((card) => {
+        results.cards.push({
+          scrollWidth: card.scrollWidth,
+          clientWidth: card.clientWidth,
+          overflow: card.scrollWidth > card.clientWidth,
+        })
+      })
+      results.documentOverflow = results.documentScrollWidth > results.documentClientWidth
+      results.mainOverflow = results.mainScrollWidth > results.mainClientWidth
+      document.getElementById('results').textContent = 'RESULTS:' + JSON.stringify(results)
+    }
+    window.addEventListener('load', report)
+  </script>
+</body>
+</html>

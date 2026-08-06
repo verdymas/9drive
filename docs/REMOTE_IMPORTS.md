@@ -20,17 +20,21 @@ User pastes URL ──► API validates (SSRF gate) ──► BullMQ queue (Redi
 
 ## How it works
 
-1. `POST /remote-imports` with `{ url, folderId?, connectedAccountId?, fileName? }`.
+1. While the user types a URL in the modal, the frontend calls
+   `POST /remote-imports/probe` (debounced ~500 ms) so the **backend** detects
+   the remote file's name — the browser never contacts the remote host. See
+   [Filename detection](#filename-detection) below. The detected name is
+   pre-filled into the File Name field, but a name the user types always wins
+   and is never overwritten by a later probe.
+2. `POST /remote-imports` with `{ url, folderId?, connectedAccountId?, fileName?, detectedFileName? }`.
    The URL is validated immediately (scheme, credentials, DNS) and the source
-   URL is stored **encrypted** (`sourceUrlEncrypted`).
-2. A BullMQ job is enqueued with `jobId = importId` (idempotent — retrying the
+   URL is stored **encrypted** (`sourceUrlEncrypted`). The effective filename
+   is: `fileName` (user) → `detectedFileName` (server probe) → derived from the
+   URL — and is always run through the shared filename sanitizer.
+3. A BullMQ job is enqueued with `jobId = importId` (idempotent — retrying the
    request never double-enqueues).
-3. The dedicated **remote-import-worker** process (separate container/service)
+4. The dedicated **remote-import-worker** process (separate container/service)
    picks the job up:
-   - **Probe** — a `Range: bytes=0-0` GET (redirects followed with per-hop SSRF
-     validation) to learn `Content-Length` and whether the server supports
-     range requests. If a server ignores the range and streams the whole body,
-     the probe aborts after the first chunk.
    - **Download** — streams the body to a temp file on a **shared volume**,
      enforcing the max-size cap while streaming and an idle timeout.
    - **Select storage** — automatic routing (most-available / round-robin /
@@ -43,7 +47,7 @@ User pastes URL ──► API validates (SSRF gate) ──► BullMQ queue (Redi
    - **Cleanup** — the temp file is always removed, even on failure. Stale
      temp files are swept by the worker's periodic sweeper
      (`REMOTE_IMPORT_TEMP_RETENTION_HOURS`).
-4. Status (`queued | processing | completed | failed | cancelled`) and stage
+5. Status (`queued | processing | completed | failed | cancelled`) and stage
    (`probing | downloading | ... | finished`) plus byte progress are written to
    the `remote_imports` row so the frontend can poll cheaply.
 
@@ -54,11 +58,14 @@ incremented). Both cancel and retry require the job to belong to the caller.
 ## API
 
 All endpoints require `Authorization: Bearer <token>` and are user-scoped —
-you can never read or mutate another user's import.
+you can never read or mutate another user's import. See the comment in
+`remote-import.routes.ts` — the `/probe` route is registered before the
+`/:id` routes so the literal segment `probe` never matches a record id.
 
 | Method | Path | Body | Returns |
 | --- | --- | --- | --- |
-| `POST` | `/remote-imports` | `{ url, folderId?, connectedAccountId?, fileName?, mimeType? }` | The created import |
+| `POST` | `/remote-imports/probe` | `{ url }` | `{ data: { originalUrl, finalUrl, fileName, fileNameSource, mimeType, contentLength, supportsRange } }` |
+| `POST` | `/remote-imports` | `{ url, folderId?, connectedAccountId?, fileName?, detectedFileName?, mimeType? }` | The created import |
 | `GET` | `/remote-imports?limit=&cursor=` | — | `{ items, cursor }` (cursor pagination, newest first) |
 | `GET` | `/remote-imports/:id` | — | The import |
 | `POST` | `/remote-imports/:id/cancel` | — | The import, now `cancelled` |
@@ -115,6 +122,42 @@ Error responses are stable JSON: `{ "code": "...", "message": "..." }`.
 | `NO_ACCOUNT_WITH_ENOUGH_SPACE` | No storage account with enough free quota |
 | `IMPORT_TIMEOUT` | Import exceeded `REMOTE_IMPORT_JOB_TIMEOUT_HOURS` (enforced between phases) |
 | `IMPORT_FAILED` | Generic worker failure |
+
+## Filename detection
+
+`POST /remote-imports/probe` runs entirely server-side (the browser never
+contacts the remote host — a HEAD from the browser would lose the
+`Content-Disposition` header to CORS anyway). The probe:
+
+1. validates the URL through the same SSRF gate as the downloader,
+2. sends a **HEAD**; if that is rejected (405/network) or its headers carry no
+   `Content-Disposition` filename, sends **one** `GET` with `Range: bytes=0-0`.
+   A server that ignores the range and streams the whole body is aborted after
+   the first chunk — the full file is never downloaded,
+3. reads the **final** response's headers (an intermediate redirect's
+   `Content-Disposition` never wins),
+4. returns `{ originalUrl, finalUrl, fileName, fileNameSource, mimeType,
+   contentLength, supportsRange }`; sensitive query parameters are redacted
+   from the returned URLs.
+
+Filename resolution order (exact):
+
+1. `Content-Disposition: filename*` (RFC 5987/8187, UTF-8 only)
+2. `Content-Disposition: filename` (quoted or unquoted token)
+3. last usable pathname segment of the **final** redirected URL
+4. last usable pathname segment of the **original** URL
+5. generated `remote-file-<shortId>` (an extension is only appended when it
+   cannot duplicate one already present)
+
+`fileNameSource` is one of `content-disposition-filename-star` /
+`content-disposition-filename` / `final-url-path` / `original-url-path` /
+`generated-fallback`. Every detected name is passed through the shared
+`sanitizeFileName` (NFC normalization, null bytes / control characters /
+path separators / traversal components / Windows-illegal characters and
+device names removed, trailing dots/spaces trimmed, length capped, never
+empty). The filename never influences the temp-file path — staging is keyed
+by import id only. At import creation the same sanitizer runs again on the
+effective name (user `fileName` wins over the probe's `detectedFileName`).
 
 ## SSRF protection (mandatory)
 
@@ -210,6 +253,15 @@ The API itself always runs inside the main backend process.
   URL (required), file name (optional, auto-detected), destination virtual
   folder (defaults to the folder you are in), storage account (default
   **Automatic** routing).
+- The modal calls `POST /remote-imports/probe` (debounced ~500 ms) while a
+  valid URL is present. While the probe runs it shows a **Detecting file
+  name...** spinner; when it succeeds it pre-fills the File Name field and
+  shows the source (**Detected from server header** / **Detected from URL**).
+  A name the user types is never overwritten by a later probe response (the
+  modal tracks a manual-edit flag and drops stale responses via an
+  AbortController + probe token). Probe failure shows **File name could not
+  be detected. Enter it manually.** — it never blocks starting an import, and
+  raw internal errors, signed URLs, IPs and stack traces are never displayed.
 - **Storage → Remote Imports** page lists your imports with live progress
   bars (polled every 3 s while anything is active), stage labels
   (`Checking URL`, `Downloading`, …), and per-item actions:

@@ -15,7 +15,11 @@ export type CreateRemoteImportInput = {
   sourceUrl: string
   folderId?: string | null
   connectedAccountId?: string | null
+  /** User-entered filename. When supplied it wins over any server detection. */
   fileName?: string | null
+  /** Server-side detected filename (from the probe), used when the user did
+   *  not type one. Always re-sanitized at creation — never trusted as-is. */
+  detectedFileName?: string | null
   mimeType?: string | null
 }
 
@@ -41,7 +45,12 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
     if (!account) throw new AppError('ACCOUNT_NOT_FOUND', 'The storage account does not exist.', 404)
   }
 
-  const fileName = sanitizeFileName(input.fileName ?? deriveFileName(input.sourceUrl))
+  // Filename precedence: an explicitly user-supplied name always wins over a
+  // server-detected one (the probe result is a convenience, never a mandate),
+  // and the winner is sanitized AGAIN here — a probe could have happened long
+  // ago or the header could have changed between probe and import creation.
+  const rawFileName = input.fileName?.trim() || input.detectedFileName || deriveFileName(input.sourceUrl)
+  const fileName = sanitizeFileName(rawFileName)
   if (fileName.length > MAX_NAME) throw new AppError('FILE_NAME_TOO_LONG', 'The file name is too long.', 400)
 
   const created = await prisma.remoteImport.create({
@@ -97,14 +106,22 @@ function displayUrl(sourceUrl: string) {
   }
 }
 
-/** Serialize a remote import row for API responses (BigInt → string). */
+/**
+ * Serialize a remote import row for API responses (BigInt → string).
+ *
+ * The final `file` relation is included in list responses and carries its own
+ * `sizeBytes` BigInt — the spread below already keeps the mapped row, and
+ * without a `toString()` here it would survive to `res.json()` and fail
+ * JSON serialization (Node: "Do not know how to serialize a BigInt").
+ */
 export function serializeRemoteImport(importRow: any) {
-  const { sourceUrlEncrypted: _url, finalUrlEncrypted: _final, resumeSessionEncrypted: _session, internalError: _internal, ...rest } = importRow
+  const { sourceUrlEncrypted: _encrypted, finalUrlEncrypted: _final, resumeSessionEncrypted: _session, internalError: _internal, ...rest } = importRow
   return {
     ...rest,
     totalBytes: importRow.totalBytes?.toString() ?? null,
     downloadedBytes: importRow.downloadedBytes.toString(),
     uploadedBytes: importRow.uploadedBytes.toString(),
+    file: importRow.file ? { ...importRow.file, sizeBytes: importRow.file.sizeBytes.toString() } : null,
   }
 }
 

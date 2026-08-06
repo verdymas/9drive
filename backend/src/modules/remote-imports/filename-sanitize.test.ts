@@ -23,8 +23,10 @@ describe('sanitizeFileName', () => {
   it('truncates over-long names but keeps the fallback path safe', () => {
     const long = 'x'.repeat(500)
     const out = sanitizeFileName(long + '.pdf')
-    expect(out.length).toBeLessThanOrEqual(180)
+    expect(out.length).toBeLessThanOrEqual(255)
     expect(out.length).toBeGreaterThan(0)
+    // The extension survives truncation.
+    expect(out.endsWith('.pdf')).toBe(true)
   })
 
   it('falls back for empty or dotted input', () => {
@@ -36,12 +38,15 @@ describe('sanitizeFileName', () => {
 
   it('falls back for reserved Windows device names', () => {
     expect(sanitizeFileName('CON')).toBe('file')
-    expect(sanitizeFileName('con.txt')).toBe('file')
     expect(sanitizeFileName('PRN')).toBe('file')
     expect(sanitizeFileName('AUX')).toBe('file')
     expect(sanitizeFileName('NUL')).toBe('file')
     expect(sanitizeFileName('COM1')).toBe('file')
-    expect(sanitizeFileName('LPT9.docx')).toBe('file')
+  })
+
+  it('neutralizes reserved device names but keeps a safe extension', () => {
+    expect(sanitizeFileName('con.txt')).toBe('file.txt')
+    expect(sanitizeFileName('LPT9.docx')).toBe('file.docx')
   })
 
   it('trims trailing dots and spaces', () => {

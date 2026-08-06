@@ -37,6 +37,7 @@ export async function uploadToGoogleResumable(
   fileName: string,
   mimeType: string,
   tempPath: string,
+  onProgress?: (uploadedBytes: bigint) => void,
 ): Promise<GoogleResumableResult> {
   const account = await prisma.connectedAccount.findUniqueOrThrow({ where: { id: accountId } })
   const auth = await getAuthedGoogleClient(account)
@@ -73,18 +74,29 @@ export async function uploadToGoogleResumable(
   // Persist the session (encrypted) for potential resume.
   await prisma.remoteImport.update({ where: { id: importId }, data: { resumeSessionEncrypted: encryptText(sessionUri) } }).catch(() => undefined)
 
-  // 2. Stream the file body to the session with Content-Range.
+  // 2. Stream the file body to the session with Content-Range. Progress is
+  // reported from the Web stream's data events (throttled by the caller) so
+  // the UI can show a real upload percentage instead of 0% → 100%.
   const stream = fs.createReadStream(tempPath)
+  let uploaded = 0n
   const putHeaders = new Headers()
   putHeaders.set('Authorization', `Bearer ${token.token}`)
   putHeaders.set('Content-Type', mimeType)
   putHeaders.set('Content-Range', `bytes 0-${fileSize - 1}/${fileSize}`)
 
+  const webStream = Readable.toWeb(stream) as ReadableStream
+  const countingStream = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      uploaded += BigInt(chunk.byteLength)
+      onProgress?.(uploaded)
+      controller.enqueue(chunk)
+    },
+  })
   const putRes = await fetch(sessionUri, {
     method: 'PUT',
     headers: putHeaders,
     // Node 18+ supports web ReadableStream bodies; convert fs stream.
-    body: Readable.toWeb(stream) as ReadableStream,
+    body: webStream.pipeThrough(countingStream),
     duplex: 'half',
   } as any)
 

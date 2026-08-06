@@ -57,22 +57,34 @@ export async function prepareHop(startUrl: string): Promise<{ url: URL; dispatch
 }
 
 /**
- * Perform a GET that follows redirects with per-hop SSRF re-validation.
- * `startUrl` is validated synchronously; each `Location` is re-validated.
- * On the final hop the `onResponse` callback receives the readable body
- * (already validated) and its metadata. Returns the result of `onResponse`.
+ * Perform an HTTP request that follows redirects with per-hop SSRF
+ * re-validation. `startUrl` is validated synchronously; each `Location` is
+ * re-validated. On the final hop the `onResponse` callback receives the
+ * readable body (already validated), its metadata, and the final URL.
+ * Returns the result of `onResponse`, the final URL, and the redirect count.
  * `dispatcher` is closed after the terminal response (probe/drain-download).
+ *
+ * `method` defaults to GET; a different method (e.g. HEAD) is applied to every
+ * hop. HEAD responses have no body — the `body` callback argument is still an
+ * empty readable.
  */
 export async function followRemoteUrl<T>(
   startUrl: string,
   options: {
+    method?: 'GET' | 'HEAD'
     headers?: Record<string, string>
-    onResponse: (res: { statusCode: number; headers: Record<string, string>; body: AsyncIterable<Uint8Array> }) => Promise<T>
+    onResponse: (
+      res: { statusCode: number; headers: Record<string, string>; body: AsyncIterable<Uint8Array> },
+      finalUrl: string,
+    ) => Promise<T>
   },
-): Promise<{ result: T; finalUrl: string }> {
+): Promise<{ result: T; finalUrl: string; redirectCount: number }> {
   const { onResponse } = options
+  const method = options.method ?? 'GET'
   const requestHeaders = options.headers
   let currentUrl = startUrl
+  let redirectCount = 0
+
   for (let redirects = 0; redirects < MAX_REDIRECTS() + 1; redirects += 1) {
     const { url, dispatcher } = await prepareHop(currentUrl)
     const headers: Record<string, string> = {
@@ -83,7 +95,7 @@ export async function followRemoteUrl<T>(
     // Never forward Authorization or Cookie from `startUrl` — only headers the
     // caller explicitly supplies for the CURRENT hop are allowed.
     const res = await request(url.href, {
-      method: 'GET',
+      method,
       headers,
       dispatcher,
       headersTimeout: CONNECT_TIMEOUT_MS(),
@@ -107,6 +119,7 @@ export async function followRemoteUrl<T>(
       // Advance to the next hop — the next loop iteration re-validates the new
       // host (scheme, creds, IP) before its socket opens.
       currentUrl = next
+      redirectCount += 1
       continue
     }
 
@@ -117,12 +130,15 @@ export async function followRemoteUrl<T>(
       else if (Array.isArray(value)) headerMap[key.toLowerCase()] = value.join(', ')
     }
     try {
-      const result = await onResponse({
-        statusCode: status,
-        headers: headerMap,
-        body: res.body,
-      })
-      return { result, finalUrl: url.href }
+      const result = await onResponse(
+        {
+          statusCode: status,
+          headers: headerMap,
+          body: res.body,
+        },
+        url.href,
+      )
+      return { result, finalUrl: url.href, redirectCount }
     } finally {
       dispatcher.close().catch(() => undefined)
     }
