@@ -53,6 +53,7 @@ Commands:
 - `cd backend && npm run prisma:migrate`: run Prisma dev migration.
 - `cd backend && npm run prisma:generate`: regenerate Prisma client.
 - `cd backend && npm run seed:google-config`: store encrypted Google OAuth config.
+- `cd backend && npm test`: run Vitest unit tests (`src/**/*.test.ts`).
 
 Environment:
 - `DATABASE_URL`
@@ -67,6 +68,16 @@ Environment:
 - `GOOGLE_CLIENT_ID`
 - `GOOGLE_CLIENT_SECRET`
 - `GOOGLE_REDIRECT_URI`
+- `SMB_ENABLED` (enables the SMB share manager; requires Samba on the host)
+- `SMB_CONFIG_PATH` (optional; override smb.conf path)
+- `SMB_ALLOWED_ROOT` (optional; restrict share paths to a directory root)
+
+Backend conventions:
+- The SMB manager lives in `backend/src/modules/smb/` and implements the `StorageProtocol` interface in `backend/src/modules/storage/storage-protocol.ts` — the abstraction future protocols (FTP, SFTP, NFS, S3) can also implement.
+- Never run shell commands with user input; use `execFile` with argument arrays (`SystemCommandRunner`).
+- smb.conf changes are written to a temp file, validated with `testparm`, then atomically renamed; on failure the previous config is kept (rollback).
+- Foreign sections (e.g. `[global]`) in an existing smb.conf are preserved verbatim — never overwrite unrelated Samba configuration.
+- SMB user passwords are never stored by 9Drive; they go to `pdbedit` and live only in Samba's password database.
 
 Backend conventions:
 - Put route logic under `backend/src/modules/<feature>/<feature>.routes.ts`.
@@ -122,6 +133,7 @@ Important files:
 - `frontend/src/pages/SettingsPage.tsx`: Google account/settings UI.
 - `frontend/src/pages/GoogleAuthPage.tsx`: Google auth handoff exchange page.
 - `frontend/src/pages/PublicFilePage.tsx`: public shared file viewer/embed page.
+- `frontend/src/pages/SmbPage.tsx`: SMB share/user management UI (Storage → SMB).
 - `frontend/src/components/auth/GoogleLogo.tsx`: Google button logo.
 - `frontend/src/components/drive/**`: drive-specific UI components.
 - `frontend/src/components/ui/**`: reusable UI primitives.

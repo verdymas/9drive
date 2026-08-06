@@ -10,10 +10,14 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "db:migrate:deploy": "prisma migrate deploy",
+    "worker:remote-import": "tsx src/modules/remote-imports/worker-entry.ts",
+    "worker:remote-import:prod": "node dist/modules/remote-imports/worker-entry.js",
     "seed:google-config": "tsx src/scripts/seed-google-config.ts",
     "seed:google-config:docker": "tsx src/scripts/seed-google-config-if-present.ts",
     "test:s3": "tsx src/scripts/test-s3-connection.ts",
-    "test:api-upload": "tsx src/scripts/test-api-upload.ts"
+    "test:api-upload": "tsx src/scripts/test-api-upload.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [],
   "author": "",
@@ -25,14 +29,18 @@
     "@prisma/client": "^6.19.3",
     "archiver": "^8.0.0",
     "argon2": "^0.44.0",
+    "bullmq": "^6.0.8",
     "busboy": "^1.6.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "googleapis": "^173.0.0",
+    "ioredis": "^6.0.0",
+    "ipaddr.js": "^1.9.1",
     "jsonwebtoken": "^9.0.3",
     "prisma": "^6.19.3",
     "undici": "^7.27.1",
+    "webdav-server": "^2.6.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
@@ -43,6 +51,7 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^25.9.1",
     "tsx": "^4.22.4",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
   }
 }

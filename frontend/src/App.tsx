@@ -16,6 +16,8 @@ import { PublicFilePage } from '@/pages/PublicFilePage'
 import { ApiManagementPage } from '@/pages/ApiManagementPage'
 import { TrashPage } from '@/pages/TrashPage'
 import { ActivityLogPage } from '@/pages/ActivityLogPage'
+import { SmbPage } from '@/pages/SmbPage'
+import { RemoteImportsPage } from '@/pages/RemoteImportsPage'
 import { UploadProvider } from '@/context/UploadContext'
 
 
@@ -42,6 +44,8 @@ function App() {
           <Route path="activity" element={<ActivityLogPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="api" element={<ApiManagementPage />} />
+          <Route path="smb" element={<SmbPage />} />
+          <Route path="remote-imports" element={<RemoteImportsPage />} />
         </Route>
       </Route>
       <Route path="*" element={<Navigate to="/all-files" replace />} />

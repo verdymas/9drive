@@ -15,12 +15,27 @@ services:
       timeout: 5s
       retries: 20
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Internal only — not published to the host. BullMQ producer (backend) and
+    # the remote-import worker both reach it over the compose network.
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   backend:
     build:
       context: ./backend
     restart: unless-stopped
     depends_on:
       mysql:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     environment:
       DATABASE_URL: mysql://${MYSQL_USER:-9drive}:${MYSQL_PASSWORD:-change-this-database-password}@mysql:3306/${MYSQL_DATABASE:-9drive}
@@ -34,8 +49,73 @@ services:
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:4000/connected-accounts/google/callback}
+      WEBDAV_PASSWORD: ${WEBDAV_PASSWORD:-}
+      SMB_ENABLED: ${SMB_ENABLED:-false}
+      SMB_CONFIG_PATH: ${SMB_CONFIG_PATH:-}
+      SMB_ALLOWED_ROOT: ${SMB_ALLOWED_ROOT:-}
+      # Remote Import — queue + temp staging
+      REDIS_URL: redis://redis:6379
+      REMOTE_IMPORT_ENABLED: ${REMOTE_IMPORT_ENABLED:-true}
+      REMOTE_IMPORT_MAX_BYTES: ${REMOTE_IMPORT_MAX_BYTES:-5368709120}
+      REMOTE_IMPORT_GLOBAL_CONCURRENCY: ${REMOTE_IMPORT_GLOBAL_CONCURRENCY:-4}
+      REMOTE_IMPORT_PER_USER_CONCURRENCY: ${REMOTE_IMPORT_PER_USER_CONCURRENCY:-2}
+      REMOTE_IMPORT_MAX_REDIRECTS: ${REMOTE_IMPORT_MAX_REDIRECTS:-5}
+      REMOTE_IMPORT_CONNECT_TIMEOUT_SECONDS: ${REMOTE_IMPORT_CONNECT_TIMEOUT_SECONDS:-15}
+      REMOTE_IMPORT_IDLE_TIMEOUT_SECONDS: ${REMOTE_IMPORT_IDLE_TIMEOUT_SECONDS:-60}
+      REMOTE_IMPORT_JOB_TIMEOUT_HOURS: ${REMOTE_IMPORT_JOB_TIMEOUT_HOURS:-12}
+      REMOTE_IMPORT_DOWNLOAD_ATTEMPTS: ${REMOTE_IMPORT_DOWNLOAD_ATTEMPTS:-3}
+      REMOTE_IMPORT_UPLOAD_ATTEMPTS: ${REMOTE_IMPORT_UPLOAD_ATTEMPTS:-2}
+      REMOTE_IMPORT_TEMP_RETENTION_HOURS: ${REMOTE_IMPORT_TEMP_RETENTION_HOURS:-24}
+      REMOTE_IMPORT_PROGRESS_UPDATE_INTERVAL_MS: ${REMOTE_IMPORT_PROGRESS_UPDATE_INTERVAL_MS:-1000}
+      REMOTE_IMPORT_TEMP_DIR: /data/remote-import-tmp
+    volumes:
+      - remote_import_tmp:/data/remote-import-tmp
     ports:
       - "4000:4000"
+
+  remote-import-worker:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    command: ["sh", "-c", "npm run db:migrate:deploy && node dist/modules/remote-imports/worker-entry.js"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: mysql://${MYSQL_USER:-9drive}:${MYSQL_PASSWORD:-change-this-database-password}@mysql:3306/${MYSQL_DATABASE:-9drive}
+      APP_PORT: 4000
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-change-this-jwt-secret-at-least-32-chars}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-change-this-encryption-key-32bytes!}
+      ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS:-3600}
+      REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS:-30}
+      MAX_UPLOAD_BYTES: 5368709120
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:4000/connected-accounts/google/callback}
+      WEBDAV_PASSWORD: ${WEBDAV_PASSWORD:-}
+      SMB_ENABLED: ${SMB_ENABLED:-false}
+      SMB_CONFIG_PATH: ${SMB_CONFIG_PATH:-}
+      SMB_ALLOWED_ROOT: ${SMB_ALLOWED_ROOT:-}
+      # Remote Import — same queue as the API, temp staging shared with backend
+      REDIS_URL: redis://redis:6379
+      REMOTE_IMPORT_ENABLED: ${REMOTE_IMPORT_ENABLED:-true}
+      REMOTE_IMPORT_MAX_BYTES: ${REMOTE_IMPORT_MAX_BYTES:-5368709120}
+      REMOTE_IMPORT_GLOBAL_CONCURRENCY: ${REMOTE_IMPORT_GLOBAL_CONCURRENCY:-4}
+      REMOTE_IMPORT_PER_USER_CONCURRENCY: ${REMOTE_IMPORT_PER_USER_CONCURRENCY:-2}
+      REMOTE_IMPORT_MAX_REDIRECTS: ${REMOTE_IMPORT_MAX_REDIRECTS:-5}
+      REMOTE_IMPORT_CONNECT_TIMEOUT_SECONDS: ${REMOTE_IMPORT_CONNECT_TIMEOUT_SECONDS:-15}
+      REMOTE_IMPORT_IDLE_TIMEOUT_SECONDS: ${REMOTE_IMPORT_IDLE_TIMEOUT_SECONDS:-60}
+      REMOTE_IMPORT_JOB_TIMEOUT_HOURS: ${REMOTE_IMPORT_JOB_TIMEOUT_HOURS:-12}
+      REMOTE_IMPORT_DOWNLOAD_ATTEMPTS: ${REMOTE_IMPORT_DOWNLOAD_ATTEMPTS:-3}
+      REMOTE_IMPORT_UPLOAD_ATTEMPTS: ${REMOTE_IMPORT_UPLOAD_ATTEMPTS:-2}
+      REMOTE_IMPORT_TEMP_RETENTION_HOURS: ${REMOTE_IMPORT_TEMP_RETENTION_HOURS:-24}
+      REMOTE_IMPORT_PROGRESS_UPDATE_INTERVAL_MS: ${REMOTE_IMPORT_PROGRESS_UPDATE_INTERVAL_MS:-1000}
+      REMOTE_IMPORT_TEMP_DIR: /data/remote-import-tmp
+    volumes:
+      - remote_import_tmp:/data/remote-import-tmp
 
   frontend:
     build:
@@ -47,7 +127,8 @@ services:
     depends_on:
       - backend
     ports:
-      - "5173:80"
+      - "5178:80"
 
 volumes:
   mysql_data:
+  remote_import_tmp:

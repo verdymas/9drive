@@ -29,6 +29,7 @@
 - MySQL database with Prisma migrations.
 - Express + TypeScript backend.
 - React + Vite frontend.
+- Remote Import from URL: paste an HTTP(S) link, and a background worker downloads it to a temp staging area and uploads it into your Google Drive / S3 storage with live progress, cancel/retry, and SSRF protection (see [docs/REMOTE_IMPORTS.md](docs/REMOTE_IMPORTS.md)).
 
 ## Preview
 
@@ -430,9 +431,11 @@ docker compose up -d --build
 Services:
 
 ```txt
-frontend: http://localhost:5173
-backend:  http://localhost:4000
-mysql:    localhost:3306
+frontend:            http://localhost:5173
+backend:             http://localhost:4000
+mysql:               localhost:3306
+redis:               internal (BullMQ queue for Remote Import)
+remote-import-worker internal (background download/uploads for Remote Import)
 ```
 
 The backend container runs Prisma migrations automatically on startup:
@@ -654,6 +657,18 @@ POST /uploads
 
 Upload is `multipart/form-data`. Metadata fields should be appended before the file:
 
+Remote imports (requires `Authorization: Bearer <token>`):
+
+```txt
+POST   /remote-imports/probe          Detect remote filename + metadata (server-side)
+POST   /remote-imports                Start a new import from a URL
+GET    /remote-imports                List my imports (cursor pagination)
+GET    /remote-imports/:id            Get one import
+POST   /remote-imports/:id/cancel     Cancel a queued/processing import
+POST   /remote-imports/:id/retry      Retry a failed/cancelled import
+DELETE /remote-imports/:id            Delete an import record
+```
+
 ```txt
 sizeBytes
 fileName
@@ -719,6 +734,127 @@ cd ../frontend && npm install && npm run build
 pm2 restart 9drive-backend
 ```
 
+## WebDAV (Read-Only) Access for rclone & Jellyfin
+
+9Drive exposes its **database-backed virtual filesystem** (virtual folders + files, not the physical Google Drive layout) over a read-only WebDAV endpoint for external clients such as rclone and Jellyfin.
+
+### Setup
+
+Set a shared password in the backend environment:
+
+```env
+WEBDAV_PASSWORD=replace-with-a-long-random-password
+```
+
+When `WEBDAV_PASSWORD` is blank/unset, the WebDAV interface is disabled (endpoint returns `503`).
+
+The WebDAV endpoint is served by the backend at:
+
+```txt
+http://<host>:4000/webdav
+```
+
+Authentication uses HTTP Basic auth with **any username** and the shared `WEBDAV_PASSWORD` as the password.
+
+### rclone
+
+Add a WebDAV remote:
+
+```bash
+rclone config create 9drive webdav \
+  url http://localhost:4000/webdav \
+  vendor other \
+  user 9drive \
+  pass $(rclone obscure 'your-webdav-password')
+```
+
+Then mount or copy:
+
+```bash
+rclone mount 9drive:/ ~/9drive-mount
+rclone ls 9drive:/
+```
+
+### Jellyfin
+
+1. Dashboard → **Libraries** → **Add Media Library**.
+2. Choose **WebDAV** as the media folder type.
+3. Enter `http://<host>:4000/webdav` as the folder URL, with any username and the shared WebDAV password.
+4. Scan and browse the virtual folder/file tree.
+
+### Security notes
+
+- The WebDAV interface is **read-only**: write methods (PUT, MKCOL, DELETE, MOVE, COPY, PROPPATCH) are rejected.
+- With a single shared password, the WebDAV tree shows files/folders from **all users** of the 9Drive instance. Use this feature only for **single-tenant / trusted deployments**, or put the endpoint behind a VPN/reverse-proxy with access control.
+- Prefer `https` in production; credentials are sent with Basic auth (base64, not encrypted).
+
+## SMB Share Management
+
+9Drive is a **management interface for Samba** — the SMB protocol itself is always served by Samba (`smbd`) on the host machine. 9Drive generates and maintains `smb.conf`, manages shares and SMB users through the Samba command-line tools, validates every change with `testparm`, and reloads the daemon with `systemctl reload smbd`. Unrelated Samba configuration (e.g. the `[global]` section) is preserved verbatim.
+
+### Requirements
+
+- Linux host (Ubuntu/Debian) with Samba installed:
+
+  ```bash
+  sudo apt install samba
+  ```
+
+- `testparm`, `pdbedit`, `smbstatus` and `systemctl` must be available.
+- The 9Drive process needs root privileges (or an sudoers grant) to write `/etc/samba/smb.conf` and to run `systemctl`/`pdbedit`.
+
+### Backend environment
+
+| Variable | Description |
+| --- | --- |
+| `SMB_ENABLED` | Set to `true` to enable the SMB manager (default `false`). |
+| `SMB_CONFIG_PATH` | Override the smb.conf path (default: auto-detected `/etc/samba/smb.conf`). |
+| `SMB_ALLOWED_ROOT` | Restrict share paths to this directory root (default `/`). |
+
+When `SMB_ENABLED` is not set, the SMB endpoints return `503 Service Unavailable`.
+
+### Frontend
+
+The **Storage → SMB** page in the sidebar shows:
+
+- Samba service health (running / stopped / reload required / configuration error) with version, service and config path.
+- The share list (name, path, read-only, guest access, allowed users/groups).
+- Create / edit / delete shares — deleting a share only removes it from `smb.conf`, never the files on disk.
+- SMB user management (create, reset password, enable, disable, delete) via `pdbedit`. Passwords are never stored by 9Drive.
+- A manual **Reload** button that runs `testparm` and then `systemctl reload smbd`.
+
+### Read-only shares for players
+
+Shares default to **read only = yes / writeable = no**, which is exactly what Android players (MX Player, VLC) and smart TVs need for streaming.
+
+### API
+
+All endpoints require `Authorization: Bearer <token>`:
+
+```txt
+GET    /smb                 List shares
+POST   /smb                 Create share
+PUT    /smb/:id             Update share
+DELETE /smb/:id             Delete share
+POST   /smb/reload          testparm + systemctl reload smbd (with rollback)
+GET    /smb/status          Samba health (also returns connectedUsers)
+GET    /smb/users           List SMB users
+POST   /smb/users           Create user { name, password }
+PUT    /smb/users/:id       Reset password and/or enable/disable
+DELETE /smb/users/:id       Delete user
+```
+
+### Security model
+
+- All command execution uses argument arrays (`execFile`), never shell strings — user input can never inject commands.
+- Share names, paths and user names are validated (name pattern, path traversal, duplicate shares, existing directories).
+- Configuration changes are written to a temp file, validated with `testparm`, then atomically renamed; on failure the previous configuration is kept and the daemon is not touched.
+- Passwords only exist transiently in the Samba command line; nothing is stored by 9Drive.
+
+### Docker note
+
+The SMB manager requires Samba and `systemd` on the host. Inside a Docker container these are typically not present, so the UI will show "Samba is unavailable" — SMB management is intended for native (PM2/systemd) installations.
+
 ## Build
 
 Backend:
@@ -726,6 +862,13 @@ Backend:
 ```bash
 cd backend
 npm run build
+```
+
+Run tests:
+
+```bash
+cd backend
+npm test
 ```
 
 Frontend:

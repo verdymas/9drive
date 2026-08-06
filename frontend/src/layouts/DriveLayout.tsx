@@ -3,7 +3,9 @@ import { Outlet, useOutletContext, NavLink, useLocation, useNavigate, useSearchP
 import {
   Bell,
   Braces,
+  CloudDownload,
   FileArchive,
+  FolderCog,
   Gauge,
   History,
   LogOut,
@@ -23,7 +25,8 @@ import {
   Info,
   CheckCircle,
   ChevronDown,
-  Upload
+  Upload,
+  Server
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { BrandLogo } from '@/components/drive/BrandLogo'
@@ -43,6 +46,13 @@ const menu = [
   { label: 'Activity Log', icon: History, href: '/activity' },
   { label: 'Setting', icon: Settings, href: '/settings' },
   { label: 'API Keys', icon: Braces, href: '/api' },
+]
+
+const storageMenu = [
+  { label: 'Local', icon: HardDrive, href: '/storage/local', disabled: true },
+  { label: 'WebDAV', icon: FolderCog, href: '/storage/webdav', disabled: true },
+  { label: 'SMB', icon: Server, href: '/smb' },
+  { label: 'Remote Imports', icon: CloudDownload, href: '/remote-imports' },
 ]
 
 type StorageSummary = {
@@ -160,6 +170,19 @@ function Sidebar({ onNavigate, user, storage, breakdown, onLogout }: { onNavigat
           </button>
         ) : (
           <NavLink key={item.label} to={item.href} onClick={onNavigate} className={({ isActive }) => cn('inline-flex h-10 items-center gap-2.5 rounded-xl px-3.5 text-[13px] font-bold transition-all border border-transparent', isActive ? 'bg-blue-600/10 text-blue-600 border-blue-600/10 shadow-sm' : 'text-slate-600 hover:bg-slate-200/50 hover:text-slate-900')}>
+            <item.icon className="h-4 w-4" />
+            {item.label}
+          </NavLink>
+        ))}
+
+        <p className="mt-3 mb-1 px-3.5 text-[10px] font-extrabold uppercase tracking-widest text-slate-400">Storage</p>
+        {storageMenu.map((item) => item.disabled ? (
+          <button key={item.label} type="button" disabled className="inline-flex h-9 cursor-not-allowed items-center gap-2 rounded-xl px-3.5 text-[13px] font-bold text-slate-400 opacity-60">
+            <item.icon className="h-4 w-4" />
+            {item.label}
+          </button>
+        ) : (
+          <NavLink key={item.label} to={item.href} onClick={onNavigate} className={({ isActive }) => cn('inline-flex h-9 items-center gap-2.5 rounded-xl px-3.5 text-[13px] font-bold transition-all border border-transparent', isActive ? 'bg-blue-600/10 text-blue-600 border-blue-600/10 shadow-sm' : 'text-slate-600 hover:bg-slate-200/50 hover:text-slate-900')}>
             <item.icon className="h-4 w-4" />
             {item.label}
           </NavLink>
@@ -397,7 +420,7 @@ export function DriveLayout() {
           </div>
           <Sidebar user={user} storage={storage} breakdown={breakdown} onLogout={logout} onNavigate={() => setSidebarOpen(false)} />
         </div>
-        <section className="min-w-0 flex-1 p-4 sm:p-6 lg:h-screen lg:overflow-y-auto lg:p-8">
+        <section className="min-w-0 max-w-full flex-1 p-4 sm:p-6 lg:h-screen lg:overflow-y-auto lg:p-8">
           <header className="flex w-full min-w-0 flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="flex items-center justify-between gap-3 lg:hidden">
               <div className="flex min-w-0 items-center gap-3">
