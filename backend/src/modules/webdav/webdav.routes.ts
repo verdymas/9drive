@@ -324,5 +324,11 @@ webdavRouter.use(requireWebDavAuth)
 webdavRouter.use((req, res) => {
   const fs = webdavServer.rootFileSystem()
   if (fs instanceof VirtualFileSystem) fs.reset()
-  webdavServer.executeRequest(req, res)
+  // req.baseUrl is the Express mount path ('/webdav', see app.ts). It becomes
+  // the WebDAV server's rootPath, which prefixes every href the library
+  // generates (fullUri/prefixUri). Without it the XML would advertise
+  // 'http://host/Movie/' and clients (rclone, Jellyfin) could not correlate
+  // the listing with the URL they requested. FS path resolution is unaffected:
+  // it uses request.url, which Express already strips of the mount prefix.
+  webdavServer.executeRequest(req, res, req.baseUrl)
 })
