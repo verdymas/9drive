@@ -12,3 +12,7 @@ process.env.DATABASE_URL ??= 'mysql://root@localhost:3306/9drive_test'
 process.env.FRONTEND_URL ??= 'http://localhost:5173'
 process.env.JWT_ACCESS_SECRET ??= 'test-jwt-secret-that-is-long-enough-1234'
 process.env.TOKEN_ENCRYPTION_KEY ??= 'test-encryption-key-32bytes!!!'
+
+// Fast idle timeout so downloader tests that exercise the abort path don't
+// wait the full production default (60s).
+process.env.REMOTE_IMPORT_IDLE_TIMEOUT_SECONDS ??= '1'

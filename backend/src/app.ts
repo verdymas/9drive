@@ -17,6 +17,7 @@ import { auditLogRouter } from './modules/audit-logs/audit-log.routes.js'
 import { systemRouter } from './modules/system/system.routes.js'
 import { webdavRouter } from './modules/webdav/webdav.routes.js'
 import { createSmbRouter } from './modules/smb/smb.routes.js'
+import { remoteImportRouter } from './modules/remote-imports/remote-import.routes.js'
 
 export const app = express()
 app.set('trust proxy', true)
@@ -39,6 +40,7 @@ app.use('/invites', inviteRouter)
 app.use('/audit-logs', auditLogRouter)
 app.use('/system', systemRouter)
 app.use('/webdav', webdavRouter)
+app.use('/remote-imports', remoteImportRouter)
 app.use(
   '/smb',
   createSmbRouter({

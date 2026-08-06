@@ -29,6 +29,7 @@
 - MySQL database with Prisma migrations.
 - Express + TypeScript backend.
 - React + Vite frontend.
+- Remote Import from URL: paste an HTTP(S) link, and a background worker downloads it to a temp staging area and uploads it into your Google Drive / S3 storage with live progress, cancel/retry, and SSRF protection (see [docs/REMOTE_IMPORTS.md](docs/REMOTE_IMPORTS.md)).
 
 ## Preview
 
@@ -430,9 +431,11 @@ docker compose up -d --build
 Services:
 
 ```txt
-frontend: http://localhost:5173
-backend:  http://localhost:4000
-mysql:    localhost:3306
+frontend:            http://localhost:5173
+backend:             http://localhost:4000
+mysql:               localhost:3306
+redis:               internal (BullMQ queue for Remote Import)
+remote-import-worker internal (background download/uploads for Remote Import)
 ```
 
 The backend container runs Prisma migrations automatically on startup:
@@ -653,6 +656,17 @@ POST /uploads
 ```
 
 Upload is `multipart/form-data`. Metadata fields should be appended before the file:
+
+Remote imports (requires `Authorization: Bearer <token>`):
+
+```txt
+POST   /remote-imports                Start a new import from a URL
+GET    /remote-imports                List my imports (cursor pagination)
+GET    /remote-imports/:id            Get one import
+POST   /remote-imports/:id/cancel     Cancel a queued/processing import
+POST   /remote-imports/:id/retry      Retry a failed/cancelled import
+DELETE /remote-imports/:id            Delete an import record
+```
 
 ```txt
 sizeBytes

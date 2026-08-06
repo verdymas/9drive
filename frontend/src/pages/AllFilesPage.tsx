@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState, type DragEvent, type FormEvent, type MouseEvent } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Archive, CheckCircle, ClipboardPaste, Download, FolderInput, FolderPlus, LayoutGrid, List, RefreshCw, Star, Trash2, Upload, X } from 'lucide-react'
+import { Archive, CheckCircle, ClipboardPaste, CloudDownload, Download, FolderInput, FolderPlus, LayoutGrid, List, RefreshCw, Star, Trash2, Upload, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { DummyModal } from '@/components/drive/DummyModal'
+import { RemoteImportModal } from '@/components/drive/RemoteImportModal'
 import { EmptyAreaContextMenu } from '@/components/drive/EmptyAreaContextMenu'
 import { FileContextMenu } from '@/components/drive/FileContextMenu'
 import { FileDetailsDrawer } from '@/components/drive/FileDetailsDrawer'
@@ -136,6 +137,7 @@ export function AllFilesPage() {
   const { setHeaderActions } = useDriveLayoutActions()
   const [connectedAccounts, setConnectedAccounts] = useState<ConnectedAccount[]>([])
   const [selectedTargetAccountId, setSelectedTargetAccountId] = useState('')
+  const [remoteImportOpen, setRemoteImportOpen] = useState(false)
 
   function changeFolderSize(scale: FolderSizeScale) {
     setFolderSizeScale(scale)
@@ -662,6 +664,9 @@ export function AllFilesPage() {
           <RefreshCw className={syncingDrive ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />
           {syncingDrive ? 'Syncing...' : 'Sync'}
         </Button>
+        <Button size="sm" variant="outline" onClick={() => setRemoteImportOpen(true)}>
+          <CloudDownload className="h-3.5 w-3.5" />Import from URL
+        </Button>
       </div>
     )
   }, [syncingDrive, folderSizeScale])
@@ -695,6 +700,7 @@ export function AllFilesPage() {
         <Button size="sm" onClick={() => setUploadOpen(true)}><Upload className="h-3.5 w-3.5" />Upload</Button>
         <Button size="sm" variant="outline" onClick={() => setFolderOpen(true)}><FolderPlus className="h-3.5 w-3.5" />New Folder</Button>
         <Button size="sm" variant="outline" disabled={syncingDrive} onClick={syncGoogleDrive}><RefreshCw className={syncingDrive ? 'h-3.5 w-3.5 animate-spin' : 'h-3.5 w-3.5'} />{syncingDrive ? 'Syncing...' : 'Sync'}</Button>
+        <Button size="sm" variant="outline" onClick={() => setRemoteImportOpen(true)}><CloudDownload className="h-3.5 w-3.5" />Import from URL</Button>
         <div className="flex items-center gap-0.5 rounded-xl border border-slate-200 bg-slate-50 p-0.5">
           {(['xs','sm','md','lg'] as FolderSizeScale[]).map((s) => (
             <button key={s} type="button" onClick={() => changeFolderSize(s)} className={['rounded-lg px-2 py-1 text-[10px] font-bold uppercase tracking-wide transition-all border border-transparent', folderSizeScale === s ? sizeActiveClasses[s] : 'text-slate-400 hover:text-slate-600'].join(' ')} aria-label={`Folder size ${s}`}>{s}</button>
@@ -770,6 +776,18 @@ export function AllFilesPage() {
           <div className="grid gap-3 pt-2 sm:flex sm:justify-end"><Button type="button" variant="outline" onClick={() => setFolderOpen(false)}>Cancel</Button><Button>Create Folder</Button></div>
         </form>
       </DummyModal>
+      <RemoteImportModal
+        open={remoteImportOpen}
+        onClose={() => setRemoteImportOpen(false)}
+        onCreated={() => {
+          setMessage('Import started. You can track its progress from the Remote Imports page.')
+          window.dispatchEvent(new Event('9drive:storage-changed'))
+          void loadAll()
+        }}
+        accounts={connectedAccounts}
+        folders={allFolders.flatMap((folder) => (folder.id ? [{ id: folder.id, name: folder.name }] : []))}
+        defaultFolderId={activeFolderId}
+      />
       <DummyModal open={renameOpen} title="Rename File" description={activeFile?.name ?? ''} onClose={() => setRenameOpen(false)}><form onSubmit={renameFile} className="grid gap-4"><Input value={renameValue} onChange={(event) => setRenameValue(event.target.value)} required /><div className="flex justify-end gap-3"><Button type="button" variant="outline" onClick={() => setRenameOpen(false)}>Cancel</Button><Button>Rename</Button></div></form></DummyModal>
       <DummyModal open={moveOpen} title="Move to Folder" description={selectedFileIds.size > 0 ? `Move ${selectedFileIds.size} files` : activeFile?.name ?? ''} onClose={() => setMoveOpen(false)}><form onSubmit={moveFile} className="grid gap-4"><select className="h-11 rounded-xl border border-slate-200 px-3 text-sm" value={selectedFolderId} onChange={(event) => setSelectedFolderId(event.target.value)}><option value="">No folder</option>{allFolders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}</select><div className="flex justify-end gap-3"><Button type="button" variant="outline" onClick={() => setMoveOpen(false)}>Cancel</Button><Button>Move</Button></div></form></DummyModal>
       <DummyModal open={deleteOpen} title={selectedFileIds.size > 0 ? 'Delete Files' : 'Delete File'} description={selectedFileIds.size > 0 ? `Delete ${selectedFileIds.size} files from Google Drive?` : `Delete ${activeFile?.name ?? 'file'} from Google Drive?`} onClose={() => setDeleteOpen(false)}><div className="flex justify-end gap-3"><Button variant="outline" onClick={() => setDeleteOpen(false)}>Cancel</Button><Button variant="danger" onClick={deleteFile}>Delete</Button></div></DummyModal>
