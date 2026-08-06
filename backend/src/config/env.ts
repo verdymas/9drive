@@ -14,6 +14,9 @@ const envSchema = z.object({
   MAX_UPLOAD_BYTES: z.coerce.number().default(5 * 1024 * 1024 * 1024),
   RECAPTCHA_SECRET_KEY: z.string().optional(),
   WEBDAV_PASSWORD: z.string().optional(),
+  SMB_ENABLED: z.coerce.boolean().default(false),
+  SMB_CONFIG_PATH: z.string().optional(),
+  SMB_ALLOWED_ROOT: z.string().optional(),
 })
 
 export const env = envSchema.parse(process.env)
