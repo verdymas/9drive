@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { render, screen } from '@testing-library/react'
-import { formatDisplayUrl, progressPercent } from '@/pages/RemoteImportsPage'
+import { formatDisplayUrl, hlsActivityLine, hlsSummaryLine, progressPercent } from '@/pages/RemoteImportsPage'
+import { formatDuration } from '@/components/drive/RemoteImportModal'
 import { Button } from '@/components/ui/button'
 import type { RemoteImportItem } from '@/lib/remoteImports'
 
@@ -96,6 +97,52 @@ describe('progressPercent', () => {
 
   it('never goes negative', () => {
     expect(progressPercent(item({ stage: 'downloading', downloadedBytes: '-5', uploadedBytes: '0' }))).toBe(0)
+  })
+})
+
+describe('formatDuration', () => {
+  it('formats seconds as h:mm:ss', () => {
+    expect(formatDuration(12)).toBe('0:00:12')
+    expect(formatDuration(5423.5)).toBe('1:30:24')
+    expect(formatDuration(3600)).toBe('1:00:00')
+  })
+
+  it('handles null / invalid inputs', () => {
+    expect(formatDuration(null)).toBe('—')
+    expect(formatDuration(undefined)).toBe('—')
+    expect(formatDuration(-5)).toBe('—')
+  })
+})
+
+describe('hlsActivityLine', () => {
+  it('shows segment counts while downloading a finite VOD', () => {
+    expect(hlsActivityLine(item({ sourceType: 'hls_media', stage: 'segments', hlsIsLive: false, hlsSegmentCount: 420, hlsCompletedSegmentCount: 128 }))).toBe('Downloading HLS segments · 128 / 420')
+  })
+
+  it('shows elapsed vs target duration while recording live', () => {
+    expect(hlsActivityLine(item({ sourceType: 'hls_media', stage: 'segments', hlsIsLive: true, hlsMediaDurationSeconds: 1112, hlsRecordingDurationSeconds: 3600 }))).toBe('Recording live stream · 0:18:32 / 1:00:00')
+  })
+
+  it('shows remux progress during remuxing', () => {
+    expect(hlsActivityLine(item({ sourceType: 'hls_media', stage: 'remuxing', remuxProgress: 0.74 }))).toBe('Remuxing media · 74%')
+  })
+
+  it('is null for non-HLS imports', () => {
+    expect(hlsActivityLine(item({ stage: 'segments' }))).toBeNull()
+  })
+})
+
+describe('hlsSummaryLine', () => {
+  it('combines quality, language, container and duration', () => {
+    expect(hlsSummaryLine(item({ sourceType: 'hls_master', hlsVariantHeight: 1080, hlsAudioTrackLanguage: 'en', hlsOutputContainer: 'mkv', hlsMediaDurationSeconds: 5423.5 }))).toBe('HLS video · 1080p · en · MKV · 1:30:24')
+  })
+
+  it('includes the recording target for live sources', () => {
+    expect(hlsSummaryLine(item({ sourceType: 'hls_media', hlsIsLive: true, hlsRecordingDurationSeconds: 3600 }))).toBe('HLS video · rec 1:00:00')
+  })
+
+  it('falls back to a neutral label with no metadata', () => {
+    expect(hlsSummaryLine(item({ sourceType: 'hls_master' }))).toBe('HLS video')
   })
 })
 

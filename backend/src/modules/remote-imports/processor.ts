@@ -14,10 +14,17 @@ import { followRemoteUrl } from './url-downloader.js'
 import { uploadToGoogleResumable } from './google-resumable-uploader.js'
 import { createTempPartFile, removeTempFile, appendStreamToTemp } from './temp-storage.js'
 import { sanitizeFileName } from './filename-sanitize.js'
+import { runHlsPipeline } from './hls/pipeline.js'
+import { hlsJobDir, removeJobDir } from './hls/job-dir.js'
+import { hlsDerivedFileName } from './hls/output.js'
+import type { ContainerChoice } from './hls/output.js'
+import { ensureJobDir } from './hls/materializer.js'
 
 const STAGES = {
   PROBING: 'probing',
   DOWNLOADING: 'downloading',
+  SEGMENTS: 'segments',
+  REMUXING: 'remuxing',
   VERIFYING: 'verifying',
   SELECTING_STORAGE: 'selecting_storage',
   UPLOADING: 'uploading',
@@ -27,6 +34,11 @@ const STAGES = {
 } as const
 
 type Stage = (typeof STAGES)[keyof typeof STAGES]
+
+/** True when the stored import is an HLS source. */
+function isHlsRecord(record: { sourceType?: string | null }): boolean {
+  return record.sourceType === 'hls_master' || record.sourceType === 'hls_media'
+}
 
 /**
  * Update the domain row's stage + progress. `progress` must be a small
@@ -78,8 +90,7 @@ async function downloadToTemp(importId: string, startUrl: string, maxBytes: bigi
       }
 
       // Idle-timeout and size-cap aborts are deliberate — keep the body's
-      // 'error' event from becoming an unhandled rejection. The body is an
-      // undici stream at runtime; guard for the type-safe listener.
+      // 'error' event from becoming an unhandled rejection.
       if (typeof (res.body as { on?: unknown }).on === 'function') {
         (res.body as unknown as { on: (event: 'error', listener: () => void) => void }).on('error', () => undefined)
       }
@@ -137,8 +148,6 @@ async function uploadTempFile(
     const providerFileId = buildS3ObjectKey(config, userId, provisionalFile.id, fileName)
     try {
       await uploadS3Object(config, providerFileId, fileStream, mimeType)
-      // S3 has no granular progress hook — this final write makes the bar
-      // reach 100% the moment the object lands, before registration.
       const s3Size = BigInt((await fsp.stat(tempPartPath)).size)
       await prisma.remoteImport.update({ where: { id: importId }, data: { uploadedBytes: s3Size } }).catch(() => undefined)
       await prisma.file.update({ where: { id: provisionalFile.id }, data: { providerFileId, status: 'active' } })
@@ -151,7 +160,6 @@ async function uploadTempFile(
 
   // Google Drive — resumable upload streams the temp file directly, records
   // the session encrypted (for crash-safe), and returns provider metadata.
-  // Upload progress is throttled like download progress to keep the UI live.
   const uploadProgress = throttledProgressUpdater(importId, STAGES.UPLOADING)
   const uploaded = await uploadToGoogleResumable(importId, account.id, userId, folderId, fileName, mimeType, tempPartPath, (bytes) => {
     void uploadProgress({ uploadedBytes: bytes.toString() })
@@ -163,7 +171,7 @@ async function uploadTempFile(
  * Register the imported file in the virtual filesystem (idempotent by
  * providerFileId when the row already points at one).
  */
-async function registerFile(importId: string, remoteImport: { userId: string; folderId: string | null; connectedAccountId: string | null; fileName: string; mimeType: string | null; tempPath: string | null }, providerFileId: string, sizeBytes: bigint) {
+async function registerFile(importId: string, remoteImport: { userId: string; folderId: string | null; connectedAccountId: string | null; fileName: string; mimeType: string | null; tempPath?: string | null }, providerFileId: string, sizeBytes: bigint) {
   await updateStage(importId, STAGES.REGISTERING)
   const accountId = remoteImport.connectedAccountId
   if (!accountId) throw new Error('Missing connected account for file registration.')
@@ -200,6 +208,142 @@ async function markFailed(importId: string, code: string, message: string) {
 }
 
 /**
+ * Run the HLS pipeline for an import whose `sourceType` is hls_master/media.
+ * Returns the remuxed output path + the provider upload metadata.
+ */
+async function processHlsImport(
+  job: Job<RemoteImportJobData>,
+  record: {
+    id: string
+    userId: string
+    folderId: string | null
+    connectedAccountId: string | null
+    fileName: string
+    mimeType: string | null
+    sourceType: string | null
+    hlsVariantId: string | null
+    hlsAudioTrackId: string | null
+    hlsOutputContainer: string | null
+    hlsIsLive: boolean | null
+    hlsRecordingDurationSeconds: number | null
+    sourceUrlEncrypted: string
+  },
+) {
+  const importId = record.id
+  const userId = record.userId
+  const folderId = record.folderId
+  const sourceUrl = decryptText(record.sourceUrlEncrypted)
+
+  if (!env.REMOTE_IMPORT_HLS_ENABLED) {
+    await markFailed(importId, 'HLS_DISABLED', 'HLS imports are disabled.')
+    return null
+  }
+
+  const jobDir = hlsJobDir(userId, importId)
+  await ensureJobDir(jobDir)
+
+  const signalController = new AbortController()
+  // The worker checks the DB between phases; this controller is only for
+  // cancel requests that arrive DURING a phase (polled below).
+  const pollCancel = setInterval(async () => {
+    const current = await prisma.remoteImport.findUnique({ where: { id: importId } }).catch(() => null)
+    if (current?.status === 'cancelled') signalController.abort()
+  }, 5000)
+
+  try {
+    await updateStage(importId, STAGES.SEGMENTS)
+    const pipeline = await runHlsPipeline({
+      jobDir,
+      sourceUrl,
+      isLive: Boolean(record.hlsIsLive),
+      recordingDurationSeconds: record.hlsRecordingDurationSeconds ?? undefined,
+      selection: {
+        variantId: record.hlsVariantId,
+        audioTrackId: record.hlsAudioTrackId,
+        outputContainer: (record.hlsOutputContainer as ContainerChoice) ?? 'auto',
+      },
+      signal: signalController.signal,
+      onProgress: async (p) => {
+        if (p.stage === 'segments' || p.stage === 'live' || p.stage === 'recording') {
+          await updateStage(importId, p.stage === 'recording' ? STAGES.SEGMENTS : STAGES.SEGMENTS, {
+            hlsCompletedSegmentCount: p.segmentsCompleted,
+            hlsSegmentCount: p.segmentsTotal,
+            hlsMediaDurationSeconds: p.mediaDurationSeconds ?? null,
+            downloadedBytes: p.downloadedBytes?.toString(),
+          })
+        } else if (p.stage === 'remux') {
+          await updateStage(importId, STAGES.REMUXING, { remuxProgress: p.remuxPercent ?? null })
+        }
+      },
+    })
+
+    if (!pipeline) {
+      await markFailed(importId, 'HLS_INVALID_MANIFEST', 'The source is not a valid HLS playlist.')
+      return null
+    }
+
+    // ── Finalize HLS metadata before upload. ────────────────────────────────
+    await updateStage(importId, STAGES.VERIFYING, {
+      hlsMediaDurationSeconds: pipeline.mediaDurationSeconds,
+      hlsSegmentCount: pipeline.segmentCount,
+      outputDurationSeconds: pipeline.outputDurationSeconds,
+      outputCodecSummary: pipeline.codecSummary.slice(0, 191),
+      remuxProgress: null,
+    })
+
+    // ── Storage selection (same routing as direct imports). ─────────────────
+    await updateStage(importId, STAGES.SELECTING_STORAGE)
+    const folder = folderId
+      ? await prisma.folder.findFirst({ where: { id: folderId, userId, deletedAt: null } })
+      : null
+    const targetAccountId = record.connectedAccountId ?? folder?.connectedAccountId ?? undefined
+    const account = await selectAccount(userId, pipeline.downloadedBytes, undefined, targetAccountId)
+    if (!account) {
+      await markFailed(importId, 'NO_ACCOUNT_WITH_ENOUGH_SPACE', 'No connected storage account has enough space.')
+      return null
+    }
+
+    // ── Upload the remuxed file. ────────────────────────────────────────────
+    const mimeType = record.mimeType ?? (pipeline.container === 'mp4' ? 'video/mp4' : 'video/x-matroska')
+    const uploaded = await uploadTempFile(
+      importId,
+      { id: account.id, provider: account.provider },
+      userId,
+      folderId,
+      pipeline.fileName,
+      mimeType,
+      pipeline.outputPath,
+    )
+    const sizeBytes = BigInt((await fsp.stat(pipeline.outputPath)).size)
+
+    // ── Register + link. ────────────────────────────────────────────────────
+    const file = await registerFile(importId, { ...record, connectedAccountId: account.id, fileName: pipeline.fileName, mimeType }, uploaded.providerFileId, sizeBytes)
+
+    await prisma.remoteImport.update({
+      where: { id: importId },
+      data: {
+        status: 'completed',
+        stage: STAGES.FINISHED,
+        fileId: file.id,
+        completedAt: new Date(),
+        downloadedBytes: pipeline.downloadedBytes,
+        uploadedBytes: sizeBytes,
+        tempPath: null,
+        finalUrlEncrypted: encryptText(sourceUrl),
+      },
+    })
+    logProgress(importId, STAGES.FINISHED, 'hls import completed')
+
+    if (account.provider === 's3') syncS3Quota(account.id).catch(() => undefined)
+    else syncGoogleQuota(account.id).catch(() => undefined)
+    return { outputPath: pipeline.outputPath }
+  } finally {
+    clearInterval(pollCancel)
+    await removeJobDir(jobDir).catch(() => undefined)
+  }
+}
+
+/**
  * Main worker processor. Drives one import through every stage and writes
  * progress back to the `remote_imports` row. The temp file is removed
  * regardless of outcome; a `CANCELLED` import aborts early.
@@ -219,9 +363,6 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
   const startedAt = Date.now()
   const jobTimeoutMs = env.REMOTE_IMPORT_JOB_TIMEOUT_HOURS * 60 * 60 * 1000
 
-  // Fail an import that has been running longer than the configured cap
-  // (BullMQ v6 has no per-job `timeout` option; the deadline is enforced here,
-  // between phases, so a hung download never occupies a worker slot forever).
   const assertWithinTimeout = () => {
     if (Date.now() - startedAt > jobTimeoutMs) {
       throw new AppError('IMPORT_TIMEOUT', `Import exceeded the ${env.REMOTE_IMPORT_JOB_TIMEOUT_HOURS}h time limit.`, 408)
@@ -236,6 +377,14 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
       data: { status: 'processing', stage: STAGES.PROBING, startedAt: new Date(), jobId: job.id },
     })
 
+    // ── HLS imports skip the direct-download path entirely. ─────────────────
+    if (isHlsRecord(record)) {
+      const result = await processHlsImport(job, record)
+      if (result) return
+      // processHlsImport already finalized status on failure; just return.
+      return
+    }
+
     // Probe the URL: follow redirects with SSRF validation, get size/range.
     // A ranged GET (`bytes=0-0`) keeps the probe cheap; servers that ignore
     // the range still answer 200 with a full body, which we abort after the
@@ -247,12 +396,9 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
         onResponse: async (res) => {
           const length = res.headers['content-length']
           const supportsRange = res.headers['accept-ranges'] === 'bytes' || res.statusCode === 206
-          // The early abort below is deliberate — silence the body error event.
           if (typeof (res.body as { on?: unknown }).on === 'function') {
             (res.body as unknown as { on: (event: 'error', listener: () => void) => void }).on('error', () => undefined)
           }
-          // Abort the body after the first chunk (a server that ignored our
-          // Range may stream the whole file — we don't want that during probe).
           const reader = res.body[Symbol.asyncIterator]()
           await reader.next().catch(() => undefined)
           await reader.return?.().catch(() => undefined)
@@ -291,9 +437,6 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
     assertWithinTimeout()
 
     // Select destination account (default routing or pinned account).
-    // Precedence: the user's explicit `connectedAccountId` wins over the
-    // destination folder's binding (the folder binding already implies it,
-    // but the user's direct pick must not be silently overridden).
     await updateStage(importId, STAGES.SELECTING_STORAGE)
     const folder = folderId
       ? await prisma.folder.findFirst({ where: { id: folderId, userId, deletedAt: null } })
@@ -338,7 +481,8 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
     const message = error instanceof Error ? error.message : 'Unknown error'
     const code = error instanceof AppError ? error.code : 'IMPORT_FAILED'
     await markFailed(importId, code, message)
-    console.error(`[remote-import] ${importId} failed: ${code} ${message}`)
+    const meta = (error as { meta?: string })?.meta
+    console.error(`[remote-import] ${importId} failed: ${code} ${message}${meta ? ` :: ${meta.slice(-800)}` : ''}`)
   } finally {
     await removeTempFile(importId)
   }

@@ -10,6 +10,16 @@ import { removeTempFile } from './temp-storage.js'
 
 const MAX_NAME = 255
 
+export type CreateRemoteImportHlsOptions = {
+  sourceType: 'hls_master' | 'hls_media'
+  variantId?: string
+  audioTrackId?: string
+  outputContainer?: 'auto' | 'mkv' | 'mp4'
+  /** True when the selected media playlist is live/event (no ENDLIST). */
+  isLive?: boolean
+  recordingDurationSeconds?: number
+}
+
 export type CreateRemoteImportInput = {
   userId: string
   sourceUrl: string
@@ -21,6 +31,8 @@ export type CreateRemoteImportInput = {
    *  not type one. Always re-sanitized at creation — never trusted as-is. */
   detectedFileName?: string | null
   mimeType?: string | null
+  /** HLS import options; when present the import is routed to the HLS pipeline. */
+  hls?: CreateRemoteImportHlsOptions | null
 }
 
 /**
@@ -53,6 +65,13 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
   const fileName = sanitizeFileName(rawFileName)
   if (fileName.length > MAX_NAME) throw new AppError('FILE_NAME_TOO_LONG', 'The file name is too long.', 400)
 
+  // For HLS imports whose source name still carries a `.m3u8`/`.m3u` suffix,
+  // the final stored name must match the OUTPUT container — never store a
+  // playlist extension for a remuxed file. The pipeline also re-derives it,
+  // but persisting the correct extension at creation keeps the UI honest.
+  const hls = input.hls
+  const finalFileName = hls ? hlsFinalFileName(fileName, hls.outputContainer) : fileName
+
   const created = await prisma.remoteImport.create({
     data: {
       userId: input.userId,
@@ -60,10 +79,20 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
       connectedAccountId,
       sourceUrlEncrypted: encryptText(input.sourceUrl),
       displayUrl: displayUrl(input.sourceUrl),
-      fileName,
+      fileName: finalFileName,
       mimeType: input.mimeType || null,
       status: 'queued',
       stage: 'waiting',
+      ...(hls
+        ? {
+            sourceType: hls.sourceType,
+            hlsVariantId: hls.variantId ?? null,
+            hlsAudioTrackId: hls.audioTrackId ?? null,
+            hlsOutputContainer: hls.outputContainer ?? null,
+            hlsIsLive: Boolean(hls.isLive),
+            hlsRecordingDurationSeconds: hls.recordingDurationSeconds ?? null,
+          }
+        : {}),
     },
   })
 
@@ -76,6 +105,16 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
     console.error('[remote-import] enqueue failed for import', created.id, error instanceof Error ? error.message : String(error))
   }
   return created
+}
+
+/**
+ * Derive the stored filename for an HLS import: the `.m3u8`/`.m3u` suffix is
+ * replaced by the output container's extension (auto → mkv, the safe default;
+ * the pipeline re-derives it later once the real container is known).
+ */
+function hlsFinalFileName(fileName: string, outputContainer: string | undefined): string {
+  const extension = outputContainer === 'mp4' ? 'mp4' : outputContainer === 'mkv' ? 'mkv' : 'mkv'
+  return fileName.replace(/\.(m3u8|m3u)$/i, '').replace(/\.+$/, '') + `.${extension}`
 }
 
 /** Last path segment of the URL, percent-decoded, as the default file name. */
@@ -154,8 +193,22 @@ export async function cancelRemoteImport(importId: string, userId: string) {
     data: { status: 'cancelled', cancelledAt: new Date() },
   })
   await removeTempFile(importId)
+  await removeJobDirIfExists(userId, importId)
   await createAuditLog(userId, 'IMPORT_URL_CANCEL', 'remote_import', importId, { name: updated.fileName })
   return updated
+}
+
+/**
+ * Remove the HLS job directory for an import when it exists. Safe: the job
+ * directory is always under the temp root and validated before removal.
+ */
+async function removeJobDirIfExists(userId: string, importId: string): Promise<void> {
+  try {
+    const { hlsJobDir, removeJobDir } = await import('./hls/job-dir.js')
+    await removeJobDir(hlsJobDir(userId, importId)).catch(() => undefined)
+  } catch {
+    /* job-dir module errors are swallowed — best-effort cleanup */
+  }
 }
 
 /** Retry a failed or cancelled import: clear errors, re-enqueue. */
@@ -178,6 +231,9 @@ export async function retryRemoteImport(importId: string, userId: string) {
       startedAt: null,
     },
   })
+  // A retry re-runs the whole pipeline — clear any stale HLS scratch dir so
+  // segments from the failed attempt never leak into the next one.
+  await removeJobDirIfExists(userId, importId)
   await enqueueRemoteImport(importId)
   await createAuditLog(userId, 'IMPORT_URL_RETRY', 'remote_import', importId, { name: updated.fileName })
   return updated
@@ -188,6 +244,7 @@ export async function deleteRemoteImport(importId: string, userId: string) {
   const row = await getRemoteImportForUser(importId, userId)
   await removeRemoteImportJob(importId).catch(() => undefined)
   await removeTempFile(importId)
+  await removeJobDirIfExists(userId, importId)
   await prisma.remoteImport.delete({ where: { id: importId } })
   await createAuditLog(userId, 'IMPORT_URL_DELETE', 'remote_import', importId, { name: row.fileName })
   return row

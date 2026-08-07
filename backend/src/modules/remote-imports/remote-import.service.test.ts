@@ -36,4 +36,40 @@ describe('serializeRemoteImport', () => {
     expect(() => JSON.stringify(serialized)).not.toThrow()
     expect(JSON.parse(JSON.stringify(serialized)).file.sizeBytes).toBe('100')
   })
+
+  it('passes HLS fields through unchanged and stays JSON-safe', () => {
+    const row = {
+      id: 'import-4',
+      totalBytes: null,
+      downloadedBytes: 0n,
+      uploadedBytes: 0n,
+      sourceType: 'hls_media',
+      hlsPlaylistType: 'vod',
+      hlsVariantId: null,
+      hlsVariantBandwidth: null,
+      hlsVariantWidth: null,
+      hlsVariantHeight: null,
+      hlsAudioTrackId: null,
+      hlsAudioTrackLanguage: 'en',
+      hlsOutputContainer: 'mkv',
+      hlsIsLive: false,
+      hlsRecordingDurationSeconds: null,
+      hlsMediaDurationSeconds: 1234.5,
+      hlsSegmentCount: 42,
+      hlsCompletedSegmentCount: 42,
+      remuxProgress: 0.55,
+      outputDurationSeconds: 1234.5,
+      outputCodecSummary: 'h264, aac',
+    }
+    const serialized = serializeRemoteImport(row)
+    expect(serialized.sourceType).toBe('hls_media')
+    expect(serialized.hlsPlaylistType).toBe('vod')
+    expect(serialized.hlsMediaDurationSeconds).toBe(1234.5)
+    expect(serialized.hlsSegmentCount).toBe(42)
+    expect(serialized.hlsCompletedSegmentCount).toBe(42)
+    expect(serialized.remuxProgress).toBe(0.55)
+    expect(serialized.hlsOutputContainer).toBe('mkv')
+    expect(serialized.hlsIsLive).toBe(false)
+    expect(() => JSON.stringify(serialized)).not.toThrow()
+  })
 })

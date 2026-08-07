@@ -1,9 +1,13 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { CloudDownload, Loader2, Search, Check, AlertTriangle } from 'lucide-react'
+import { CloudDownload, Loader2, Search, Check, AlertTriangle, Radio, MonitorPlay } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Select } from '@/components/ui/select'
 import { DummyModal } from '@/components/drive/DummyModal'
-import { createRemoteImport, probeRemoteUrl, type ProbeResult } from '@/lib/remoteImports'
+import { createRemoteImport, probeRemoteUrl, type HlsImportOptions, type ProbeResult } from '@/lib/remoteImports'
+
+const RECORDING_MIN_SECONDS = 60
+const RECORDING_MAX_SECONDS = 21600
 
 type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string }
 type FolderOption = { id: string; name: string }
@@ -31,7 +35,136 @@ function sourceLabel(source: ProbeResult['fileNameSource']): string {
 }
 
 /**
- * Remote Import modal with backend-owned filename detection.
+ * Human duration like "01:00:00". Returns a neutral placeholder for null/NaN.
+ */
+export function formatDuration(seconds: number | null | undefined): string {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return '—'
+  const total = Math.round(seconds)
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+}
+
+/**
+ * The HLS-specific controls in the Remote Import modal (§13, §14, §21).
+ *
+ * Rendered only after a probe classified the source as HLS (`probe.result.hls`
+ * is non-null). Layout:
+ *   - a "HLS Video" badge with the playlist kind,
+ *   - Quality (optional — only when >1 variant),
+ *   - Audio Track (only when >1 audio rendition),
+ *   - Output Format (Auto / MKV / MP4),
+ *   - live/event sources additionally require a Recording Duration, which the
+ *     server enforces between 60 and 21600 seconds.
+ *
+ * The recorded selections are returned in `onChange` so the parent can send
+ * them in the create request's `hls` field.
+ */
+export function HlsSection({
+  hls,
+  value,
+  onChange,
+}: {
+  hls: NonNullable<ProbeResult['hls']>
+  value: HlsImportOptions
+  onChange: (next: HlsImportOptions) => void
+}) {
+  const isLive = hls.isFinite === false
+  const variants = hls.variants
+  const tracks = hls.audioTracks
+
+  return (
+    <fieldset className="grid gap-3 rounded-2xl border border-slate-200 bg-slate-50/60 p-3">
+      <legend className="sr-only">HLS options</legend>
+      <p className="flex flex-wrap items-center gap-2 text-sm font-extrabold text-slate-800">
+        <Radio className="h-4 w-4 text-blue-600" />
+        HLS Video
+        <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[11px] font-bold uppercase tracking-wide text-blue-700">
+          {hls.playlistType}
+        </span>
+      </p>
+
+      {isLive ? (
+        <p className="rounded-xl bg-amber-50 p-2.5 text-xs font-semibold text-amber-800">
+          Live HLS stream detected. A recording duration is required.
+        </p>
+      ) : (
+        <p className="flex items-center gap-1.5 text-xs font-semibold text-slate-500">
+          <MonitorPlay className="h-4 w-4" />
+          {variants.length > 1 ? `${variants.length} quality levels available` : 'Single quality level'}
+          {hls.durationSeconds != null && hls.durationSeconds > 0 ? ` · ${formatDuration(hls.durationSeconds)}` : ''}
+        </p>
+      )}
+
+      {variants.length > 1 ? (
+        <label className="grid gap-1.5 text-sm font-semibold">
+          Quality
+          <Select
+            value={value.variantId ?? 'auto'}
+            onChange={(event) => onChange({ ...value, variantId: event.target.value === 'auto' ? undefined : event.target.value })}
+          >
+            <option value="auto">Automatic (best available)</option>
+            {variants.map((variant) => (
+              <option key={variant.id} value={variant.id}>{variant.label}</option>
+            ))}
+          </Select>
+        </label>
+      ) : null}
+
+      {tracks.length > 1 ? (
+        <label className="grid gap-1.5 text-sm font-semibold">
+          Audio Track
+          <Select
+            value={value.audioTrackId ?? 'auto'}
+            onChange={(event) => onChange({ ...value, audioTrackId: event.target.value === 'auto' ? undefined : event.target.value })}
+          >
+            <option value="auto">Auto (default)</option>
+            {tracks.map((track) => (
+              <option key={track.id} value={track.id}>{track.name || track.language || 'Audio'}</option>
+            ))}
+          </Select>
+        </label>
+      ) : null}
+
+      <label className="grid gap-1.5 text-sm font-semibold">
+        Output Format
+        <Select
+          value={value.outputContainer ?? 'auto'}
+          onChange={(event) => onChange({ ...value, outputContainer: event.target.value as HlsImportOptions['outputContainer'] })}
+        >
+          <option value="auto">Auto</option>
+          <option value="mkv">MKV</option>
+          <option value="mp4">MP4</option>
+        </Select>
+      </label>
+
+      {isLive ? (
+        <label className="grid gap-1.5 text-sm font-semibold">
+          Recording Duration
+          <Input
+            type="number"
+            min={RECORDING_MIN_SECONDS}
+            max={RECORDING_MAX_SECONDS}
+            step="1"
+            value={value.recordingDurationSeconds ?? ''}
+            onChange={(event) => {
+              const raw = Number(event.target.value)
+              onChange({ ...value, recordingDurationSeconds: Number.isInteger(raw) && raw > 0 ? raw : undefined })
+            }}
+            placeholder={`${RECORDING_MIN_SECONDS} – ${RECORDING_MAX_SECONDS} seconds`}
+          />
+          <span className="text-xs font-normal text-slate-400">
+            {formatDuration(value.recordingDurationSeconds)} recording (between {RECORDING_MIN_SECONDS} and {RECORDING_MAX_SECONDS} seconds)
+          </span>
+        </label>
+      ) : null}
+    </fieldset>
+  )
+}
+
+/**
+ * Remote Import modal with backend-owned filename detection + HLS support.
  *
  * While the user types a valid URL, the backend is asked to probe the remote
  * (server-side only — never the browser) after a short debounce. The result
@@ -62,6 +195,11 @@ export function RemoteImportModal({
   const [error, setError] = useState('')
   const [probe, setProbe] = useState<ProbeState>({ status: 'idle' })
 
+  // HLS import options, populated from the probe when the source is HLS. Kept
+  // across URL edits so a user's selections survive a repaint, but cleared when
+  // the modal closes and when the probe says "not HLS".
+  const [hlsOptions, setHlsOptions] = useState<HlsImportOptions | null>(null)
+
   // The detected name is kept separate from the visible field; the field is
   // only auto-filled while the user has not manually edited it.
   const [detectedFileName, setDetectedFileName] = useState('')
@@ -84,6 +222,7 @@ export function RemoteImportModal({
       setFileName('')
       setError('')
       setProbe({ status: 'idle' })
+      setHlsOptions(null)
       setDetectedFileName('')
       setHasUserEditedFileName(false)
       hasUserEditedRef.current = false
@@ -114,6 +253,22 @@ export function RemoteImportModal({
       if (token !== probeTokenRef.current) return // stale — a newer run started
       setProbe({ status: 'detected', result: data })
       setDetectedFileName(data.fileName)
+      // HLS sources expose variant/audio/format controls. Start from `auto`
+      // everywhere; the user can override. Reset only when the classification
+      // changed (a new URL), never on every probe repaint.
+      if (data.sourceType === 'hls_master' || data.sourceType === 'hls_media') {
+        const sourceType = data.sourceType
+        setHlsOptions((prev) => ({
+          sourceType,
+          isLive: data.hls?.isFinite === false,
+          outputContainer: prev?.outputContainer ?? 'auto',
+          variantId: prev?.variantId,
+          audioTrackId: prev?.audioTrackId,
+          recordingDurationSeconds: prev?.recordingDurationSeconds,
+        }))
+      } else {
+        setHlsOptions(null)
+      }
       // Only auto-fill while the user has not typed their own name — check the
       // live ref, not this render's state snapshot.
       if (!hasUserEditedRef.current) setFileName(data.fileName)
@@ -167,6 +322,18 @@ export function RemoteImportModal({
   async function handleSubmit(event: FormEvent) {
     event.preventDefault()
     if (!url.trim()) return
+
+    // Client-side mirror of the server's §19 rule: a live source without a
+    // recording duration is pointless, and a finite source must not carry one.
+    const live = hlsOptions?.isLive === true
+    if (live && hlsOptions.recordingDurationSeconds == null) {
+      setError('Recording duration is required for a live HLS stream.')
+      return
+    }
+    if (!live && hlsOptions?.recordingDurationSeconds != null) {
+      setHlsOptions({ ...hlsOptions, recordingDurationSeconds: undefined })
+    }
+
     setSubmitting(true)
     setError('')
     try {
@@ -176,6 +343,7 @@ export function RemoteImportModal({
         connectedAccountId: accountId || null,
         fileName: fileName.trim() || null,
         detectedFileName: detectedFileName || null,
+        hls: hlsOptions,
       })
       onCreated()
       onClose()
@@ -231,6 +399,13 @@ export function RemoteImportModal({
           </p>
         ) : null}
         {error ? <p className="rounded-xl bg-red-50 p-3 text-sm font-semibold text-red-700">{error}</p> : null}
+        {probeStatus === 'detected' && probe.result.hls ? (
+          <HlsSection
+            hls={probe.result.hls}
+            value={hlsOptions ?? { sourceType: probe.result.sourceType as 'hls_master' | 'hls_media', isLive: probe.result.hls.isFinite === false }}
+            onChange={setHlsOptions}
+          />
+        ) : null}
         <label className="grid gap-2 text-sm font-semibold">
           Destination Folder
           <select className="h-11 rounded-xl border border-slate-200 px-3 text-sm" value={folderId} onChange={(event) => setFolderId(event.target.value)}>

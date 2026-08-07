@@ -1,0 +1,18 @@
+-- AlterTable
+ALTER TABLE `remote_imports` ADD COLUMN `hls_audio_track_id` VARCHAR(64) NULL,
+    ADD COLUMN `hls_audio_track_language` VARCHAR(32) NULL,
+    ADD COLUMN `hls_completed_segment_count` INTEGER NULL,
+    ADD COLUMN `hls_is_live` BOOLEAN NULL,
+    ADD COLUMN `hls_media_duration_seconds` DOUBLE NULL,
+    ADD COLUMN `hls_output_container` VARCHAR(16) NULL,
+    ADD COLUMN `hls_playlist_type` VARCHAR(16) NULL,
+    ADD COLUMN `hls_recording_duration_seconds` INTEGER NULL,
+    ADD COLUMN `hls_segment_count` INTEGER NULL,
+    ADD COLUMN `hls_variant_bandwidth` INTEGER NULL,
+    ADD COLUMN `hls_variant_height` INTEGER NULL,
+    ADD COLUMN `hls_variant_id` VARCHAR(64) NULL,
+    ADD COLUMN `hls_variant_width` INTEGER NULL,
+    ADD COLUMN `output_codec_summary` VARCHAR(191) NULL,
+    ADD COLUMN `output_duration_seconds` DOUBLE NULL,
+    ADD COLUMN `remux_progress` DOUBLE NULL,
+    ADD COLUMN `source_type` VARCHAR(32) NULL;
