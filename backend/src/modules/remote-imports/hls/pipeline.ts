@@ -27,7 +27,7 @@ import { fetchManifest, parseManifest, type HlsAudioTrackMetadata, type HlsManif
 import { materializeMedia, fetchMediaPlaylistSegments, buildSegmentCacheSeed } from './materialize.js'
 import { resolveSelectedVariant, resolveSelectedAudio } from './selection.js'
 import { resolveContainer, containerExtension, shouldAutoFallbackToMkv, type ContainerChoice } from './output.js'
-import { runFfmpegReencode, runFfmpegRemux, verifyFfmpegAvailable, type FfmpegRunResult } from './ffmpeg.js'
+import * as ffmpeg from './ffmpeg.js'
 import { verifyOutput, type MediaVerification } from './verify.js'
 import { ensureJobDir } from './materializer.js'
 import { writeResumeMarker } from './job-dir.js'
@@ -198,7 +198,7 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     expectAudio = Boolean(audioPlaylistUrl) || sourceInfo.sourceType === 'media'
 
     // ── 6. Verify FFmpeg + resolve container. ───────────────────────────────
-    verifyFfmpegAvailable()
+    ffmpeg.verifyFfmpegAvailable()
     container = resolveContainer(selection.outputContainer, {
       hasSeparateAudio: Boolean(audioPlaylistUrl),
       hasSubtitles: false,
@@ -242,10 +242,13 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
 
   // On a terminal remux/verify failure, write the resume marker so a
   // convert-only retry can reuse the materialized segments, then rethrow the
-  // original error (the processor marks the row failed).
-  const writeMarkerAndRethrow = (error: unknown): never => {
+  // original error (the processor marks the row failed). The write is AWAITED:
+  // the processor's cleanup keeps the job dir only while a marker exists, so
+  // the marker must be on disk before the error reaches it — a fire-and-forget
+  // write here races with that check and loses (the dir gets wiped).
+  const writeMarkerAndRethrow = async (error: unknown): Promise<never> => {
     if (error instanceof AppError && (error.code === HLS_ERROR_CODES.HLS_REMUX_FAILED || error.code === HLS_ERROR_CODES.HLS_OUTPUT_INVALID)) {
-      void writeResumeMarker(jobDir, {
+      await writeResumeMarker(jobDir, {
         version: 1,
         mode: 'remux-only',
         playlistUrl: videoPlaylistUrl,
@@ -267,9 +270,9 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
   //   3. any copy failure → re-encode (H.264 + AAC) as a last resort.
   // A re-encode always succeeds or we fail; the marker is written on a terminal
   // failure so a convert-only retry can reuse the downloaded segments.
-  const runRemux = async (forContainer: 'mkv' | 'mp4'): Promise<FfmpegRunResult> => {
+  const runRemux = async (forContainer: 'mkv' | 'mp4'): Promise<ffmpeg.FfmpegRunResult> => {
     try {
-      return await runFfmpegRemux(video.localPlaylistPath, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
+      return await ffmpeg.runFfmpegRemux(video.localPlaylistPath, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
     } catch (error) {
       // Auto-selected MP4: if the mux failed (e.g. a container that cannot hold
       // the stream-copied codec), retry once with MKV, which is the safe
@@ -277,7 +280,7 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
       if (error instanceof AppError && error.code === HLS_ERROR_CODES.HLS_REMUX_FAILED && forContainer === 'mp4' && shouldAutoFallbackToMkv(selection.outputContainer)) {
         actualContainer = 'mkv'
         try {
-          return await runFfmpegRemux(video.localPlaylistPath, outputPartPath(actualContainer), actualContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
+          return await ffmpeg.runFfmpegRemux(video.localPlaylistPath, outputPartPath(actualContainer), actualContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
         } catch (fallbackError) {
           return runReencode(actualContainer, fallbackError)
         }
@@ -289,9 +292,9 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
   // Re-encode (H.264 + AAC) the local playlist — handles image2/png-pipe and
   // other sources a stream copy cannot mux. On failure, write the marker +
   // rethrow.
-  const runReencode = async (forContainer: 'mkv' | 'mp4', originalError: unknown): Promise<FfmpegRunResult> => {
+  const runReencode = async (forContainer: 'mkv' | 'mp4', originalError: unknown): Promise<ffmpeg.FfmpegRunResult> => {
     try {
-      return await runFfmpegReencode(video.localPlaylistPath, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
+      return await ffmpeg.runFfmpegReencode(video.localPlaylistPath, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
     } catch (error) {
       return writeMarkerAndRethrow(error)
     }

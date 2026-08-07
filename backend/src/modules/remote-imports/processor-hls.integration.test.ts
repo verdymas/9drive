@@ -12,7 +12,6 @@ import type { RemoteImportJobData } from './queue.js'
 import { AppError } from '../../utils/app-error.js'
 import { hlsJobDir, readResumeMarker } from './hls/job-dir.js'
 import { tempDir } from './temp-storage.js'
-import * as ffmpegModule from './hls/ffmpeg.js'
 
 /**
  * End-to-end HLS remote-import test (§31 of the spec — the controlled
@@ -52,6 +51,28 @@ vi.mock('./ssrf.js', async (importOriginal) => {
     ...actual,
     validateRemoteUrl: validationSpy.validateRemoteUrl,
     resolveAndValidateHost: validationSpy.resolveAndValidateHost,
+  }
+})
+
+// ── FFmpeg boundary: delegate to the REAL ffmpeg by default, but let a test
+// force a failure (remux/re-encode) via `ffmpegFailures`. vitest gives every
+// importer the SAME mocked module record here — `importOriginal` keeps the
+// real binaries, the flags swap in a failing implementation.
+const ffmpegFailures = vi.hoisted(() => ({ remux: false, reencode: false, reencodeCalls: 0 }))
+
+vi.mock('./hls/ffmpeg.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./hls/ffmpeg.js')>()
+  return {
+    ...actual,
+    runFfmpegRemux: async (...args: Parameters<typeof actual.runFfmpegRemux>) => {
+      if (ffmpegFailures.remux) throw new AppError('HLS_REMUX_FAILED', 'The HLS media could not be converted.', 502)
+      return actual.runFfmpegRemux(...args)
+    },
+    runFfmpegReencode: async (...args: Parameters<typeof actual.runFfmpegReencode>) => {
+      ffmpegFailures.reencodeCalls += 1
+      if (ffmpegFailures.reencode) throw new AppError('HLS_REMUX_FAILED', 'The HLS media could not be converted.', 502)
+      return actual.runFfmpegReencode(...args)
+    },
   }
 })
 
@@ -328,20 +349,14 @@ describe('HLS remote import end-to-end (fixture)', () => {
     await import('node:fs/promises').then((fsp) => fsp.rm(jobDir, { recursive: true, force: true }))
 
     // ── Run 1: make the remux FAIL (the remux step is reached with all
-    // segments materialized). Spy on the real ffmpeg module so the processor
-    // still imports the real one — the processor imports from './hls/ffmpeg.js'
-    // which resolves to THIS module instance, so the spy intercepts it. The
-    // conversion chain runs remux → mkv-fallback remux → re-encode, so ALL
-    // three must fail for the import to fail.
-    const remuxSpy = vi.spyOn(ffmpegModule, 'runFfmpegRemux').mockRejectedValue(
-      new AppError('HLS_REMUX_FAILED', 'The HLS media could not be converted.', 502),
-    )
-    const reencodeSpy = vi.spyOn(ffmpegModule, 'runFfmpegReencode').mockRejectedValue(
-      new AppError('HLS_REMUX_FAILED', 'The HLS media could not be converted.', 502),
-    )
+    // segments materialized). The conversion chain runs remux → mkv-fallback
+    // remux → re-encode, so ALL THREE must fail for the import to fail — the
+    // mocked boundary (see vi.mock above) throws for both functions.
+    ffmpegFailures.remux = true
+    ffmpegFailures.reencode = true
     await processRemoteImportJob(job)
-    remuxSpy.mockRestore()
-    reencodeSpy.mockRestore()
+    ffmpegFailures.remux = false
+    ffmpegFailures.reencode = false
 
     // The job must be marked failed with the remux error code.
     const failed = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'failed' && call[0]?.data?.errorCode === 'HLS_REMUX_FAILED')
@@ -401,15 +416,14 @@ describe('HLS remote import end-to-end (fixture)', () => {
 
     // The conversion chain must attempt remux, the mkv fallback, and re-encode.
     // Only the re-encode (REAL ffmpeg) is allowed to succeed.
-    const reencodeSpy = vi.spyOn(ffmpegModule, 'runFfmpegReencode')
-    const remuxSpy = vi.spyOn(ffmpegModule, 'runFfmpegRemux').mockRejectedValue(
-      new AppError('HLS_REMUX_FAILED', 'The HLS media could not be converted.', 502),
-    )
+    ffmpegFailures.remux = true
+    ffmpegFailures.reencode = false
     await processRemoteImportJob(job)
-    remuxSpy.mockRestore()
-    reencodeSpy.mockRestore()
+    ffmpegFailures.remux = false
 
-    expect(reencodeSpy).toHaveBeenCalled()
+    // The re-encode must have run and produced a real output (the wrapper
+    // delegates to the REAL ffmpeg; it only counts calls).
+    expect(ffmpegFailures.reencodeCalls).toBeGreaterThan(0)
     const completed = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'completed')
     expect(completed).toBe(true)
     expect(createdFile.name).toMatch(/\.(mp4|mkv)$/)
