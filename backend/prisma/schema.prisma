@@ -371,7 +371,7 @@ model FolderStorageLocation {
   folderId           String           @map("folder_id") @db.Char(36)
   connectedAccountId String           @map("connected_account_id") @db.Char(36)
   provider           String           @db.VarChar(32)
-  providerFolderId   String           @db.VarChar(191)
+  providerFolderId   String           @map("provider_folder_id") @db.VarChar(191)
   createdAt          DateTime         @default(now()) @map("created_at")
   updatedAt          DateTime         @updatedAt @map("updated_at")
   folder             Folder           @relation(fields: [folderId], references: [id], onDelete: Cascade)

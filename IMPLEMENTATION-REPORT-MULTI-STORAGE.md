@@ -51,6 +51,14 @@ model FolderStorageLocation {
 `File.connectedAccountId` remains required — a file always lives on exactly one
 physical account; the refactor never moves provider ownership into locations.
 
+> **Post-verification fix (2026-08-07):** `providerFolderId` in the
+> `FolderStorageLocation` model originally lacked `@map("provider_folder_id")`.
+> The generated client therefore queried the literal column `providerFolderId`
+> while the hand-written migration had created `provider_folder_id`, producing
+> `column does not exist` at `GET /folders` in production. Added the missing
+> `@map` in `schema.prisma` — the migration did not need re-running (DB was
+> already correct); only the client needed regeneration/redeploy.
+
 ## Migration
 
 `backend/prisma/migrations/20260807080000_multi_storage_locations/migration.sql`
