@@ -1,12 +1,82 @@
-import { FolderOpen, MoreVertical, Star } from 'lucide-react'
-import { type MouseEvent, useState } from 'react'
+import { ArrowDown, ArrowUp, ArrowUpDown, FolderOpen, MoreVertical, Star } from 'lucide-react'
+import { type MouseEvent, useMemo, useState } from 'react'
 import { AvatarStack } from '@/components/drive/AvatarStack'
 import { FileIcon } from '@/components/drive/FileIcon'
 import type { FileItem } from '@/data/drive-data'
 import { apiFetch } from '@/lib/api'
 
+type SortKey = 'name' | 'modified' | 'size'
+type SortDir = 'asc' | 'desc'
+
+/** Raw bytes for size sorting when `sizeBytes` (the API field) is available. */
+function sizeInBytes(file: FileItem): number | null {
+  const raw = file.sizeBytes
+  if (raw === undefined || raw === null || raw === '') return null
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+/** Parse the "Last Modified" label back into a comparable timestamp. */
+function modifiedTimestamp(file: FileItem): number {
+  const value = file.createdAt ?? file.date
+  const parsed = Date.parse(value)
+  if (!Number.isNaN(parsed)) return parsed
+  // "Today, 09:42 AM" / "Yesterday, 07:12 PM" style labels — approximate so
+  // relative dates still sort sensibly instead of colliding.
+  const lower = value.toLowerCase()
+  if (lower.includes('today')) return Date.now() - 4 * 60 * 60 * 1000
+  if (lower.includes('yesterday')) return Date.now() - 28 * 60 * 60 * 1000
+  return 0
+}
+
+function compareFiles(a: FileItem, b: FileItem, key: SortKey): number {
+  if (key === 'name') return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+  if (key === 'modified') return modifiedTimestamp(a) - modifiedTimestamp(b)
+  const aBytes = sizeInBytes(a)
+  const bBytes = sizeInBytes(b)
+  if (aBytes !== null && bBytes !== null) return aBytes - bBytes
+  // Fall back to the human label when raw bytes are missing.
+  if (aBytes === null && bBytes === null) return a.size.localeCompare(b.size, undefined, { numeric: true, sensitivity: 'base' })
+  return aBytes === null ? 1 : -1
+}
+
 export function FileTable({ files, mode = 'default', selectedFileIds = new Set<string>(), allSelected = false, onFileContextMenu, onToggleFile, onToggleAll }: { files: FileItem[]; mode?: 'default' | 'shared' | 'recent' | 'starred' | 'archived'; selectedFileIds?: Set<string>; allSelected?: boolean; onFileContextMenu?: (event: MouseEvent<HTMLElement>, file: FileItem) => void; onToggleFile?: (file: FileItem) => void; onToggleAll?: () => void }) {
   const [copiedFileId, setCopiedFileId] = useState<string | null>(null)
+  const [sortKey, setSortKey] = useState<SortKey | null>(null)
+  const [sortDir, setSortDir] = useState<SortDir>('asc')
+
+  const sortedFiles = useMemo(() => {
+    if (!sortKey) return files
+    const dir = sortDir === 'asc' ? 1 : -1
+    return [...files].sort((a, b) => dir * compareFiles(a, b, sortKey))
+  }, [files, sortKey, sortDir])
+
+  /** Toggle: clicking the active column flips direction, else starts asc. */
+  function toggleSort(key: SortKey) {
+    if (sortKey === key) {
+      setSortDir((current) => (current === 'asc' ? 'desc' : 'asc'))
+    } else {
+      setSortKey(key)
+      setSortDir('asc')
+    }
+  }
+
+  function SortButton({ label, column }: { label: string; column: SortKey }) {
+    const active = sortKey === column
+    return (
+      <button
+        type="button"
+        onClick={() => toggleSort(column)}
+        className={`inline-flex items-center gap-1 rounded px-1 py-0.5 -my-0.5 font-extrabold transition-colors ${active ? 'text-blue-600' : 'text-slate-500 hover:text-slate-950'}`}
+        aria-label={`Sort by ${label.toLowerCase()}`}
+      >
+        {label}
+        {active
+          ? (sortDir === 'asc' ? <ArrowUp className="h-3.5 w-3.5" /> : <ArrowDown className="h-3.5 w-3.5" />)
+          : <ArrowUpDown className="h-3.5 w-3.5 opacity-60" />}
+      </button>
+    )
+  }
 
   return (
     <div className="mt-4">
@@ -48,20 +118,20 @@ export function FileTable({ files, mode = 'default', selectedFileIds = new Set<s
           <thead>
             <tr className="border-b border-slate-200/20 text-slate-950">
               <th className="w-9 py-2.5"><input type="checkbox" className="h-4 w-4 accent-blue-600" checked={allSelected} onChange={onToggleAll} /></th>
-              <th className="py-2.5 font-extrabold">Name</th>
+              <th className="py-2.5"><SortButton label="Name" column="name" /></th>
               {mode === 'default' ? <th className="py-2.5 font-extrabold text-slate-500 font-semibold">Folder</th> : null}
               {mode === 'shared' ? <th className="py-2.5 font-extrabold">Owner</th> : null}
               {mode === 'recent' ? <th className="py-2.5 font-extrabold">Last Opened</th> : null}
               {mode === 'starred' ? <th className="py-2.5 font-extrabold">Starred On</th> : null}
               {mode === 'archived' ? <th className="py-2.5 font-extrabold">Archived Date</th> : null}
-              {mode === 'archived' ? <th className="py-2.5 font-extrabold">Original Location</th> : <th className="py-2.5 font-extrabold">Last Modified</th>}
-              <th className="py-2.5 font-extrabold">Size</th>
+              {mode === 'archived' ? <th className="py-2.5 font-extrabold">Original Location</th> : <th className="py-2.5"><SortButton label="Last Modified" column="modified" /></th>}
+              <th className="py-2.5"><SortButton label="Size" column="size" /></th>
               <th className="py-2.5 font-extrabold">Access</th>
               <th className="py-2.5" />
             </tr>
           </thead>
           <tbody>
-            {files.map((file) => (
+            {sortedFiles.map((file) => (
               <tr key={file.id ?? file.name} draggable onDragStart={(event) => { event.dataTransfer.setData('text/plain', file.id ?? ''); event.dataTransfer.effectAllowed = 'move' }} onContextMenu={(event) => onFileContextMenu?.(event, file)} onClick={() => onToggleFile?.(file)} className={selectedFileIds.has(file.id ?? '') ? 'group border-b file-selected transition hover:bg-orange-500/15 cursor-grab active:cursor-grabbing' : 'group border-b border-slate-200/10 transition hover:bg-slate-100 cursor-grab active:cursor-grabbing'}>
                 <td className="py-2.5"><input type="checkbox" className="h-4 w-4 accent-blue-600" checked={selectedFileIds.has(file.id ?? '')} onChange={() => onToggleFile?.(file)} onClick={(event) => event.stopPropagation()} /></td>
                 <td className="py-2.5 font-semibold">
