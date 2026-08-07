@@ -7,10 +7,12 @@ import { google } from 'googleapis'
 import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
-import { ensureGoogleAppFolder, getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
+import { getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
 import { buildS3ObjectKey, getS3ConfigForAccount, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
 import { createAuditLog } from '../../utils/audit.js'
-import { planBatchUploads, selectAccount } from './storage-routing.service.js'
+import { planBatchUploads } from './storage-routing.service.js'
+import { resolveUploadPlacement } from '../storage/upload-placement.service.js'
+import { resolveUploadParent } from '../storage/provider-folder.service.js'
 
 export const uploadRouter = Router()
 
@@ -18,6 +20,15 @@ type UploadMeta = { fieldName: string; fileName: string; mimeType: string; sizeB
 
 function logUpload(message: string, metadata?: Record<string, unknown>) {
   console.info('[upload]', message, metadata ?? '')
+}
+
+/**
+ * The S3 object-key prefix for a folder location: the location's
+ * `providerFolderId` is the full virtual path (e.g. `9drive/Movies`).
+ * `buildS3ObjectKey` strips the account root and appends `/userId/fileId/name`.
+ */
+function folderPrefixFor(config: { prefix: string }, providerFolderId: string) {
+  return providerFolderId
 }
 
 function syncQuotaInBackground(accountId: string, sessionId: string) {
@@ -83,20 +94,18 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
         }
 
         const folderId = meta.folderId || null
-        let targetAccountId: string | undefined = undefined
-        if (folderId) {
-          const folderRecord = await prisma.folder.findFirstOrThrow({ where: { id: folderId, userId: req.user!.id, deletedAt: null } })
-          if (folderRecord.connectedAccountId) {
-            targetAccountId = folderRecord.connectedAccountId
-          }
-        }
 
-        const account = await selectAccount(req.user!.id, meta.sizeBytes, reservedBytesByAccount, targetAccountId)
-        if (!account) {
+        // Placement: manual pin (multipart has none) or Automatic routing with
+        // the destination folder's existing locations as a soft preference.
+        let placement
+        try {
+          placement = await resolveUploadPlacement(req.user!.id, folderId, undefined, meta.sizeBytes, reservedBytesByAccount, 'multipart')
+        } catch (error: any) {
           fileStream.resume()
-          failed.push({ fileName, code: 'NO_ACCOUNT_WITH_ENOUGH_SPACE', message: 'No connected storage account has enough space for this upload.' })
+          failed.push({ fileName, code: error?.code === 'AUTOMATIC_STORAGE_NO_ELIGIBLE_ACCOUNT' ? 'NO_ACCOUNT_WITH_ENOUGH_SPACE' : (error?.code ?? 'UPLOAD_FAILED'), message: error?.message ?? 'Upload failed' })
           return
         }
+        const account = placement.connectedAccount
         reservedBytesByAccount.set(account.id, (reservedBytesByAccount.get(account.id) ?? 0n) + meta.sizeBytes)
 
         const session = await prisma.uploadSession.create({ data: { userId: req.user!.id, targetConnectedAccountId: account.id, folderId, fileName, mimeType: meta.mimeType, sizeBytes: meta.sizeBytes, status: 'uploading' } })
@@ -122,7 +131,7 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
             data: { userId: req.user!.id, connectedAccountId: account.id, folderId, provider: 's3', providerFileId: 'pending', name: fileName, mimeType: meta.mimeType, sizeBytes: meta.sizeBytes, status: 'uploading' },
           })
           s3FileId = provisionalFile.id
-          providerFileId = buildS3ObjectKey(config, req.user!.id, provisionalFile.id, fileName)
+          providerFileId = buildS3ObjectKey(config, req.user!.id, provisionalFile.id, fileName, folderId ? folderPrefixFor(config, placement.folderStorageLocation.providerFolderId) : undefined)
           await uploadS3Object(config, providerFileId, Readable.from(fileBuffer), meta.mimeType)
           await prisma.file.update({ where: { id: provisionalFile.id }, data: { providerFileId, status: 'active' } })
           completed.push({ ...provisionalFile, providerFileId, status: 'active', sizeBytes: provisionalFile.sizeBytes.toString() })
@@ -130,14 +139,7 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
         } else {
           const auth = await getAuthedGoogleClient(account)
           const drive = google.drive({ version: 'v3', auth })
-          const appFolderId = await ensureGoogleAppFolder(account)
-          let targetParentId = appFolderId
-          if (folderId) {
-            const folderRecord = await prisma.folder.findFirst({ where: { id: folderId, userId: req.user!.id } })
-            if (folderRecord?.providerFolderId) {
-              targetParentId = folderRecord.providerFolderId
-            }
-          }
+          const targetParentId = resolveUploadParent(account, placement.folderStorageLocation)
           const uploaded = await drive.files.create({
             requestBody: { name: fileName, parents: [targetParentId] },
             media: { mimeType: meta.mimeType, body: Readable.from(fileBuffer) },
@@ -244,23 +246,19 @@ uploadRouter.post('/resumable/init', requireAuth, async (req: AuthRequest, res, 
     if (sizeBytes > BigInt(env.MAX_UPLOAD_BYTES)) return res.status(400).json({ code: 'UPLOAD_TOO_LARGE', message: 'File exceeds max upload size.' })
 
     const folderId = body.folderId || null
-    let targetAccountId = body.targetAccountId
-    // A pin chosen by the user (dropdown) is a soft preference — if the pinned
-    // account can't hold the file, fall back to another eligible account. A
-    // pin from the destination folder's ownership stays strict: subfolder
-    // uploads must land on the account that owns the folder or Google Drive
-    // returns 404s for the physical file.
-    let allowFallback = Boolean(body.targetAccountId)
-    if (folderId) {
-      const folderRecord = await prisma.folder.findFirstOrThrow({ where: { id: folderId, userId: req.user!.id, deletedAt: null } })
-      if (folderRecord.connectedAccountId) {
-        targetAccountId = folderRecord.connectedAccountId
-        allowFallback = false
-      }
-    }
 
-    const account = await selectAccount(req.user!.id, sizeBytes, new Map<string, bigint>(), targetAccountId, allowFallback)
-    if (!account) return res.status(400).json({ code: 'NO_ACCOUNT_WITH_ENOUGH_SPACE', message: 'No connected storage account has enough space.' })
+    // Placement: a user-chosen account pin is authoritative (no silent
+    // fallback — manual selection must be respected or fail clearly); without
+    // a pin, Automatic routing applies with the destination folder's existing
+    // locations as a soft preference.
+    let placement
+    try {
+      placement = await resolveUploadPlacement(req.user!.id, folderId, body.targetAccountId, sizeBytes, new Map<string, bigint>(), 'resumable')
+    } catch (error: any) {
+      const code = error?.code === 'AUTOMATIC_STORAGE_NO_ELIGIBLE_ACCOUNT' ? 'NO_ACCOUNT_WITH_ENOUGH_SPACE' : (error?.code ?? 'UPLOAD_FAILED')
+      return res.status(400).json({ code, message: error?.message ?? 'No connected storage account has enough space.' })
+    }
+    const account = placement.connectedAccount
 
     if (account.provider !== 'google_drive') {
       const session = await prisma.uploadSession.create({
@@ -278,14 +276,7 @@ uploadRouter.post('/resumable/init', requireAuth, async (req: AuthRequest, res, 
     }
 
     const auth = await getAuthedGoogleClient(account)
-    const appFolderId = await ensureGoogleAppFolder(account)
-    let targetParentId = appFolderId
-    if (folderId) {
-      const folderRecord = await prisma.folder.findFirst({ where: { id: folderId, userId: req.user!.id } })
-      if (folderRecord?.providerFolderId) {
-        targetParentId = folderRecord.providerFolderId
-      }
-    }
+    const targetParentId = resolveUploadParent(account, placement.folderStorageLocation)
 
     // Initiate Google Drive Resumable Session
     const headers = new Headers()

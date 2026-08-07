@@ -6,6 +6,7 @@ export type FolderItem = {
   iconUrl?: string | null
   parentId?: string | null
   providerFolderId?: string | null
+  primaryLocation?: { connectedAccountId: string; provider: string; providerFolderId: string } | null
 }
 
 export type FileItem = {

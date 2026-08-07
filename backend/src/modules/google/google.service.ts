@@ -111,13 +111,29 @@ export async function syncGoogleAppFolderFiles(accountId: string, userId: string
   const drive = google.drive({ version: 'v3', auth })
   const appFolderId = await ensureGoogleAppFolder(account)
 
-  const userFolders = await prisma.folder.findMany({
-    where: { userId, connectedAccountId: account.id, deletedAt: null },
-    select: { id: true, providerFolderId: true }
+  // Physical folders on THIS account are storage locations (multi-account
+  // support): a virtual folder's Drive folder for this account may exist even
+  // when the folder's legacy binding points elsewhere. Fall back to the legacy
+  // `Folder.providerFolderId` only while no location rows exist yet (migration
+  // period).
+  const userFolderLocations = await prisma.folderStorageLocation.findMany({
+    where: { connectedAccountId: account.id },
+    select: { folderId: true, providerFolderId: true },
   })
+  const legacyFolders = await prisma.folder.findMany({
+    where: {
+      userId,
+      connectedAccountId: account.id,
+      deletedAt: null,
+      providerFolderId: { not: null },
+    },
+    select: { id: true, providerFolderId: true },
+  })
+  const legacyByProviderId = new Map(legacyFolders.map((f) => [f.providerFolderId as string, f.id]))
   const parentIds = [
     appFolderId,
-    ...userFolders.map((f) => f.providerFolderId).filter((id): id is string => !!id)
+    ...userFolderLocations.map((l) => l.providerFolderId),
+    ...legacyFolders.map((f) => f.providerFolderId as string),
   ]
 
   const driveFiles: DriveFileMetadata[] = []
@@ -149,7 +165,10 @@ export async function syncGoogleAppFolderFiles(accountId: string, userId: string
   let updated = 0
   let deleted = 0
 
-  const folderIdMap = new Map(userFolders.map((f) => [f.providerFolderId, f.id]))
+  const folderIdMap = new Map<string, string>([
+    ...userFolderLocations.map((l) => [l.providerFolderId, l.folderId] as const),
+    ...legacyByProviderId.entries(),
+  ])
 
   for (const driveFile of driveFiles) {
     const dbFolderId = driveFile.parentId === appFolderId ? null : (folderIdMap.get(driveFile.parentId) ?? null)

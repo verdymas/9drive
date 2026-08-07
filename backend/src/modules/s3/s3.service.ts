@@ -39,8 +39,30 @@ function safeFileName(name: string) {
   return name.replace(/[\\/]+/g, '-').replace(/[\u0000-\u001f\u007f]+/g, '').slice(0, 180) || 'file'
 }
 
-export function buildS3ObjectKey(config: Pick<S3Config, 'prefix'>, userId: string, fileId: string, fileName: string) {
-  return `${config.prefix.replace(/^\/+|\/+$/g, '')}/${userId}/${fileId}/${safeFileName(fileName)}`
+/**
+ * Build the S3 object key for a file.
+ *
+ * With a `folderPrefix` (the virtual folder's physical location prefix, e.g.
+ * `Movies/Action` relative to the account root `9drive`), the object lands
+ * under the folder's key prefix:
+ *
+ *   9drive/Movies/Action/{userId}/{fileId}/{name}
+ *
+ * Without one (root upload, or a folder that has never been materialized on
+ * this account), the legacy flat scheme is kept:
+ *
+ *   9drive/{userId}/{fileId}/{name}
+ *
+ * Existing objects under the flat scheme are NOT migrated by this refactor —
+ * both schemes coexist; keys are unique because `fileId` is a UUID.
+ */
+export function buildS3ObjectKey(config: Pick<S3Config, 'prefix'>, userId: string, fileId: string, fileName: string, folderPrefix?: string) {
+  const root = config.prefix.replace(/^\/+|\/+$/g, '')
+  if (folderPrefix) {
+    const cleanFolder = folderPrefix.replace(/^\/+|\/+$/g, '').replace(/^9drive\/?/, '')
+    if (cleanFolder) return `${root}/${cleanFolder}/${userId}/${fileId}/${safeFileName(fileName)}`
+  }
+  return `${root}/${userId}/${fileId}/${safeFileName(fileName)}`
 }
 
 export async function uploadS3Object(config: S3Config, key: string, body: NodeJS.ReadableStream, mimeType: string) {

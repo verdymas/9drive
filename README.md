@@ -687,6 +687,31 @@ file
 - `backend/.env` is ignored by git.
 - Do not expose `TOKEN_ENCRYPTION_KEY`, `JWT_ACCESS_SECRET`, `RECAPTCHA_SECRET_KEY`, OAuth client secrets, or raw share/preview/handoff tokens.
 
+## Storage Architecture
+
+9Drive separates two concepts that used to be bound together:
+
+- **Virtual folder** — the logical tree the user navigates (All Files). It owns no storage.
+- **Physical location** (`folder_storage_locations`) — one virtual folder's physical folder on one connected account. A virtual folder can have 0..N locations across accounts/providers.
+
+```
+Movies            (virtual folder — appears once in All Files)
+├── location on Drive A: 9drive/Movies            (folder id …)
+├── location on Drive B: 9drive/Movies            (folder id …)
+└── location on S3:      prefix/Movies/           (object-key prefix)
+    Action
+    ├── location on Drive B: 9drive/Movies/Action
+    └── location on S3:      prefix/Movies/Action/
+```
+
+- Physical folders are created **lazily**: `ensureFolderStorageLocation` materializes the whole ancestor chain on the chosen account only when an upload, import, or move actually needs it there. Creating a folder in the UI touches nothing physical.
+- **Automatic routing** ignores folder ownership entirely. Quota is the hard filter; an account that already hosts the destination folder is only a tie-breaker. So a nearly-full Drive A is skipped even when the folder was "created" there.
+- **Manual account selection** is authoritative: if the chosen account lacks space, the upload fails with a clear error — no silent switch.
+- Files always live on one physical account; the virtual folder just aggregates them. **Rebalancing is out of scope**: existing files stay where they are.
+- Remote Import (direct and HLS) uses the same placement service as normal uploads.
+- The folder API exposes `storageLocationCount`; the UI keeps showing one unified folder.
+- S3 has no real folder objects: a location's `providerFolderId` is the object-key prefix of the virtual path, and upload keys derive from it (`prefix/<folderPrefix>/<userId>/<fileId>/<name>`). Pre-existing flat-key objects are not migrated.
+
 ## Production Notes
 
 - Replace localhost redirect URIs with production URLs.

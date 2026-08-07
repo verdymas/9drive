@@ -8,7 +8,7 @@ import { createAuditLog } from '../../utils/audit.js'
 import { decryptText, encryptText } from '../../utils/crypto.js'
 import { ensureGoogleAppFolder, getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
 import { buildS3ObjectKey, getS3ConfigForAccount, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
-import { selectAccount } from '../uploads/storage-routing.service.js'
+import { resolveUploadPlacement } from '../storage/upload-placement.service.js'
 import type { RemoteImportJobData } from './queue.js'
 import { followRemoteUrl } from './url-downloader.js'
 import { uploadToGoogleResumable } from './google-resumable-uploader.js'
@@ -135,6 +135,7 @@ async function uploadTempFile(
   fileName: string,
   mimeType: string,
   tempPartPath: string,
+  providerFolderId: string,
   onUploadProgress?: (uploadedBytes: bigint) => void,
 ) {
   const fileStream = fs.createReadStream(tempPartPath)
@@ -145,7 +146,7 @@ async function uploadTempFile(
     const provisionalFile = await prisma.file.create({
       data: { userId, connectedAccountId: account.id, folderId, provider: 's3', providerFileId: 'pending', name: fileName, mimeType, sizeBytes: 0n, status: 'uploading' },
     })
-    const providerFileId = buildS3ObjectKey(config, userId, provisionalFile.id, fileName)
+    const providerFileId = buildS3ObjectKey(config, userId, provisionalFile.id, fileName, folderId ? providerFolderId : undefined)
     try {
       await uploadS3Object(config, providerFileId, fileStream, mimeType)
       const s3Size = BigInt((await fsp.stat(tempPartPath)).size)
@@ -161,7 +162,7 @@ async function uploadTempFile(
   // Google Drive — resumable upload streams the temp file directly, records
   // the session encrypted (for crash-safe), and returns provider metadata.
   const uploadProgress = throttledProgressUpdater(importId, STAGES.UPLOADING)
-  const uploaded = await uploadToGoogleResumable(importId, account.id, userId, folderId, fileName, mimeType, tempPartPath, (bytes) => {
+  const uploaded = await uploadToGoogleResumable(importId, account.id, userId, fileName, mimeType, tempPartPath, providerFolderId, (bytes) => {
     void uploadProgress({ uploadedBytes: bytes.toString() })
   })
   return { providerFileId: uploaded.providerFileId, fileId: null }
@@ -317,19 +318,19 @@ async function processHlsImport(
 
     // ── Storage selection (same routing as direct imports). ─────────────────
     await updateStage(importId, STAGES.SELECTING_STORAGE)
-    const folder = folderId
-      ? await prisma.folder.findFirst({ where: { id: folderId, userId, deletedAt: null } })
-      : null
-    const targetAccountId = record.connectedAccountId ?? folder?.connectedAccountId ?? undefined
-    // A user-chosen pin (import record) is a soft preference; a folder-ownership
-    // pin stays strict so the remuxed file lands on the account that owns the
-    // folder (Google Drive 404s otherwise).
-    const allowFallback = Boolean(record.connectedAccountId)
-    const account = await selectAccount(userId, pipeline.downloadedBytes, undefined, targetAccountId, allowFallback)
-    if (!account) {
-      await markFailed(importId, 'NO_ACCOUNT_WITH_ENOUGH_SPACE', 'No connected storage account has enough space.')
+    // Placement: a user-chosen account pin (import record) is authoritative —
+    // the import fails with a clear quota error rather than silently switching
+    // providers. Without a pin, Automatic routing applies (destination folder
+    // locations are only a soft preference).
+    let placement
+    try {
+      placement = await resolveUploadPlacement(userId, folderId, record.connectedAccountId, pipeline.downloadedBytes, undefined, 'remote-import')
+    } catch (error: any) {
+      const code = error?.code === 'AUTOMATIC_STORAGE_NO_ELIGIBLE_ACCOUNT' ? 'NO_ACCOUNT_WITH_ENOUGH_SPACE' : (error?.code ?? 'IMPORT_FAILED')
+      await markFailed(importId, code, error?.message ?? 'No connected storage account has enough space.')
       return null
     }
+    const account = placement.connectedAccount
 
     // ── Upload the remuxed file. ────────────────────────────────────────────
     const mimeType = record.mimeType ?? (pipeline.container === 'mp4' ? 'video/mp4' : 'video/x-matroska')
@@ -341,6 +342,7 @@ async function processHlsImport(
       pipeline.fileName,
       mimeType,
       pipeline.outputPath,
+      placement.folderStorageLocation.providerFolderId,
     )
     const sizeBytes = BigInt((await fsp.stat(pipeline.outputPath)).size)
 
@@ -475,22 +477,23 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
 
     // Select destination account (default routing or pinned account).
     await updateStage(importId, STAGES.SELECTING_STORAGE)
-    const folder = folderId
-      ? await prisma.folder.findFirst({ where: { id: folderId, userId, deletedAt: null } })
-      : null
-    const targetAccountId = record.connectedAccountId ?? folder?.connectedAccountId ?? undefined
-    // User-chosen pin (import record) is a soft preference; folder-ownership
-    // pin stays strict so the file lands on the account that owns the folder.
-    const allowFallback = Boolean(record.connectedAccountId)
-    const account = await selectAccount(userId, downloaded.contentLength ?? 0n, undefined, targetAccountId, allowFallback)
-    if (!account) {
-      await markFailed(importId, 'NO_ACCOUNT_WITH_ENOUGH_SPACE', 'No connected storage account has enough space.')
+    // Placement: a user-chosen account pin (import record) is authoritative —
+    // the import fails with a clear quota error rather than silently switching
+    // providers. Without a pin, Automatic routing applies (destination folder
+    // locations are only a soft preference).
+    let placement
+    try {
+      placement = await resolveUploadPlacement(userId, folderId, record.connectedAccountId, downloaded.contentLength ?? 0n, undefined, 'remote-import')
+    } catch (error: any) {
+      const code = error?.code === 'AUTOMATIC_STORAGE_NO_ELIGIBLE_ACCOUNT' ? 'NO_ACCOUNT_WITH_ENOUGH_SPACE' : (error?.code ?? 'IMPORT_FAILED')
+      await markFailed(importId, code, error?.message ?? 'No connected storage account has enough space.')
       await removeTempFile(importId)
       return
     }
+    const account = placement.connectedAccount
 
     // Upload.
-    const uploaded = await uploadTempFile(importId, { id: account.id, provider: account.provider }, userId, folderId, fileName, mimeType, downloaded.tempPartPath)
+    const uploaded = await uploadTempFile(importId, { id: account.id, provider: account.provider }, userId, folderId, fileName, mimeType, downloaded.tempPartPath, placement.folderStorageLocation.providerFolderId)
     assertWithinTimeout()
     await updateStage(importId, STAGES.REGISTERING)
 

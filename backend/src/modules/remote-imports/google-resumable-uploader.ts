@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import { Readable } from 'node:stream'
 import { prisma } from '../../config/prisma.js'
 import { decryptText, encryptText } from '../../utils/crypto.js'
-import { getAuthedGoogleClient, ensureGoogleAppFolder } from '../google/google.service.js'
+import { getAuthedGoogleClient } from '../google/google.service.js'
 import { AppError } from '../../utils/app-error.js'
 
 /**
@@ -33,21 +33,19 @@ export async function uploadToGoogleResumable(
   importId: string,
   accountId: string,
   userId: string,
-  folderId: string | null,
   fileName: string,
   mimeType: string,
   tempPath: string,
+  parentProviderFolderId: string,
   onProgress?: (uploadedBytes: bigint) => void,
 ): Promise<GoogleResumableResult> {
   const account = await prisma.connectedAccount.findUniqueOrThrow({ where: { id: accountId } })
   const auth = await getAuthedGoogleClient(account)
   const drive = google.drive({ version: 'v3', auth })
-  const appFolderId = await ensureGoogleAppFolder(account)
-  let targetParentId = appFolderId
-  if (folderId) {
-    const folder = await prisma.folder.findFirst({ where: { id: folderId, userId } })
-    if (folder?.providerFolderId) targetParentId = folder.providerFolderId
-  }
+  // The physical parent is resolved by placement BEFORE the upload starts:
+  // for a virtual folder it is the folder's storage location on this account
+  // (lazily materialized); for a root upload it is the account's 9drive root.
+  const targetParentId = parentProviderFolderId
 
   const fileSize = fs.statSync(tempPath).size
   const token = await auth.getAccessToken()

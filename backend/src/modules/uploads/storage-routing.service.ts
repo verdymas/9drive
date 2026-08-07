@@ -68,6 +68,7 @@ export async function selectAccount(
   reservedBytesByAccount = new Map<string, bigint>(),
   targetAccountId?: string | null,
   allowFallback = false,
+  preferredAccountIds: string[] = [],
 ) {
   const accounts = await prisma.connectedAccount.findMany({
     where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected', ...(targetAccountId ? { id: targetAccountId } : {}) },
@@ -121,6 +122,12 @@ export async function selectAccount(
   const mode = (['most_available', 'round_robin', 'priority'].includes(policy.mode) ? policy.mode : 'most_available') as RoutingMode
   const priorityAccountIds = normalizePriorityAccountIds(policy.priorityAccountIds)
 
+  // Accounts that already hold a physical location for the destination folder.
+  // A soft preference ONLY — quota remains the hard filter (see #11 in the
+  // multi-storage spec), so a nearly-full account never wins over an eligible
+  // account that would need lazy folder materialization.
+  const preferred = new Set(preferredAccountIds)
+
   if (mode === 'priority') return byPriority(eligible, priorityAccountIds)[0]?.account ?? null
 
   if (mode === 'round_robin') {
@@ -132,10 +139,18 @@ export async function selectAccount(
 
   return eligible
     .sort((a, b) => {
+      // 1. Quota (descending) stays the primary ordering.
+      if (a.availableBytes !== null && b.availableBytes !== null && a.availableBytes !== b.availableBytes) {
+        return Number(b.availableBytes - a.availableBytes)
+      }
+      if (a.availableBytes === null && b.availableBytes !== null) return a.account.provider === 's3' ? -1 : 1
+      if (b.availableBytes === null && a.availableBytes !== null) return b.account.provider === 's3' ? 1 : -1
       if (a.availableBytes === null && b.availableBytes === null) return a.account.provider === 's3' ? -1 : 1
-      if (a.availableBytes === null) return a.account.provider === 's3' ? -1 : 1
-      if (b.availableBytes === null) return b.account.provider === 's3' ? 1 : -1
-      return Number(b.availableBytes - a.availableBytes)
+      // 2. Tie-breaker: existing physical location for the destination folder.
+      if (preferred.has(a.account.id) && !preferred.has(b.account.id)) return -1
+      if (preferred.has(b.account.id) && !preferred.has(a.account.id)) return 1
+      // 3. Stable order by creation time.
+      return a.account.createdAt.getTime() - b.account.createdAt.getTime()
     })[0]?.account
 }
 

@@ -3,8 +3,11 @@ import { google } from 'googleapis'
 import { z } from 'zod'
 import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
-import { getAuthedGoogleClient, syncGoogleQuota, ensureGoogleAppFolder } from '../google/google.service.js'
+import { getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
+import { deleteS3Object, syncS3Quota } from '../s3/s3.service.js'
 import { createAuditLog } from '../../utils/audit.js'
+import { deleteProviderFolder, ensureProviderRoot, moveProviderFolder, renameProviderFolder } from '../storage/provider-folder.service.js'
+import { ensureFolderStorageLocation } from '../storage/folder-materialization.service.js'
 
 export const folderRouter = Router()
 folderRouter.use(requireAuth)
@@ -21,62 +24,31 @@ const createSchema = z.object({
   parentId: z.string().nullable().optional(),
 })
 
-function serializeFolder(folder: { id: string; name: string; color: string; iconUrl?: string | null; parentId?: string | null; providerFolderId?: string | null; createdAt: Date; updatedAt: Date }) {
-  return { ...folder, providerFolderId: folder.providerFolderId ?? null, createdAt: folder.createdAt.toISOString(), updatedAt: folder.updatedAt.toISOString() }
+type FolderRow = {
+  id: string
+  name: string
+  color: string
+  iconUrl: string | null
+  parentId: string | null
+  providerFolderId: string | null
+  createdAt: Date
+  updatedAt: Date
+  storageLocationCount?: number
+  primaryLocation?: { connectedAccountId: string; provider: string; providerFolderId: string } | null
 }
 
-async function ensureProviderFolderIds(
-  folders: Array<{ id: string; name: string; parentId: string | null; providerFolderId: string | null }>,
-  userId: string
-) {
-  const foldersWithoutId = folders.filter((f) => !f.providerFolderId)
-  if (foldersWithoutId.length === 0) return
-
-  const connectedAccount = await prisma.connectedAccount.findFirst({
-    where: { userId, provider: 'google_drive', status: 'connected' }
-  })
-  if (!connectedAccount) return
-
-  try {
-    const auth = await getAuthedGoogleClient(connectedAccount)
-    const drive = google.drive({ version: 'v3', auth })
-    const appFolderId = await ensureGoogleAppFolder(connectedAccount)
-
-    for (const folder of foldersWithoutId) {
-      try {
-        let parentGoogleId = appFolderId
-        if (folder.parentId) {
-          const parentFolder = await prisma.folder.findFirst({
-            where: { id: folder.parentId, userId }
-          })
-          if (parentFolder?.providerFolderId) {
-            parentGoogleId = parentFolder.providerFolderId
-          }
-        }
-
-        const driveFolder = await drive.files.create({
-          requestBody: {
-            name: folder.name,
-            mimeType: 'application/vnd.google-apps.folder',
-            parents: [parentGoogleId]
-          },
-          fields: 'id'
-        })
-
-        const gId = driveFolder.data.id ?? null
-        if (gId) {
-          await prisma.folder.update({
-            where: { id: folder.id },
-            data: { providerFolderId: gId, connectedAccountId: connectedAccount.id }
-          })
-          folder.providerFolderId = gId
-        }
-      } catch (error) {
-        console.error(`Failed self-healing for folder ${folder.id}:`, error)
-      }
-    }
-  } catch (error) {
-    console.error('Failed self-healing Google Drive auth:', error)
+function serializeFolder(folder: FolderRow) {
+  return {
+    id: folder.id,
+    name: folder.name,
+    color: folder.color,
+    iconUrl: folder.iconUrl,
+    parentId: folder.parentId,
+    providerFolderId: folder.providerFolderId ?? null,
+    storageLocationCount: folder.storageLocationCount ?? 0,
+    primaryLocation: folder.primaryLocation ?? null,
+    createdAt: folder.createdAt.toISOString(),
+    updatedAt: folder.updatedAt.toISOString(),
   }
 }
 
@@ -85,11 +57,41 @@ folderRouter.get('/', async (req: AuthRequest, res, next) => {
     const query = z.object({ parentId: z.string().nullable().optional(), all: z.string().optional() }).parse(req.query)
     const folders = await prisma.folder.findMany({
       where: { userId: req.user!.id, deletedAt: null, ...(query.all === '1' ? {} : { parentId: query.parentId ?? null }) },
-      select: { id: true, name: true, color: true, iconUrl: true, parentId: true, providerFolderId: true, createdAt: true, updatedAt: true },
+      select: {
+        id: true,
+        name: true,
+        color: true,
+        iconUrl: true,
+        parentId: true,
+        providerFolderId: true,
+        createdAt: true,
+        updatedAt: true,
+        _count: { select: { storageLocations: true } },
+      },
       orderBy: { updatedAt: 'desc' },
     })
-    await ensureProviderFolderIds(folders, req.user!.id)
-    return res.json({ folders: folders.map(serializeFolder) })
+
+    // Attach the primary (most recent) physical location per folder in one query.
+    const folderIds = folders.map((f) => f.id)
+    const locations = folderIds.length
+      ? await prisma.folderStorageLocation.findMany({
+          where: { folderId: { in: folderIds } },
+          select: { folderId: true, connectedAccountId: true, provider: true, providerFolderId: true, updatedAt: true },
+        })
+      : []
+    const locationByFolderId = new Map<string, { connectedAccountId: string; provider: string; providerFolderId: string; updatedAt: Date }>()
+    for (const loc of locations) {
+      const prev = locationByFolderId.get(loc.folderId)
+      if (!prev || loc.updatedAt > prev.updatedAt) {
+        locationByFolderId.set(loc.folderId, { connectedAccountId: loc.connectedAccountId, provider: loc.provider, providerFolderId: loc.providerFolderId, updatedAt: loc.updatedAt })
+      }
+    }
+
+    const serialized = folders.map((f) => {
+      const primary = locationByFolderId.get(f.id)
+      return serializeFolder({ ...f, storageLocationCount: f._count.storageLocations, primaryLocation: primary ?? null })
+    })
+    return res.json({ folders: serialized })
   } catch (error) {
     return next(error)
   }
@@ -100,12 +102,21 @@ folderRouter.get('/recent', async (req: AuthRequest, res, next) => {
     const limit = Math.min(Number(req.query.limit ?? 4), 4)
     const folders = await prisma.folder.findMany({
       where: { userId: req.user!.id, deletedAt: null },
-      select: { id: true, name: true, color: true, iconUrl: true, parentId: true, providerFolderId: true, createdAt: true, updatedAt: true },
+      select: {
+        id: true,
+        name: true,
+        color: true,
+        iconUrl: true,
+        parentId: true,
+        providerFolderId: true,
+        createdAt: true,
+        updatedAt: true,
+        _count: { select: { storageLocations: true } },
+      },
       orderBy: { updatedAt: 'desc' },
       take: limit,
     })
-    await ensureProviderFolderIds(folders, req.user!.id)
-    return res.json({ folders: folders.map(serializeFolder) })
+    return res.json({ folders: folders.map((f) => serializeFolder({ ...f, storageLocationCount: f._count.storageLocations })) })
   } catch (error) {
     return next(error)
   }
@@ -114,42 +125,14 @@ folderRouter.get('/recent', async (req: AuthRequest, res, next) => {
 folderRouter.post('/', async (req: AuthRequest, res, next) => {
   try {
     const body = createSchema.parse(req.body)
-    let parentFolder = null
     if (body.parentId) {
-      parentFolder = await prisma.folder.findFirstOrThrow({
-        where: { id: body.parentId, userId: req.user!.id, deletedAt: null }
+      await prisma.folder.findFirstOrThrow({
+        where: { id: body.parentId, userId: req.user!.id, deletedAt: null },
       })
     }
 
-    const connectedAccount = await prisma.connectedAccount.findFirst({
-      where: { userId: req.user!.id, provider: 'google_drive', status: 'connected' }
-    })
-
-    let providerFolderId: string | null = null
-    if (connectedAccount) {
-      try {
-        const auth = await getAuthedGoogleClient(connectedAccount)
-        const drive = google.drive({ version: 'v3', auth })
-
-        let googleParentId = await ensureGoogleAppFolder(connectedAccount)
-        if (parentFolder && parentFolder.providerFolderId) {
-          googleParentId = parentFolder.providerFolderId
-        }
-
-        const driveFolder = await drive.files.create({
-          requestBody: {
-            name: body.name,
-            mimeType: 'application/vnd.google-apps.folder',
-            parents: [googleParentId]
-          },
-          fields: 'id'
-        })
-        providerFolderId = driveFolder.data.id ?? null
-      } catch (error) {
-        console.error('Failed to create folder on Google Drive:', error)
-      }
-    }
-
+    // Virtual-first: a folder exists only in the virtual tree until an upload
+    // (or a move) needs a physical location on some storage account.
     const folder = await prisma.folder.create({
       data: {
         userId: req.user!.id,
@@ -157,13 +140,11 @@ folderRouter.post('/', async (req: AuthRequest, res, next) => {
         color: body.color ?? defaultFolderColor,
         iconUrl: body.iconUrl ?? defaultFolderIconUrl,
         parentId: body.parentId ?? null,
-        providerFolderId,
-        connectedAccountId: connectedAccount?.id ?? null
       },
       select: { id: true, name: true, color: true, iconUrl: true, parentId: true, providerFolderId: true, createdAt: true, updatedAt: true },
     })
     await createAuditLog(req.user!.id, 'CREATE_FOLDER', 'folder', folder.id, { name: folder.name })
-    return res.status(201).json({ folder: serializeFolder(folder) })
+    return res.status(201).json({ folder: serializeFolder({ ...folder, storageLocationCount: 0, primaryLocation: null }) })
   } catch (error) {
     return next(error)
   }
@@ -177,7 +158,7 @@ folderRouter.patch('/:id', async (req: AuthRequest, res, next) => {
 
     const folderRecord = await prisma.folder.findFirstOrThrow({
       where: { id: folderId, userId: req.user!.id, deletedAt: null },
-      include: { connectedAccount: true }
+      include: { storageLocations: { include: { connectedAccount: true } } },
     })
 
     if (body.parentId) {
@@ -197,53 +178,43 @@ folderRouter.patch('/:id', async (req: AuthRequest, res, next) => {
       if (descendantIds.has(body.parentId)) return res.status(400).json({ code: 'FOLDER_INVALID_PARENT', message: 'Folder cannot be moved into itself or a child folder.' })
     }
 
-    // Update name on Google Drive if changed
-    if (body.name && folderRecord.providerFolderId && folderRecord.connectedAccount) {
-      try {
-        const auth = await getAuthedGoogleClient(folderRecord.connectedAccount)
-        const drive = google.drive({ version: 'v3', auth })
-        await drive.files.update({
-          fileId: folderRecord.providerFolderId,
-          requestBody: { name: body.name }
-        })
-      } catch (error) {
-        console.error('Failed to rename folder on Google Drive:', error)
-      }
-    }
-
-    // Update parent on Google Drive if moved
-    if (body.parentId !== undefined && folderRecord.providerFolderId && folderRecord.connectedAccount) {
-      try {
-        const auth = await getAuthedGoogleClient(folderRecord.connectedAccount)
-        const drive = google.drive({ version: 'v3', auth })
-
-        let newGoogleParentId = await ensureGoogleAppFolder(folderRecord.connectedAccount)
-        if (body.parentId) {
-          const newParent = await prisma.folder.findFirst({ where: { id: body.parentId, userId: req.user!.id } })
-          if (newParent?.providerFolderId) {
-            newGoogleParentId = newParent.providerFolderId
-          }
-        }
-
-        const fileInfo = await drive.files.get({ fileId: folderRecord.providerFolderId, fields: 'parents' })
-        const previousParents = fileInfo.data.parents?.join(',')
-
-        await drive.files.update({
-          fileId: folderRecord.providerFolderId,
-          addParents: newGoogleParentId,
-          removeParents: previousParents,
-          fields: 'id, parents'
-        })
-      } catch (error) {
-        console.error('Failed to move folder on Google Drive:', error)
-      }
-    }
-
     const folder = await prisma.folder.updateMany({
       where: { id: folderId, userId: req.user!.id, deletedAt: null },
       data: { ...(body.name ? { name: body.name } : {}), ...(body.color ? { color: body.color } : {}), ...(body.iconUrl !== undefined ? { iconUrl: body.iconUrl } : {}), ...(body.parentId !== undefined ? { parentId: body.parentId } : {}) },
     })
     if (folder.count === 0) return res.status(404).json({ code: 'FOLDER_NOT_FOUND', message: 'Folder not found.' })
+
+    // Provider sync (best-effort — the virtual tree remains authoritative).
+    // Rename: every physical location is renamed on its own account.
+    if (body.name && folderRecord.storageLocations.length > 0) {
+      for (const location of folderRecord.storageLocations) {
+        try {
+          await renameProviderFolder(location.connectedAccount, location.providerFolderId, body.name)
+        } catch (error: any) {
+          console.error(`Failed provider rename for folder ${folderId} on account ${location.connectedAccountId}:`, error.message || error)
+        }
+      }
+    }
+
+    // Move: for each existing location, ensure the new virtual parent exists
+    // physically on the same account, then move the physical folder under it.
+    if (body.parentId !== undefined && folderRecord.storageLocations.length > 0) {
+      const parentId = body.parentId ?? null
+      for (const location of folderRecord.storageLocations) {
+        try {
+          if (parentId) {
+            const parentLocation = await ensureFolderStorageLocation(req.user!.id, parentId, location.connectedAccountId)
+            await moveProviderFolder(location.connectedAccount, location.providerFolderId, parentLocation.location.providerFolderId)
+          } else {
+            const rootId = await ensureProviderRoot(location.connectedAccount)
+            await moveProviderFolder(location.connectedAccount, location.providerFolderId, rootId)
+          }
+        } catch (error: any) {
+          console.error(`Failed provider move for folder ${folderId} on account ${location.connectedAccountId}:`, error.message || error)
+        }
+      }
+    }
+
     const updated = await prisma.folder.findFirstOrThrow({
       where: { id: folderId, userId: req.user!.id },
       select: { id: true, name: true, color: true, iconUrl: true, parentId: true, providerFolderId: true, createdAt: true, updatedAt: true },
@@ -271,38 +242,49 @@ folderRouter.delete('/:id', async (req: AuthRequest, res, next) => {
         }
       }
     }
+    const folderIdArray = [...folderIds]
 
-    const files = await prisma.file.findMany({ where: { userId: req.user!.id, status: 'active', folderId: { in: [...folderIds] } }, include: { connectedAccount: true } })
+    const files = await prisma.file.findMany({ where: { userId: req.user!.id, status: 'active', folderId: { in: folderIdArray } }, include: { connectedAccount: true } })
     const syncedAccountIds = new Set<string>()
     for (const file of files) {
       try {
-        const auth = await getAuthedGoogleClient(file.connectedAccount)
-        const drive = google.drive({ version: 'v3', auth })
-        await drive.files.delete({ fileId: file.providerFileId })
+        if (file.provider === 's3') {
+          await deleteS3Object(file)
+        } else {
+          const auth = await getAuthedGoogleClient(file.connectedAccount)
+          const drive = google.drive({ version: 'v3', auth })
+          await drive.files.delete({ fileId: file.providerFileId })
+        }
         syncedAccountIds.add(file.connectedAccountId)
       } catch {
         // Keep going so one failure does not block the whole deletion
       }
     }
 
-    // Delete folders on Google Drive
-    const foldersToDelete = await prisma.folder.findMany({ where: { id: { in: [...folderIds] }, userId: req.user!.id }, include: { connectedAccount: true } })
-    for (const f of foldersToDelete) {
-      if (f.providerFolderId && f.connectedAccount) {
-        try {
-          const auth = await getAuthedGoogleClient(f.connectedAccount)
-          const drive = google.drive({ version: 'v3', auth })
-          await drive.files.delete({ fileId: f.providerFolderId })
-          if (f.connectedAccountId) syncedAccountIds.add(f.connectedAccountId)
-        } catch {
-          // ignore
-        }
+    // Delete physical folder locations per account (S3: no-op; the objects
+    // under the prefixes were deleted with their files above).
+    const locations = await prisma.folderStorageLocation.findMany({
+      where: { folderId: { in: folderIdArray } },
+      include: { connectedAccount: true },
+    })
+    for (const location of locations) {
+      try {
+        await deleteProviderFolder(location.connectedAccount, location.providerFolderId)
+        syncedAccountIds.add(location.connectedAccountId)
+      } catch (error: any) {
+        console.error(`Failed provider folder delete for location ${location.id}:`, error.message || error)
       }
     }
 
+    await prisma.folderStorageLocation.deleteMany({ where: { folderId: { in: folderIdArray } } })
     await prisma.file.updateMany({ where: { id: { in: files.map((file) => file.id) } }, data: { status: 'deleted', deletedAt: new Date() } })
-    await prisma.folder.updateMany({ where: { id: { in: [...folderIds] }, userId: req.user!.id }, data: { deletedAt: new Date() } })
-    for (const accountId of syncedAccountIds) await syncGoogleQuota(accountId).catch(() => undefined)
+    await prisma.folder.updateMany({ where: { id: { in: folderIdArray }, userId: req.user!.id }, data: { deletedAt: new Date() } })
+
+    for (const accountId of syncedAccountIds) {
+      const account = await prisma.connectedAccount.findUnique({ where: { id: accountId } })
+      if (account?.provider === 's3') await syncS3Quota(accountId).catch(() => undefined)
+      else await syncGoogleQuota(accountId).catch(() => undefined)
+    }
 
     await createAuditLog(req.user!.id, 'DELETE_FOLDER', 'folder', root.id, { name: root.name })
     return res.json({ status: 'ok' })

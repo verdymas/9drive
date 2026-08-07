@@ -92,6 +92,14 @@ vi.mock('../../config/prisma.js', () => ({
     },
     connectedAccount: {
       findUniqueOrThrow: vi.fn(async () => ({ id: 'acc-1', provider: 's3' })),
+      // The import row pins `connectedAccountId: 'acc-1'` (a manual selection),
+      // so placement takes the authoritative path and asserts quota against
+      // the account. Unknown quota (null) = eligible, per the routing
+      // convention — the remuxed output is far larger than any fixed value.
+      findFirst: vi.fn(async () => ({ id: 'acc-1', provider: 's3', storageAccount: { availableBytes: null } })),
+    },
+    folderStorageLocation: {
+      findMany: vi.fn(async () => []),
     },
     file: {
       findFirst: vi.fn(async () => null),
@@ -113,13 +121,20 @@ vi.mock('../../config/prisma.js', () => ({
 // Mock the storage boundary so the test never touches S3/Google. The HLS path
 // uploads through `uploadTempFile`, whose S3 branch calls these.
 vi.mock('../s3/s3.service.js', () => ({
-  getS3ConfigForAccount: vi.fn(async () => ({ bucket: 'test', region: 'us-east-1' })),
+  getS3ConfigForAccount: vi.fn(async () => ({ bucket: 'test', region: 'us-east-1', prefix: 'test' })),
   uploadS3Object: vi.fn(async () => undefined),
   // The REAL buildS3ObjectKey is SYNC (returns a string) and the processor
   // calls it WITHOUT await — an async mock would hand the caller a Promise.
   buildS3ObjectKey: vi.fn(() => 'provider/object-key.mkv'),
   syncS3Quota: vi.fn(async () => undefined),
   getS3PresignedUrl: vi.fn(async () => ''),
+}))
+
+// Placement seam: the processor routes through `resolveUploadPlacement` which
+// (for a root-level import) resolves the provider root via provider-folder
+// service. Mock that boundary so no real provider call happens.
+vi.mock('../storage/provider-folder.service.js', () => ({
+  ensureProviderRoot: vi.fn(async () => 'ROOT'),
 }))
 
 vi.mock('../uploads/storage-routing.service.js', () => ({

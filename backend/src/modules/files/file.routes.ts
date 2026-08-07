@@ -7,6 +7,7 @@ import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.
 import { hashToken, randomToken } from '../../utils/crypto.js'
 import { getAuthedGoogleClient, syncGoogleAppFolderFiles, syncGoogleQuota } from '../google/google.service.js'
 import { deleteS3Object, syncS3Quota, createS3Client, getS3ConfigForAccount } from '../s3/s3.service.js'
+import { ensureFolderStorageLocation } from '../storage/folder-materialization.service.js'
 import { streamProviderFile } from './stream-file.js'
 import { googleDownloadExportMimeTypes, normalizeHeaders, withExtension } from './stream-google-file.js'
 import { GetObjectCommand } from '@aws-sdk/client-s3'
@@ -95,10 +96,58 @@ const batchFileSchema = z.object({ fileIds: z.array(z.string().min(1)).min(1).ma
 fileRouter.patch('/batch', async (req: AuthRequest, res, next) => {
   try {
     const body = batchFileSchema.extend({ folderId: z.string().nullable().optional() }).parse(req.body)
-    if (body.folderId) await prisma.folder.findFirstOrThrow({ where: { id: body.folderId, userId: req.user!.id, deletedAt: null } })
-    const result = await prisma.file.updateMany({ where: { id: { in: body.fileIds }, userId: req.user!.id, status: 'active' }, data: { folderId: body.folderId ?? null } })
-    await createAuditLog(req.user!.id, 'MOVE_FILES', 'file', undefined, { count: result.count, folderId: body.folderId })
-    return res.json({ status: 'ok', moved: result.count })
+    const destFolderId = body.folderId ?? null
+    if (destFolderId) await prisma.folder.findFirstOrThrow({ where: { id: destFolderId, userId: req.user!.id, deletedAt: null } })
+
+    const files = await prisma.file.findMany({
+      where: { id: { in: body.fileIds }, userId: req.user!.id, status: 'active' },
+      include: { connectedAccount: true },
+    })
+
+    // Moving a file keeps it on its current connected account (no automatic
+    // rebalancing). The destination virtual folder is lazily materialized on
+    // that account, then the provider object is physically moved there.
+    let moved = 0
+    let providerMoved = 0
+    let providerFailed = 0
+    for (const file of files) {
+      try {
+        if (destFolderId) {
+          const destLocation = await ensureFolderStorageLocation(req.user!.id, destFolderId, file.connectedAccountId)
+          if (file.provider === 'google_drive') {
+            const drive = google.drive({ version: 'v3', auth: await getAuthedGoogleClient(file.connectedAccount) })
+            const fileInfo = await drive.files.get({ fileId: file.providerFileId, fields: 'parents' })
+            const previousParents = fileInfo.data.parents?.join(',')
+            await drive.files.update({
+              fileId: file.providerFileId,
+              addParents: destLocation.location.providerFolderId,
+              removeParents: previousParents,
+              fields: 'id, parents',
+            })
+            providerMoved += 1
+          } else if (file.provider === 's3') {
+            // S3 has no move: when the object already lives under the
+            // destination folder's prefix there is nothing to do; legacy
+            // flat-key objects are kept where they are (log only).
+            const config = await getS3ConfigForAccount(file.connectedAccountId, req.user!.id)
+            const destPrefix = destLocation.location.providerFolderId
+            if (file.providerFileId.includes(`/${destPrefix.replace(/^\/+|\/+$/g, '')}/`)) {
+              providerMoved += 1
+            } else {
+              console.info(`[file-move] S3 object for ${file.id} stays at its legacy flat key (no physical move)`)
+            }
+          }
+        }
+        await prisma.file.update({ where: { id: file.id }, data: { folderId: destFolderId } })
+        moved += 1
+      } catch (error: any) {
+        providerFailed += 1
+        console.error(`Failed provider move for file ${file.id} to folder ${destFolderId}:`, error.message || error)
+      }
+    }
+
+    await createAuditLog(req.user!.id, 'MOVE_FILES', 'file', undefined, { count: moved, folderId: destFolderId })
+    return res.json({ status: 'ok', moved, providerMoved, providerFailed })
   } catch (error) {
     return next(error)
   }
@@ -273,6 +322,34 @@ fileRouter.patch('/:id', async (req: AuthRequest, res, next) => {
     const drive = file.provider === 's3' ? null : google.drive({ version: 'v3', auth: await getAuthedGoogleClient(file.connectedAccount) })
     if (body.folderId) await prisma.folder.findFirstOrThrow({ where: { id: body.folderId, userId: req.user!.id, deletedAt: null } })
     if (body.name && drive) await drive.files.update({ fileId: file.providerFileId, requestBody: { name: body.name } })
+
+    // Move keeps the file on its current account; the destination virtual
+    // folder is lazily materialized there and the provider object moved.
+    if (body.folderId !== undefined && body.folderId !== file.folderId && drive) {
+      if (body.folderId) {
+        const destLocation = await ensureFolderStorageLocation(req.user!.id, body.folderId, file.connectedAccountId)
+        const fileInfo = await drive.files.get({ fileId: file.providerFileId, fields: 'parents' })
+        const previousParents = fileInfo.data.parents?.join(',')
+        await drive.files.update({
+          fileId: file.providerFileId,
+          addParents: destLocation.location.providerFolderId,
+          removeParents: previousParents,
+          fields: 'id, parents',
+        })
+      } else {
+        const { ensureProviderRoot } = await import('../storage/provider-folder.service.js')
+        const rootId = await ensureProviderRoot(file.connectedAccount)
+        const fileInfo = await drive.files.get({ fileId: file.providerFileId, fields: 'parents' })
+        const previousParents = fileInfo.data.parents?.join(',')
+        await drive.files.update({
+          fileId: file.providerFileId,
+          addParents: rootId,
+          removeParents: previousParents,
+          fields: 'id, parents',
+        })
+      }
+    }
+
     const updated = await prisma.file.update({ where: { id: file.id }, data: { ...(body.name ? { name: body.name } : {}), ...(body.folderId !== undefined ? { folderId: body.folderId } : {}) }, include: { connectedAccount: { select: { id: true, email: true, provider: true } }, folder: { select: { id: true, name: true } } } })
     await createAuditLog(req.user!.id, 'UPDATE_FILE', 'file', updated.id, { name: updated.name, updates: body })
     return res.json({ file: { ...updated, sizeBytes: updated.sizeBytes.toString() } })

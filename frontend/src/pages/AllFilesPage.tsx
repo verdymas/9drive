@@ -24,7 +24,7 @@ import { useUpload, type UploadPreflightError } from '@/context/UploadContext'
 import { useDriveLayoutActions } from '@/layouts/DriveLayout'
 
 type BackendFile = { id: string; name: string; mimeType: string; sizeBytes: string; createdAt: string; folderId?: string | null; connectedAccount?: { email: string; provider: string }; folder?: { id: string; name: string } | null }
-type BackendFolder = { id: string; name: string; color: string; iconUrl?: string | null; parentId?: string | null; providerFolderId?: string | null; updatedAt: string }
+type BackendFolder = { id: string; name: string; color: string; iconUrl?: string | null; parentId?: string | null; providerFolderId?: string | null; storageLocationCount?: number; primaryLocation?: { connectedAccountId: string; provider: string; providerFolderId: string } | null; updatedAt: string }
 type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string }
 
 const sizeActiveClasses: Record<FolderSizeScale, string> = {
@@ -60,7 +60,7 @@ function mapFile(file: BackendFile): FileItem {
 }
 
 function mapFolder(folder: BackendFolder): FolderItem {
-  return { id: folder.id, name: folder.name, color: folder.color, iconUrl: folder.iconUrl, parentId: folder.parentId, providerFolderId: folder.providerFolderId, updated: `Updated ${formatDate(folder.updatedAt)}` }
+  return { id: folder.id, name: folder.name, color: folder.color, iconUrl: folder.iconUrl, parentId: folder.parentId, providerFolderId: folder.providerFolderId, primaryLocation: folder.primaryLocation ?? null, updated: `Updated ${formatDate(folder.updatedAt)}` }
 }
 
 
@@ -565,9 +565,13 @@ export function AllFilesPage() {
 
   async function copyFolderLink() {
     if (!activeFolderForMenu?.id) return
+    // A virtual folder is no longer owned by a single storage account. Copy
+    // the in-app link by default; a direct Google Drive link is offered only
+    // when a primary (most recent) physical location on a Drive account exists.
     let url = `${window.location.origin}/all-files?folderId=${activeFolderForMenu.id}`
-    if (activeFolderForMenu.providerFolderId) {
-      url = `https://drive.google.com/open?id=${activeFolderForMenu.providerFolderId}`
+    const primary = activeFolderForMenu.primaryLocation
+    if (primary?.provider === 'google_drive' && primary.providerFolderId) {
+      url = `https://drive.google.com/open?id=${primary.providerFolderId}`
     }
     await navigator.clipboard.writeText(url)
     setMessage('Folder link copied to clipboard!')
