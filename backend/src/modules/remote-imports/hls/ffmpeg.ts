@@ -219,6 +219,35 @@ const DEMUXER_ARGS = ['-analyzeduration', '100M', '-probesize', '100M']
  * @param signal           abort (SIGTERM → SIGKILL escalation)
  * @param onProgress       throttled percent callback
  */
+/** Timestamp/DTS compatibility flags (§9 — named profile `timestamp_compat`). */
+const TIMESTAMP_COMPAT_ARGS = ['-fflags', '+genpts', '-avoid_negative_ts', 'make_zero']
+
+/**
+ * True when the remux stderr tail looks like a timestamp/DTS problem (negative
+ * or non-monotonic timestamps) — the case the `timestamp_compat` profile fixes.
+ */
+function looksLikeTimestampIssue(stderr: string): boolean {
+  return /non-monotonic dts|invalid dts|negative.*timestamp|timestamp.*negative|dts <|pts <|out of range.*dts|non-monotonic.*timestamp/i.test(stderr)
+}
+
+/**
+ * Run FFmpeg against the local rewritten playlist (stream copy — the fast
+ * path). A container that cannot hold the stream-copied codec fails here; the
+ * pipeline falls back to `runFfmpegReencode`.
+ *
+ * On a first failure that looks like a timestamp/DTS issue, the run is retried
+ * ONCE with the named `timestamp_compat` profile (`-fflags +genpts
+ * -avoid_negative_ts make_zero`) — a targeted fix, never random flag
+ * combinations (§9). The retry reports HLS_FFMPEG_TIMESTAMP_FAILED if it
+ * fails again, so the failure is attributable.
+ *
+ * @param inputPlaylistPath absolute path of the local media playlist
+ * @param outputPartPath   absolute `.part` path — renamed to final on success
+ * @param container        'mkv' | 'mp4'
+ * @param cwd              job directory
+ * @param signal           abort (SIGTERM → SIGKILL escalation)
+ * @param onProgress       throttled percent callback
+ */
 export async function runFfmpegRemux(
   inputPlaylistPath: string,
   outputPartPath: string,
@@ -229,7 +258,7 @@ export async function runFfmpegRemux(
   totalDurationSeconds?: number,
 ): Promise<FfmpegRunResult> {
   verifyFfmpegAvailable()
-  const args = [
+  const baseArgs = [
     '-nostdin',
     '-hide_banner',
     '-loglevel', 'warning',
@@ -249,9 +278,28 @@ export async function runFfmpegRemux(
     // from a `.part` suffix, so the container is pinned explicitly.
     '-f', container === 'mp4' ? 'mp4' : 'matroska',
     '-y',
-    outputPartPath,
   ]
-  return runFfmpegProcess(args, outputPartPath, { cwd, signal, onProgress, totalDurationSeconds })
+
+  try {
+    return await runFfmpegProcess([...baseArgs, outputPartPath], outputPartPath, { cwd, signal, onProgress, totalDurationSeconds })
+  } catch (error) {
+    // Timestamp/DTS problem → ONE retry with the named compatibility profile.
+    if (error instanceof AppError && error.code === HLS_ERROR_CODES.HLS_REMUX_FAILED && looksLikeTimestampIssue((error as AppError & { meta?: string }).meta ?? '')) {
+      try {
+        return await runFfmpegProcess([...baseArgs, ...TIMESTAMP_COMPAT_ARGS, outputPartPath], outputPartPath, { cwd, signal, onProgress, totalDurationSeconds })
+      } catch (retryError) {
+        // The compatibility profile failed too — surface it as an attributable
+        // timestamp error (a new AppError; `code` is readonly).
+        if (retryError instanceof AppError && retryError.code === HLS_ERROR_CODES.HLS_REMUX_FAILED) {
+          const err = new AppError(HLS_ERROR_CODES.HLS_FFMPEG_TIMESTAMP_FAILED, HLS_ERROR_MESSAGES.HLS_FFMPEG_TIMESTAMP_FAILED, 500)
+          ;(err as AppError & { meta?: string }).meta = (retryError as AppError & { meta?: string }).meta
+          throw err
+        }
+        throw retryError
+      }
+    }
+    throw error
+  }
 }
 
 /**

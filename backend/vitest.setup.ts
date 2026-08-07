@@ -16,3 +16,13 @@ process.env.TOKEN_ENCRYPTION_KEY ??= 'test-encryption-key-32bytes!!!'
 // Fast idle timeout so downloader tests that exercise the abort path don't
 // wait the full production default (60s).
 process.env.REMOTE_IMPORT_IDLE_TIMEOUT_SECONDS ??= '1'
+
+// On Windows dev hosts the FFmpeg defaults are Linux paths (/usr/bin/ffmpeg).
+// Point the env at the winget-installed binaries so the real-FFmpeg HLS
+// integration tests execute instead of silently skipping (the worker container
+// still uses the Docker defaults).
+if (process.platform === 'win32') {
+  const wingetLinks = path.join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WinGet', 'Links')
+  process.env.REMOTE_IMPORT_FFMPEG_PATH ??= path.join(wingetLinks, 'ffmpeg.exe')
+  process.env.REMOTE_IMPORT_FFPROBE_PATH ??= path.join(wingetLinks, 'ffprobe.exe')
+}

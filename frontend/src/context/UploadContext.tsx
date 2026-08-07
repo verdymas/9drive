@@ -8,6 +8,23 @@ export type UploadProgressState = { open: boolean; fileName: string; percent: nu
 
 type ResumableSession = { sessionId: string; file: File; folderId?: string | null; targetAccountId?: string | null }
 
+type PreflightPlan = {
+  fileName: string
+  accountId: string | null
+  provider: 'google_drive' | null
+  reason: 'insufficient' | 'no_accounts' | 's3_only' | 'duplicate' | null
+}
+
+type PreflightResult = {
+  plans: PreflightPlan[]
+  totalBytes: string
+  totalRoutedBytes: string
+  unroutedBytes: string
+}
+
+/** Thrown when the space preflight itself fails (not when a file doesn't fit). */
+export type UploadPreflightError = { message: string; unroutedFiles: string[] }
+
 type UploadContextType = {
   uploadProgress: UploadProgressState
   setUploadProgress: React.Dispatch<React.SetStateAction<UploadProgressState>>
@@ -119,9 +136,60 @@ export function UploadProvider({ children }: { children: ReactNode }) {
       files: filesToUpload.map(f => ({ name: f.name, size: f.size, percent: 0, status: 'uploading' }))
     })
 
+    // Batch preflight: check available space across all connected accounts and
+    // plan per-file routing with reservations, so a batch never dies mid-way
+    // because one account ran out. A preflight failure is not fatal — uploads
+    // continue with automatic per-file routing (best-effort optimization).
+    const plannedIds = new Map<string, string>()
+    const unrouted: Array<{ name: string; message: string }> = []
+    if (filesToUpload.length > 1) {
+      try {
+        const preflight = await apiFetch<PreflightResult>('/uploads/resumable/preflight', {
+          method: 'POST',
+          body: JSON.stringify({
+            files: filesToUpload.map(f => ({
+              fileName: f.name,
+              mimeType: f.type || 'application/octet-stream',
+              sizeBytes: String(f.size)
+            })),
+            targetAccountId: targetAccountId || undefined
+          })
+        })
+        for (const plan of preflight.plans) {
+          if (plan.accountId) {
+            plannedIds.set(plan.fileName, plan.accountId)
+          } else if (plan.reason === 'duplicate') {
+            unrouted.push({ name: plan.fileName, message: 'Duplicate file name in batch' })
+          } else if (plan.reason === 'insufficient' || plan.reason === 'no_accounts' || plan.reason === 's3_only') {
+            unrouted.push({ name: plan.fileName, message: 'Not enough space on any connected account' })
+          }
+        }
+      } catch (err) {
+        // Optional optimization: never block an upload because preflight failed.
+        console.error('Upload preflight failed, continuing without plans:', err)
+      }
+    }
+
     // Upload files sequentially
     for (let i = 0; i < filesToUpload.length; i++) {
       const file = filesToUpload[i]
+      const unroutedFile = unrouted.find(u => u.name === file.name)
+      if (unroutedFile) {
+        // Preflight already determined this file cannot be stored — mark it
+        // failed up-front instead of starting an upload doomed to fail.
+        setUploadProgress((current) => {
+          const nextFiles = [...current.files]
+          if (nextFiles[i]) {
+            nextFiles[i] = { ...nextFiles[i], status: 'error', errorMessage: unroutedFile.message }
+          }
+          return {
+            ...current,
+            status: 'partial',
+            files: nextFiles
+          }
+        })
+        continue
+      }
       try {
         await uploadSingleFileResumable(file, targetFolderId, (filePercent) => {
           setUploadProgress((current) => {
@@ -136,7 +204,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
               files: nextFiles
             }
           })
-        }, undefined, targetAccountId)
+        }, undefined, plannedIds.get(file.name) ?? targetAccountId)
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : 'Upload failed'
         console.error('File upload failed:', file.name, err)

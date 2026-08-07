@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "hls-parser": "^0.16.1"
+  }
+}

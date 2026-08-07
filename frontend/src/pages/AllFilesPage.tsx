@@ -20,7 +20,7 @@ import { getAccessToken } from '@/lib/auth'
 import { createPlyr, ensurePlyr } from '@/lib/plyr'
 import { getPreviewKind, officeViewerUrl } from '@/lib/preview'
 import type { FileItem, FolderItem } from '@/data/drive-data'
-import { useUpload } from '@/context/UploadContext'
+import { useUpload, type UploadPreflightError } from '@/context/UploadContext'
 import { useDriveLayoutActions } from '@/layouts/DriveLayout'
 
 type BackendFile = { id: string; name: string; mimeType: string; sizeBytes: string; createdAt: string; folderId?: string | null; connectedAccount?: { email: string; provider: string }; folder?: { id: string; name: string } | null }
@@ -116,6 +116,7 @@ export function AllFilesPage() {
   const [folderContextMenu, setFolderContextMenu] = useState<{ x: number; y: number; folder: FolderItem | null }>({ x: 0, y: 0, folder: null })
   const [emptyContextMenu, setEmptyContextMenu] = useState<{ x: number; y: number; open: boolean }>({ x: 0, y: 0, open: false })
   const [message, setMessage] = useState('')
+  const [preflightError, setPreflightError] = useState<UploadPreflightError | null>(null)
   const [gdrivePublicUrl, setGdrivePublicUrl] = useState('')
   const [makingPublic, setMakingPublic] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -282,6 +283,7 @@ export function AllFilesPage() {
     if (selectedFiles.length === 0) return
     setLoading(true)
     setMessage('')
+    setPreflightError(null)
 
     const uploadingFiles = [...selectedFiles]
     const targetFolderId = activeFolderId || selectedFolderId
@@ -296,9 +298,17 @@ export function AllFilesPage() {
       await uploadFiles(uploadingFiles, targetFolderId, targetAccountId)
     } catch (err) {
       console.error('Upload initiation failed:', err)
+      if (isUploadPreflightError(err)) {
+        setPreflightError(err)
+        setUploadOpen(true)
+      }
     } finally {
       setLoading(false)
     }
+  }
+
+  function isUploadPreflightError(err: unknown): err is UploadPreflightError {
+    return typeof err === 'object' && err !== null && 'message' in err && Array.isArray((err as { unroutedFiles?: unknown }).unroutedFiles)
   }
 
 
@@ -326,11 +336,16 @@ export function AllFilesPage() {
     }
   }
 
+  // Cap the batch at 20 files so the space preflight stays a single sane
+  // request; the backend accepts up to 50.
+  const MAX_BATCH_PREFLIGHT_FILES = 20
+
   function selectUploadFiles(files: FileList | File[] | null | undefined) {
     if (!files) return
     const nextFiles = Array.from(files)
     if (nextFiles.length === 0) return
-    setSelectedFiles(nextFiles)
+    setSelectedFiles(nextFiles.slice(0, MAX_BATCH_PREFLIGHT_FILES))
+    setPreflightError(null)
   }
 
   function removeUploadFile(index: number) {
@@ -746,7 +761,7 @@ export function AllFilesPage() {
            <label onDragEnter={handleUploadDrag} onDragOver={handleUploadDrag} onDragLeave={handleUploadDrag} onDrop={handleUploadDrag} className={isUploadDragging ? 'grid cursor-pointer gap-3 rounded-2xl border-2 border-dashed border-blue-500 bg-blue-50 p-4 text-center transition sm:p-6' : 'grid cursor-pointer gap-3 rounded-2xl border-2 border-dashed border-slate-200 bg-slate-50 p-4 text-center transition hover:border-blue-300 hover:bg-blue-50/50 sm:p-6'}>
             <Upload className={isUploadDragging ? 'mx-auto h-8 w-8 text-blue-600' : 'mx-auto h-8 w-8 text-slate-500'} />
             <span className="text-sm font-extrabold text-slate-950">Drop file here or click to browse</span>
-            <span className="text-xs text-slate-500">Metadata is sent before the file so upload can stream directly to Google Drive.</span>
+            <span className="text-xs text-slate-500">Metadata is sent before the file so upload can stream directly to Google Drive. Multi-file uploads check available space up-front and route files to accounts that have room.</span>
             <Input type="file" className="sr-only" multiple onChange={(event) => selectUploadFiles(event.target.files)} required={selectedFiles.length === 0} />
           </label>
           <label className="grid gap-2 text-sm font-semibold">
@@ -765,6 +780,7 @@ export function AllFilesPage() {
             </select>
           </label>
           {activeFolder ? <p className="rounded-xl bg-slate-50 p-3 text-sm text-slate-600">Uploading to: <b>{activeFolder.name}</b></p> : <label className="grid gap-2 text-sm font-semibold">Virtual Folder<select className="h-11 rounded-xl border border-slate-200 px-3 text-sm bg-white" value={selectedFolderId} onChange={(event) => setSelectedFolderId(event.target.value)}><option value="">No folder</option>{allFolders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}</select></label>}
+          {preflightError ? <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800"><p className="font-bold">{preflightError.message}</p><p className="mt-1 text-xs">No space on any connected account for: <span className="font-semibold">{preflightError.unroutedFiles.join(', ')}</span></p></div> : null}
           {selectedFiles.length > 0 ? <div className="grid max-h-56 gap-2 overflow-y-auto rounded-xl bg-slate-50 p-3 text-sm text-slate-600"><div className="flex items-center justify-between gap-3"><span className="font-bold text-slate-950">{selectedFiles.length} selected</span><span className="shrink-0">{formatBytes(selectedFiles.reduce((total, file) => total + file.size, 0))}</span></div>{selectedFiles.map((file, index) => <div key={`${file.name}-${file.size}-${index}`} className="flex min-w-0 items-center justify-between gap-3 rounded-lg bg-white px-3 py-2"><span className="min-w-0 flex-1 truncate" title={file.name}>{file.name}</span><span className="shrink-0 text-xs text-slate-500">{formatBytes(file.size)}</span><button type="button" className="shrink-0 text-slate-500 hover:text-red-600" onClick={() => removeUploadFile(index)} aria-label={`Remove ${file.name}`}><X className="h-4 w-4" /></button></div>)}</div> : null}
           <div className="grid gap-3 sm:flex sm:justify-end"><Button type="button" variant="outline" onClick={() => setUploadOpen(false)}>Cancel</Button><Button disabled={loading || selectedFiles.length === 0}>{loading ? 'Uploading...' : `Upload${selectedFiles.length > 1 ? ` ${selectedFiles.length} files` : ''}`}</Button></div>
         </form>

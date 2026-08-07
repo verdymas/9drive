@@ -10,7 +10,7 @@ import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.
 import { ensureGoogleAppFolder, getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
 import { buildS3ObjectKey, getS3ConfigForAccount, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
 import { createAuditLog } from '../../utils/audit.js'
-import { selectAccount } from './storage-routing.service.js'
+import { planBatchUploads, selectAccount } from './storage-routing.service.js'
 
 export const uploadRouter = Router()
 
@@ -259,7 +259,7 @@ uploadRouter.post('/resumable/init', requireAuth, async (req: AuthRequest, res, 
       }
     }
 
-    const account = await selectAccount(req.user!.id, sizeBytes, undefined, targetAccountId, allowFallback)
+    const account = await selectAccount(req.user!.id, sizeBytes, new Map<string, bigint>(), targetAccountId, allowFallback)
     if (!account) return res.status(400).json({ code: 'NO_ACCOUNT_WITH_ENOUGH_SPACE', message: 'No connected storage account has enough space.' })
 
     if (account.provider !== 'google_drive') {
@@ -326,6 +326,45 @@ uploadRouter.post('/resumable/init', requireAuth, async (req: AuthRequest, res, 
     })
 
     return res.status(201).json({ sessionId: session.id, provider: 'google_drive', offset: 0 })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+// 1b. Preflight a multi-file upload batch: check available space across all
+// connected Google Drive accounts and plan per-file routing with reservations,
+// so a batch never dies mid-way because a single account ran out of space.
+uploadRouter.post('/resumable/preflight', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const body = z.object({
+      files: z.array(z.object({
+        fileName: z.string().min(1),
+        mimeType: z.string().min(1),
+        sizeBytes: z.string()
+      })).min(1).max(50),
+      targetAccountId: z.string().nullable().optional()
+    }).parse(req.body)
+
+    const files: Array<{ fileName: string; mimeType: string; sizeBytes: bigint }> = []
+    for (const file of body.files) {
+      let sizeBytes: bigint
+      try {
+        sizeBytes = BigInt(file.sizeBytes)
+      } catch {
+        return res.status(400).json({ code: 'INVALID_SIZE_BYTES', message: 'Valid sizeBytes required.' })
+      }
+      if (sizeBytes <= 0n) return res.status(400).json({ code: 'UPLOAD_SIZE_REQUIRED', message: 'Valid sizeBytes required.' })
+      if (sizeBytes > BigInt(env.MAX_UPLOAD_BYTES)) return res.status(400).json({ code: 'UPLOAD_TOO_LARGE', message: 'File exceeds max upload size.' })
+      files.push({ fileName: file.fileName, mimeType: file.mimeType, sizeBytes })
+    }
+
+    const result = await planBatchUploads(req.user!.id, files, body.targetAccountId)
+    return res.json({
+      plans: result.plans,
+      totalBytes: result.totalBytes.toString(),
+      totalRoutedBytes: result.totalRoutedBytes.toString(),
+      unroutedBytes: result.unroutedBytes.toString()
+    })
   } catch (error) {
     return next(error)
   }

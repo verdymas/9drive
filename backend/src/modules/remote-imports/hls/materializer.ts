@@ -121,6 +121,12 @@ export async function downloadResource(
   let written = 0n
   await followRemoteUrl(url, {
     onResponse: async (res) => {
+      // An authenticated source (401/403 on a resource the manifest references)
+      // is classified as unsupported — 9Drive never forwards cookies/credentials
+      // (§14), so the only honest answer is a stable error, not a retry storm.
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        throw new AppError(HLS_ERROR_CODES.HLS_AUTHENTICATED_SOURCE_UNSUPPORTED, HLS_ERROR_MESSAGES.HLS_AUTHENTICATED_SOURCE_UNSUPPORTED, 400)
+      }
       if (res.statusCode >= 400) throw new AppError('DOWNLOAD_HTTP_ERROR', `Remote server responded ${res.statusCode}.`, 502)
       if (typeof (res.body as { on?: unknown }).on === 'function') {
         (res.body as unknown as { on: (event: 'error', listener: () => void) => void }).on('error', () => undefined)

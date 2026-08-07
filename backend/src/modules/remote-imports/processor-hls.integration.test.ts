@@ -10,6 +10,7 @@ import { prisma } from '../../config/prisma.js'
 import { processRemoteImportJob } from './processor.js'
 import type { RemoteImportJobData } from './queue.js'
 import { AppError } from '../../utils/app-error.js'
+import { env } from '../../config/env.js'
 import { hlsJobDir, readResumeMarker } from './hls/job-dir.js'
 import { tempDir } from './temp-storage.js'
 
@@ -26,12 +27,12 @@ import { tempDir } from './temp-storage.js'
  * file,crypto`, ffprobe-verify, then upload (S3 branch mocked) and register
  * (prisma mocked). Everything except storage/Db is exercised for real.
  *
- * Requires FFmpeg on PATH (the worker container has it; the host may not).
- * Skipped cleanly when missing.
+ * Requires FFmpeg (the env-configured `REMOTE_IMPORT_FFMPEG_PATH` — the same
+ * binary the pipeline runs). Skipped cleanly when missing.
  */
 const hasFfmpeg = () =>
   new Promise<boolean>((resolve) => {
-    const child = spawn('ffmpeg', ['-version'], { stdio: 'ignore' })
+    const child = spawn(env.REMOTE_IMPORT_FFMPEG_PATH, ['-version'], { stdio: 'ignore' })
     child.on('error', () => resolve(false))
     child.on('close', (code) => resolve(code === 0))
   })
@@ -167,6 +168,17 @@ let masterBody = ''
 let mediaBody = ''
 let segment0Bytes: Buffer
 let segment1Bytes: Buffer
+// Fixture B (§23): fragmented MP4 — a single media file split into
+// byte-range segments behind one EXT-X-MAP (init section).
+let fmp4MediaBody = ''
+let fmp4InitBytes: Buffer
+let fmp4FileBytes: Buffer
+// Fixture F (§23): EXT-X-BYTERANGE over a single contiguous MPEG-TS file.
+let brMediaBody = ''
+let brFileBytes: Buffer
+// Re-request counters, asserted by the byte-range test (exact bytes only).
+let brFileRequests = 0
+let fmp4FileRequests = 0
 
 const MASTER = () => `#EXTM3U
 #EXT-X-VERSION:7
@@ -186,6 +198,25 @@ ${segments.map((s) => `#EXTINF:4.000,\n${s}`).join('\n')}
 #EXT-X-ENDLIST`
 }
 
+/**
+ * Generate the real media fixtures with FFmpeg:
+ *
+ *  - `seg0.ts`/`seg1.ts`: TWO AES-128 encrypted MPEG-TS segments — the muxer
+ *    splits at the keyframe/segment boundary and encrypts each with the given
+ *    key, IV derived from the segment number. `-force_key_frames 0:2,0:4,0:6`
+ *    pins IDR boundaries so the 8s source actually splits into 2×4s segments
+ *    (otherwise the ultralow-bitrate encoder emits a single keyframe and the
+ *    whole source collapses into one segment).
+ *
+ *  - fMP4 (Fixture B): `-hls_segment_type fmp4` produces an init section
+ *    (`init.mp4` — the EXT-X-MAP) + N `.m4s` media segments. The fixture
+ *    rewrites those segments into a hand-made playlist of EXT-X-BYTERANGE
+ *    entries over ONE `.m4s` file, so the downloader must exercise BOTH
+ *    EXT-X-MAP AND byte-range materialization through a single path.
+ *
+ *  - byte-range (Fixture F): a single MPEG-TS file segmented via
+ *    EXT-X-BYTERANGE (as a camera/recorder might emit).
+ */
 async function generateFixture() {
   fixtureDir = await fsp.mkdtemp(path.join(os.tmpdir(), '9drive-hls-fixture-'))
   const key = Buffer.from('0123456789abcdef0123456789abcdef') // 16 raw bytes
@@ -199,13 +230,6 @@ async function generateFixture() {
   const keyInfoPath = path.join(fixtureDir, 'key.info')
   await fsp.writeFile(keyInfoPath, `key.bin\n${path.join(fixtureDir, 'key.bin')}\n`)
 
-  // Use FFmpeg's HLS muxer with `-hls_key_info_file` to produce TWO AES-128
-  // encrypted segments (the muxer splits at the keyframe/segment boundary and
-  // encrypts each with the given key, IV derived from the segment number).
-  // `-force_key_frames 0:2,0:4,0:6` pins IDR boundaries so the 8s source
-  // actually splits into 2×4s segments (otherwise the ultralow-bitrate
-  // encoder emits a single keyframe and the whole source collapses into one
-  // segment, and seg1.ts never exists).
   await runFfmpeg([
     '-f', 'lavfi', '-i', 'testsrc=duration=8:size=640x360:rate=25',
     '-f', 'lavfi', '-i', 'sine=frequency=440:duration=8',
@@ -219,11 +243,109 @@ async function generateFixture() {
   ])
   segment0Bytes = await fsp.readFile(path.join(fixtureDir, 'seg0.ts'))
   segment1Bytes = await fsp.readFile(path.join(fixtureDir, 'seg1.ts'))
+
+  // ── Fixture B: fMP4 (init + m4s). ───────────────────────────────────────
+  // `+independent_segments` is REQUIRED: without it FFmpeg inlines the init
+  // section (ftyp+moov) into the first .m4s and never writes a separate init
+  // file — the EXT-X-MAP then references a file that does not exist.
+  await runFfmpeg([
+    '-f', 'lavfi', '-i', 'testsrc2=duration=6:size=320x240:rate=25',
+    '-f', 'lavfi', '-i', 'sine=frequency=330:duration=6',
+    '-c:v', 'libx264', '-preset', 'ultrafast',
+    '-force_key_frames', '0:2,0:4',
+    '-c:a', 'aac', '-f', 'hls',
+    '-hls_time', '2', '-hls_playlist_type', 'vod',
+    '-hls_flags', 'independent_segments',
+    '-hls_segment_type', 'fmp4',
+    // `-hls_fmp4_init_filename` resolves RELATIVE TO THE PROCESS CWD, not the
+    // segment dir — an absolute path pins the init file next to the segments.
+    '-hls_fmp4_init_filename', path.join(fixtureDir, 'init.mp4'),
+    '-hls_segment_filename', path.join(fixtureDir, 'fseg%d.m4s'),
+    path.join(fixtureDir, 'fmp4.m3u8'),
+  ])
+  fmp4InitBytes = await fsp.readFile(path.join(fixtureDir, 'init.mp4'))
+  // Numeric sort — `fseg10.m4s` would otherwise sort before `fseg2.m4s`.
+  const m4sList = (await fsp.readdir(fixtureDir))
+    .filter((f) => f.endsWith('.m4s'))
+    .sort((a, b) => Number(a.match(/\d+/)?.[0]) - Number(b.match(/\d+/)?.[0]))
+  const fmp4Segments = await Promise.all(m4sList.map((f) => fsp.readFile(path.join(fixtureDir, f))))
+  // One concatenated media file the byte-range entries point into.
+  const concatParts = fmp4Segments.map((b, i) => ({ b, start: fmp4InitBytes.length + fmp4Segments.slice(0, i).reduce((s, x) => s + x.length, 0) }))
+  fmp4FileBytes = Buffer.concat([fmp4InitBytes, ...fmp4Segments])
+  fmp4MediaBody = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-MAP:URI="init.mp4"
+${fmp4Segments
+  .map((b, i) => {
+    const off = concatParts[i].start
+    const nextOff = i + 1 < concatParts.length ? concatParts[i + 1].start : fmp4FileBytes.length
+    return `#EXTINF:2.000,\n#EXT-X-BYTERANGE:${nextOff - off}@${off}\nfmp4.bin`
+  })
+  .join('\n')}
+#EXT-X-ENDLIST`
+
+  // ── Fixture F: one TS file, EXT-X-BYTERANGE segments. ───────────────────
+  // Generate a CLEAN (unencrypted) MPEG-TS with `-hls_flags single_file` —
+  // the HLS muxer writes ONE .ts and emits EXT-X-BYTERANGE entries pointing
+  // into it, exactly like a camera/recorder byte-range source. The playlist
+  // URIs are rewritten to a bare relative placeholder (`brfile.bin`); the
+  // `beforeAll` rewrite turns it into the server URL once the port is known
+  // (generation runs pre-server).
+  const brOut = path.join(fixtureDir, 'brout.m3u8')
+  const brSingle = path.join(fixtureDir, 'brfile.ts')
+  let brGenerated = false
+  try {
+    await runFfmpeg([
+      '-f', 'lavfi', '-i', 'testsrc=duration=8:size=640x360:rate=25',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=8',
+      '-c:v', 'libx264', '-preset', 'ultrafast',
+      '-force_key_frames', '0:2,0:4,0:6',
+      '-c:a', 'aac', '-f', 'hls',
+      '-hls_time', '4', '-hls_playlist_type', 'vod',
+      '-hls_flags', 'single_file',
+      '-hls_segment_filename', brSingle,
+      brOut,
+    ])
+    const autoBody = await fsp.readFile(brOut, 'utf8')
+    if (!autoBody.includes('#EXT-X-BYTERANGE')) throw new Error('no BYTERANGE in output')
+    brMediaBody = autoBody.replaceAll(brSingle, 'brfile.bin')
+    brFileBytes = await fsp.readFile(brSingle)
+    brGenerated = true
+  } catch (error) {
+    console.warn('[fixture] single_file byterange generation failed, falling back to 2-range playlist:', error instanceof Error ? error.message : String(error))
+  }
+  if (!brGenerated) {
+    // Fallback: hand-written byte-range playlist over a clean generated TS.
+    await runFfmpeg([
+      '-f', 'lavfi', '-i', 'testsrc=duration=8:size=640x360:rate=25',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=8',
+      '-c:v', 'libx264', '-preset', 'ultrafast',
+      '-force_key_frames', '0:2,0:4,0:6',
+      '-c:a', 'aac', '-f', 'mpegts',
+      path.join(fixtureDir, 'brfile.ts'),
+    ])
+    const whole = await fsp.readFile(brSingle)
+    const half = Math.floor(whole.length / 2)
+    // Trim to whole TS packets (188-byte units) so both halves start on a sync byte.
+    const off0 = half - (half % 188)
+    brFileBytes = whole
+    const sizes = [off0, whole.length - off0]
+    const offsets = [0, off0]
+    brMediaBody = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:4
+#EXT-X-MEDIA-SEQUENCE:0
+${sizes.map((s, i) => `#EXTINF:4.000,\n#EXT-X-BYTERANGE:${s}@${offsets[i]}\nbrfile.bin`).join('\n')}
+#EXT-X-ENDLIST`
+  }
+  await fsp.writeFile(path.join(fixtureDir, 'brfile.bin'), brFileBytes)
 }
 
 function runFfmpeg(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(env.REMOTE_IMPORT_FFMPEG_PATH, args, { stdio: ['ignore', 'pipe', 'pipe'] })
     let stderr = ''
     child.stderr?.on('data', (c: Buffer) => { stderr += c.toString() })
     child.on('error', reject)
@@ -271,6 +393,57 @@ beforeAll(async () => {
       res.end(Buffer.from('0123456789abcdef0123456789abcdef'))
       return
     }
+    // Fixture B: the init section (EXT-X-MAP) — the downloader must fetch the
+    // map separately from the byte-ranged segments.
+    if (pathname === '/init.mp4') {
+      res.writeHead(200, { 'Content-Type': 'video/mp4' })
+      res.end(fmp4InitBytes)
+      return
+    }
+    // Fixture B: the byte-ranged media file. Serve EXACT ranges; a full (200)
+    // response is the server "ignoring Range" case the materializer rejects.
+    if (pathname === '/fmp4.bin') {
+      const range = req.headers.range
+      if (!range || !range.startsWith('bytes=')) {
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream' })
+        res.end(fmp4FileBytes)
+        return
+      }
+      const [startStr, endStr] = range.slice(6).split('-')
+      const start = Number(startStr)
+      const end = Math.min(Number(endStr), fmp4FileBytes.length - 1)
+      fmp4FileRequests += 1
+      const slice = fmp4FileBytes.subarray(start, end + 1)
+      res.writeHead(206, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Range': `bytes ${start}-${end}/${fmp4FileBytes.length}`,
+        'Content-Length': slice.length,
+      })
+      res.end(slice)
+      return
+    }
+    // Fixture F: one contiguous media file served in byte ranges.
+    if (pathname === '/brfile.bin') {
+      const range = req.headers.range
+      if (!range || !range.startsWith('bytes=')) {
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream' })
+        res.end(brFileBytes)
+        return
+      }
+      const [startStr, endStr] = range.slice(6).split('-')
+      const start = Number(startStr)
+      const end = Math.min(Number(endStr), brFileBytes.length - 1)
+      brFileRequests += 1
+      const slice = brFileBytes.subarray(start, end + 1)
+      res.writeHead(206, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Range': `bytes ${start}-${end}/${brFileBytes.length}`,
+        'Content-Length': slice.length,
+      })
+      res.end(slice)
+      return
+    }
+    console.warn('[fixture-server] 404:', pathname)
     res.writeHead(404)
     res.end()
   })
@@ -280,6 +453,13 @@ beforeAll(async () => {
   // The playlist bodies embed baseUrl — build them AFTER the port is known.
   mediaBody = makeMediaPlaylist(['seg0.ts', 'seg1.ts'])
   masterBody = MASTER()
+  // Fixture B/F bodies embed baseUrl too — they are generated in
+  // `generateFixture` without a base; substitute the placeholder now.
+  fmp4MediaBody = fmp4MediaBody.replaceAll('"init.mp4"', `"${baseUrl}/init.mp4"`).replaceAll('fmp4.bin', `${baseUrl}/fmp4.bin`)
+  // The single_file muxer emits the segment URI `brfile.ts`; the fallback body
+  // uses `brfile.bin`. Rewrite EITHER placeholder to the server URL — a single
+  // pass (replacing both in one expression so the result is never re-matched).
+  brMediaBody = brMediaBody.replace(/\bbrfile\.(ts|bin)\b/g, `${baseUrl}/brfile.bin`)
 })
 
 afterAll(async () => {
@@ -426,6 +606,94 @@ describe('HLS remote import end-to-end (fixture)', () => {
     expect(ffmpegFailures.reencodeCalls).toBeGreaterThan(0)
     const completed = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'completed')
     expect(completed).toBe(true)
+    expect(createdFile.name).toMatch(/\.(mp4|mkv)$/)
+  })
+
+  it('Fixture B: fMP4 (EXT-X-MAP) + byte-range media materializes and remuxes (§23)', async () => {
+    if (!fixtureDir) return // skipped (no ffmpeg)
+    validationSpy.validateRemoteUrl.mockReset()
+    validationSpy.resolveAndValidateHost.mockReset()
+    validationSpy.validateRemoteUrl.mockImplementation(async (raw: string) => new URL(raw))
+    validationSpy.resolveAndValidateHost.mockImplementation(async (host: string) => host)
+
+    const importId = 'import-hls-fmp4'
+    const job = { data: { importId, attempt: 1 }, id: 'job-1' } as unknown as Job<RemoteImportJobData>
+    const { encryptText } = await import('../../utils/crypto.js')
+    const row = mockRow(importId)
+    row.sourceType = 'hls_media'
+    row.sourceUrlEncrypted = encryptText(`${baseUrl}/fmp4.m3u8`)
+    prisma.remoteImport.findUnique = vi.fn(async () => row)
+    const updateMock = prisma.remoteImport.update as ReturnType<typeof vi.fn>
+    updateMock.mockClear()
+    fmp4FileRequests = 0
+    // A prior failing run may have left a resume marker (remux failure keeps
+    // the job dir) — its playlistUrl would send this run to a stale port.
+    await fsp.rm(hlsJobDir(row.userId, importId), { recursive: true, force: true })
+
+    // The server must serve the fMP4 media playlist.
+    const realServer = server
+    const originalListener = realServer.listeners('request')[0] as (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void
+    realServer.removeAllListeners('request')
+    realServer.on('request', (req, res) => {
+      const p = new URL(req.url ?? '/', 'http://x').pathname
+      if (p === '/fmp4.m3u8') {
+        res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' })
+        res.end(fmp4MediaBody)
+        return
+      }
+      originalListener(req, res)
+    })
+
+    await processRemoteImportJob(job)
+
+    // Completed, and the materializer fetched the init section AND byte ranges
+    // of the fMP4 file (a byte-range request → 206; assert at least one).
+    const completed = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'completed')
+    expect(completed).toBe(true)
+    expect(fmp4FileRequests).toBeGreaterThan(0)
+    expect(createdFile.name).toMatch(/\.(mp4|mkv)$/)
+  })
+
+  it('Fixture F: EXT-X-BYTERANGE-only source materializes via Range requests and remuxes (§23)', async () => {
+    if (!fixtureDir) return // skipped (no ffmpeg)
+    validationSpy.validateRemoteUrl.mockReset()
+    validationSpy.resolveAndValidateHost.mockReset()
+    validationSpy.validateRemoteUrl.mockImplementation(async (raw: string) => new URL(raw))
+    validationSpy.resolveAndValidateHost.mockImplementation(async (host: string) => host)
+
+    const importId = 'import-hls-byterange'
+    const job = { data: { importId, attempt: 1 }, id: 'job-1' } as unknown as Job<RemoteImportJobData>
+    const { encryptText } = await import('../../utils/crypto.js')
+    const row = mockRow(importId)
+    row.sourceType = 'hls_media'
+    row.sourceUrlEncrypted = encryptText(`${baseUrl}/br.m3u8`)
+    prisma.remoteImport.findUnique = vi.fn(async () => row)
+    const updateMock = prisma.remoteImport.update as ReturnType<typeof vi.fn>
+    updateMock.mockClear()
+    brFileRequests = 0
+    // A prior failing run may have left a resume marker — its stale playlistUrl
+    // would hijack this fresh run (the resume path skips the manifest fetch).
+    await fsp.rm(hlsJobDir(row.userId, importId), { recursive: true, force: true })
+
+    const realServer = server
+    const originalListener = realServer.listeners('request')[0] as (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void
+    realServer.removeAllListeners('request')
+    realServer.on('request', (req, res) => {
+      const p = new URL(req.url ?? '/', 'http://x').pathname
+      if (p === '/br.m3u8') {
+        res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' })
+        res.end(brMediaBody)
+        return
+      }
+      originalListener(req, res)
+    })
+
+    await processRemoteImportJob(job)
+
+    const completed = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'completed')
+    expect(completed).toBe(true)
+    // Each EXT-X-BYTERANGE segment is one Range request: 2 segments → 2 hits.
+    expect(brFileRequests).toBe(2)
     expect(createdFile.name).toMatch(/\.(mp4|mkv)$/)
   })
 })

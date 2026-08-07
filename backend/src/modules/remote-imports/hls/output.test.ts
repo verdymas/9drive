@@ -7,8 +7,8 @@ describe('resolveContainer', () => {
     expect(resolveContainer('mp4', { hasSeparateAudio: true, hasSubtitles: true, hasDiscontinuities: true })).toBe('mp4')
   })
 
-  it('routes separate audio / subtitles / discontinuities to MKV (auto)', () => {
-    expect(resolveContainer('auto', { hasSeparateAudio: false, hasSubtitles: false, hasDiscontinuities: false })).toBe('mp4')
+  it('routes EVERYTHING to MKV under auto (§3 — MKV is the default)', () => {
+    expect(resolveContainer('auto', { hasSeparateAudio: false, hasSubtitles: false, hasDiscontinuities: false })).toBe('mkv')
     expect(resolveContainer('auto', { hasSeparateAudio: true, hasSubtitles: false, hasDiscontinuities: false })).toBe('mkv')
     expect(resolveContainer('auto', { hasSeparateAudio: false, hasSubtitles: true, hasDiscontinuities: false })).toBe('mkv')
     expect(resolveContainer('auto', { hasSeparateAudio: false, hasSubtitles: false, hasDiscontinuities: true })).toBe('mkv')

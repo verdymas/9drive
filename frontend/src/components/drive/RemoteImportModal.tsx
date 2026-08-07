@@ -133,10 +133,13 @@ export function HlsSection({
           value={value.outputContainer ?? 'auto'}
           onChange={(event) => onChange({ ...value, outputContainer: event.target.value as HlsImportOptions['outputContainer'] })}
         >
-          <option value="auto">Auto</option>
+          <option value="auto">Automatic (MKV)</option>
           <option value="mkv">MKV</option>
           <option value="mp4">MP4</option>
         </Select>
+        {value.outputContainer === 'auto' ? (
+          <span className="text-xs font-normal text-gray-500">Automatic uses MKV for maximum compatibility.</span>
+        ) : null}
       </label>
 
       {isLive ? (

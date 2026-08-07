@@ -26,16 +26,14 @@ export function resolveContainer(requested: ContainerChoice, eligibility: Contai
 }
 
 /**
- * Automatic selection:
- *  - MP4 only when all selected streams share one muxed set (no separate
- *    audio, no subtitles, no discontinuities).
- *  - MKV otherwise (separate audio tracks, subtitles, discontinuities, or
- *    unknown codecs all route to MKV, which holds raw HLS streams).
+ * Automatic selection (§3): MKV is the DEFAULT HLS output container. MKV is
+ * more tolerant of stream-copy combinations (raw MPEG-TS, fMP4 fragments,
+ * separate audio, subtitles, discontinuities) and plays better with Jellyfin.
+ * The old behaviour tried MP4 first and only fell back on mux failure — the
+ * refactor spec mandates MKV first and never attempting MP4 first.
  */
-export function recommendContainer(eligibility: ContainerEligibility): 'mkv' | 'mp4' {
-  const { hasSeparateAudio, hasSubtitles, hasDiscontinuities } = eligibility
-  if (hasSeparateAudio || hasSubtitles || hasDiscontinuities) return 'mkv'
-  return 'mp4'
+export function recommendContainer(_eligibility: ContainerEligibility): 'mkv' | 'mp4' {
+  return 'mkv'
 }
 
 export function containerExtension(container: 'mkv' | 'mp4'): string {

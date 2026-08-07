@@ -30,6 +30,7 @@ import {
   manifestLocalName,
 } from './materializer.js'
 import { assertSupportedEncryption, buildRewrittenPlaylist, type NormalizedSegment, type SegmentMap } from './segments.js'
+import { rewriteMediaPlaylist, validateLocalPlaylist } from './manifest-service.js'
 
 export type MediaLabel = 'video' | 'audio'
 
@@ -38,6 +39,12 @@ export type MaterializeMediaOptions = {
   /** Local-file label ('video' | 'audio'); sets the generated filename prefix. */
   mediaLabel: MediaLabel
   segments: NormalizedSegment[]
+  /**
+   * The ORIGINAL media playlist body (used to serialize the rewritten local
+   * playlist with `hls-parser` round-trip — preserves version/media-sequence/
+   * playlist-type/endlist/discontinuities semantics instead of hand-building).
+   */
+  originalBody?: string
   /** Persistent cache {absoluteUri → localPath} for live windows. */
   segmentCache?: Map<string, string>
   signal?: AbortSignal
@@ -204,14 +211,29 @@ export async function materializeMedia(opts: MaterializeMediaOptions): Promise<M
   await Promise.all(segments.map((segment) => downloadOne(segment).catch((error) => Promise.reject(error))))
 
   // ── Phase C: write the REWRITTEN local playlist. ──────────────────────────
+  // Serialized with `hls-parser` stringify (round-trip preserves HLS
+  // semantics); falls back to the hand-built writer only when the original
+  // body is unavailable (callers threaded it).
   const localPlaylistPath = pathInJobDir(jobDir, manifestLocalName(mediaLabel))
-  const body = buildRewrittenPlaylist(
-    segments,
-    (s) => segmentPaths.get(s.uri) ?? pathInJobDir(jobDir, segmentLocalName(mediaLabel, s.index)),
-    (uri) => keyPaths.get(uri) ?? pathInJobDir(jobDir, keyLocalName(mediaLabel, 1)),
-    (uri) => mapPaths.get(uri) ?? pathInJobDir(jobDir, mapLocalName(mediaLabel, 1)),
-  )
+  const localFor = (s: NormalizedSegment) => segmentPaths.get(s.uri) ?? pathInJobDir(jobDir, segmentLocalName(mediaLabel, s.index))
+  const keyLocalFor = (uri: string) => keyPaths.get(uri) ?? pathInJobDir(jobDir, keyLocalName(mediaLabel, 1))
+  const mapLocalFor = (uri: string) => mapPaths.get(uri) ?? pathInJobDir(jobDir, mapLocalName(mediaLabel, 1))
+  const body = opts.originalBody
+    ? rewriteMediaPlaylist(opts.originalBody, segments, localFor, keyLocalFor, mapLocalFor)
+    : buildRewrittenPlaylist(segments, localFor, keyLocalFor, mapLocalFor)
   await fsp.writeFile(localPlaylistPath, body, 'utf8')
+
+  // ── Phase D: validate the GENERATED local playlist (§18) before FFmpeg. ──
+  // Re-parse with hls-parser; every referenced file must exist inside the job
+  // directory and no remote URI (http/https/file) may remain.
+  const validation = validateLocalPlaylist(body, jobDir)
+  for (const localFile of validation.localFiles) {
+    const fullPath = pathInJobDir(jobDir, localFile)
+    const stats = await fsp.stat(fullPath).catch(() => null)
+    if (!stats) {
+      throw new AppError(HLS_ERROR_CODES.HLS_LOCAL_PLAYLIST_INVALID, HLS_ERROR_MESSAGES.HLS_LOCAL_PLAYLIST_INVALID, 500)
+    }
+  }
 
   const mediaDurationSeconds = segments.reduce((sum, s) => sum + (Number.isFinite(s.duration) ? s.duration : 0), 0)
   return {
@@ -239,8 +261,11 @@ export function buildSegmentCacheSeed(jobDir: string, segments: NormalizedSegmen
   return cache
 }
 
-/** Re-fetch a LIVE media playlist (the worker polls it). */
-export async function fetchMediaPlaylistSegments(playlistUrl: string): Promise<NormalizedSegment[]> {
+/**
+ * Re-fetch a media playlist (the worker polls it) into normalized segments +
+ * the original body (needed for the hls-parser round-trip serialization).
+ */
+export async function fetchMediaPlaylistSegments(playlistUrl: string): Promise<{ segments: NormalizedSegment[]; body: string }> {
   const { body, finalUrl } = await fetchManifest(playlistUrl)
-  return (await parseMediaPlaylist(body, finalUrl)).segments
+  return { segments: (await parseMediaPlaylist(body, finalUrl)).segments, body }
 }

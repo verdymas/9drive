@@ -26,7 +26,7 @@ import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './errors.js'
 import { fetchManifest, parseManifest, type HlsAudioTrackMetadata, type HlsManifestInfo, type HlsVariantMetadata } from './manifest.js'
 import { materializeMedia, fetchMediaPlaylistSegments, buildSegmentCacheSeed } from './materialize.js'
 import { resolveSelectedVariant, resolveSelectedAudio } from './selection.js'
-import { resolveContainer, containerExtension, shouldAutoFallbackToMkv, type ContainerChoice } from './output.js'
+import { resolveContainer, containerExtension, type ContainerChoice } from './output.js'
 import * as ffmpeg from './ffmpeg.js'
 import { verifyOutput, type MediaVerification } from './verify.js'
 import { ensureJobDir } from './materializer.js'
@@ -97,10 +97,14 @@ function assertNotAborted(signal: AbortSignal | undefined) {
   }
 }
 
-/** Re-fetch + parse a media playlist into normalized segments. */
-async function resolveMediaSegments(playlistUrl: string): Promise<NormalizedSegment[]> {
+/**
+ * Re-fetch + parse a media playlist into normalized segments + the original
+ * body (the body drives the hls-parser round-trip serialization of the
+ * rewritten local playlist).
+ */
+async function resolveMediaSegments(playlistUrl: string): Promise<{ segments: NormalizedSegment[]; body: string }> {
   const fetched = await fetchMediaPlaylistSegments(playlistUrl)
-  if (fetched.length === 0) throw new AppError(HLS_ERROR_CODES.HLS_NO_VALID_VARIANT, HLS_ERROR_MESSAGES.HLS_NO_VALID_VARIANT, 400)
+  if (fetched.segments.length === 0) throw new AppError(HLS_ERROR_CODES.HLS_NO_VALID_VARIANT, HLS_ERROR_MESSAGES.HLS_NO_VALID_VARIANT, 400)
   return fetched
 }
 
@@ -123,6 +127,9 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
   // ── 1–4 (fresh run): fetch + parse source, select variant/audio, poll. ────
   let segmentCache = new Map<string, string>()
   let allVideoSegments: NormalizedSegment[]
+  // The original media playlist body (drives the hls-parser round-trip
+  // serialization of the rewritten local playlist).
+  let videoPlaylistBody: string
 
   if (resume) {
     // ── Convert-only retry: reuse the on-disk segments. ────────────────────
@@ -136,7 +143,9 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     expectAudio = resume.expectAudio
     container = resume.container
 
-    allVideoSegments = await resolveMediaSegments(videoPlaylistUrl)
+    const fetchedVideo = await resolveMediaSegments(videoPlaylistUrl)
+    allVideoSegments = fetchedVideo.segments
+    videoPlaylistBody = fetchedVideo.body
     segmentCache = buildSegmentCacheSeed(jobDir, allVideoSegments, 'video')
   } else {
     // ── 1. Fetch + parse the ORIGINAL source manifest. ─────────────────────
@@ -161,7 +170,9 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     }
 
     // ── 3. Fetch the (first) media playlist snapshot. ───────────────────────
-    const firstVideoSegments = await resolveMediaSegments(videoPlaylistUrl)
+    const firstVideoFetched = await resolveMediaSegments(videoPlaylistUrl)
+    const firstVideoSegments = firstVideoFetched.segments
+    videoPlaylistBody = firstVideoFetched.body
     allVideoSegments = [...firstVideoSegments]
 
     // ── 4. LIVE recording: poll until the target is hit. ────────────────────
@@ -176,8 +187,8 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
       while (true) {
         assertNotAborted(signal)
         const snapshot = await resolveMediaSegments(videoPlaylistUrl)
-        if (snapshot.length > firstVideoSegments.length) {
-          allVideoSegments.push(...snapshot.slice(firstVideoSegments.length))
+        if (snapshot.segments.length > firstVideoSegments.length) {
+          allVideoSegments.push(...snapshot.segments.slice(firstVideoSegments.length))
         }
         opts.onProgress?.({
           stage: 'recording',
@@ -191,8 +202,15 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     // Optional alternate audio.
     if (selectedAudio?.playlistUrl) {
       audioPlaylistUrl = selectedAudio.playlistUrl
-      const audioSegments = await resolveMediaSegments(audioPlaylistUrl)
-      await materializeMedia({ jobDir, mediaLabel: 'audio', segments: audioSegments, segmentCache, signal })
+      const audioFetched = await resolveMediaSegments(audioPlaylistUrl)
+      await materializeMedia({
+        jobDir,
+        mediaLabel: 'audio',
+        segments: audioFetched.segments,
+        originalBody: audioFetched.body,
+        segmentCache,
+        signal,
+      })
     }
 
     expectAudio = Boolean(audioPlaylistUrl) || sourceInfo.sourceType === 'media'
@@ -212,6 +230,7 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     jobDir,
     mediaLabel: 'video',
     segments: allVideoSegments,
+    originalBody: videoPlaylistBody,
     segmentCache,
     signal,
     onProgress: (p) => opts.onProgress?.({
@@ -225,9 +244,17 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
 
   // ── (resume) Optional alternate audio. ────────────────────────────────────
   if (resume && audioPlaylistUrl) {
-    const audioSegments = await resolveMediaSegments(audioPlaylistUrl)
+    const audioFetched = await resolveMediaSegments(audioPlaylistUrl)
+    const audioSegments = audioFetched.segments
     const audioCache = buildSegmentCacheSeed(jobDir, audioSegments, 'audio')
-    await materializeMedia({ jobDir, mediaLabel: 'audio', segments: audioSegments, segmentCache: audioCache, signal })
+    await materializeMedia({
+      jobDir,
+      mediaLabel: 'audio',
+      segments: audioSegments,
+      originalBody: audioFetched.body,
+      segmentCache: audioCache,
+      signal,
+    })
   }
 
   // ── 7. Remux. ─────────────────────────────────────────────────────────────
@@ -263,27 +290,30 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     throw error
   }
 
-  // Conversion chain, mirroring the known-good script (code_example_convert.sh):
-  //   1. stream-copy remux (fast path),
-  //   2. auto-selected MP4 that fails to copy-mux → retry as MKV (safe default
-  //      for raw HLS streams; a user-selected container is never changed),
-  //   3. any copy failure → re-encode (H.264 + AAC) as a last resort.
+  // Conversion chain (§3, §9, §16 of the refactor spec):
+  //   1. stream-copy remux (fast path). MKV is the auto default — the safe
+  //      container for raw HLS streams (MPEG-TS, fMP4, separate audio).
+  //   2. a USER-selected MP4 that cannot stream-copy mux → stable error
+  //      HLS_MP4_STREAM_COPY_UNSUPPORTED suggesting MKV (§16) — never a
+  //      silent transcode, never a silent container swap.
+  //   3. any auto/MKV copy failure → re-encode (H.264 + AAC) as a last resort.
   // A re-encode always succeeds or we fail; the marker is written on a terminal
   // failure so a convert-only retry can reuse the downloaded segments.
   const runRemux = async (forContainer: 'mkv' | 'mp4'): Promise<ffmpeg.FfmpegRunResult> => {
     try {
       return await ffmpeg.runFfmpegRemux(video.localPlaylistPath, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
     } catch (error) {
-      // Auto-selected MP4: if the mux failed (e.g. a container that cannot hold
-      // the stream-copied codec), retry once with MKV, which is the safe
-      // default for raw HLS streams.
-      if (error instanceof AppError && error.code === HLS_ERROR_CODES.HLS_REMUX_FAILED && forContainer === 'mp4' && shouldAutoFallbackToMkv(selection.outputContainer)) {
-        actualContainer = 'mkv'
-        try {
-          return await ffmpeg.runFfmpegRemux(video.localPlaylistPath, outputPartPath(actualContainer), actualContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
-        } catch (fallbackError) {
-          return runReencode(actualContainer, fallbackError)
-        }
+      // Auto-selected MKV that fails to copy-mux → re-encode as a last resort.
+      // (Auto never resolves to MP4 anymore — `recommendContainer` returns MKV
+      // — so the old "auto MP4 → retry as MKV" branch is gone.)
+      if (selection.outputContainer === 'mp4') {
+        // A USER-selected MP4: a stream-copy incompatibility is a stable,
+        // actionable error — do NOT silently re-encode or swap the container.
+        throw new AppError(
+          HLS_ERROR_CODES.HLS_MP4_STREAM_COPY_UNSUPPORTED,
+          HLS_ERROR_MESSAGES.HLS_MP4_STREAM_COPY_UNSUPPORTED,
+          400,
+        )
       }
       return runReencode(forContainer, error)
     }
