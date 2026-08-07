@@ -166,6 +166,39 @@ describe('UploadContext batch preflight', () => {
     expect(initCalls.every((call) => call.targetAccountId === 'acc-1')).toBe(true)
   })
 
+  it('surfaces a reroute notice when the pinned account is full and the server routes elsewhere', async () => {
+    // Pin to acc-pinned; the server routes the file to acc-routed instead.
+    function PinnedHarness() {
+      const { uploadFiles, uploadProgress } = useUpload()
+      return (
+        <div>
+          <button
+            onClick={() => uploadFiles([makeFile('pinned.bin')], null, 'acc-pinned', 'acc-pinned@example.com')}
+            data-testid="trigger-pinned"
+          >
+            upload pinned
+          </button>
+          <div data-testid="progress-pinned">{JSON.stringify(uploadProgress)}</div>
+        </div>
+      )
+    }
+    vi.spyOn(Api, 'apiFetch').mockImplementation(async (path: string) => {
+      if (String(path).includes('/uploads/resumable/init')) {
+        return { sessionId: 'session-1', provider: 'google_drive', targetAccountId: 'acc-routed', targetAccountEmail: 'acc-routed@example.com' }
+      }
+      throw new Error(`unexpected apiFetch path: ${path}`)
+    })
+
+    render(<UploadProvider><PinnedHarness /></UploadProvider>)
+    await userEvent.click(screen.getByTestId('trigger-pinned'))
+    await waitFor(() => {
+      const progress = JSON.parse(screen.getByTestId('progress-pinned').textContent ?? '{}')
+      expect(progress.files[0].errorMessage).toContain('No space on acc-pinned@example.com')
+      expect(progress.files[0].errorMessage).toContain('acc-routed@example.com')
+      expect(progress.files[0].status).toBe('done')
+    })
+  })
+
   it('skips the preflight for a single-file upload', async () => {
     function SingleHarness() {
       const { uploadFiles } = useUpload()

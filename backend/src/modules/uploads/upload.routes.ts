@@ -274,7 +274,7 @@ uploadRouter.post('/resumable/init', requireAuth, async (req: AuthRequest, res, 
           status: 'uploading'
         }
       })
-      return res.status(201).json({ sessionId: session.id, provider: account.provider, offset: 0 })
+      return res.status(201).json({ sessionId: session.id, provider: account.provider, offset: 0, targetAccountId: account.id, targetAccountEmail: account.email })
     }
 
     const auth = await getAuthedGoogleClient(account)
@@ -325,7 +325,7 @@ uploadRouter.post('/resumable/init', requireAuth, async (req: AuthRequest, res, 
       }
     })
 
-    return res.status(201).json({ sessionId: session.id, provider: 'google_drive', offset: 0 })
+    return res.status(201).json({ sessionId: session.id, provider: 'google_drive', offset: 0, targetAccountId: account.id, targetAccountEmail: account.email })
   } catch (error) {
     return next(error)
   }

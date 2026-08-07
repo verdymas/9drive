@@ -288,6 +288,7 @@ export function AllFilesPage() {
     const uploadingFiles = [...selectedFiles]
     const targetFolderId = activeFolderId || selectedFolderId
     const targetAccountId = selectedTargetAccountId || null
+    const pinnedAccountName = connectedAccounts.find((account) => account.id === targetAccountId)?.email || undefined
 
     setSelectedFiles([])
     setSelectedFolderId('')
@@ -295,7 +296,7 @@ export function AllFilesPage() {
     setUploadOpen(false)
 
     try {
-      await uploadFiles(uploadingFiles, targetFolderId, targetAccountId)
+      await uploadFiles(uploadingFiles, targetFolderId, targetAccountId, pinnedAccountName)
     } catch (err) {
       console.error('Upload initiation failed:', err)
       if (isUploadPreflightError(err)) {

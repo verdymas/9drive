@@ -3,10 +3,10 @@ import { API_URL, apiFetch } from '@/lib/api'
 import { getAccessToken } from '@/lib/auth'
 
 export type UploadProgressStatus = 'uploading' | 'done' | 'error' | 'partial'
-export type UploadProgressFile = { name: string; size: number; percent: number; status: UploadProgressStatus; errorMessage?: string }
+export type UploadProgressFile = { name: string; size: number; percent: number; status: UploadProgressStatus; errorMessage?: string; accountName?: string }
 export type UploadProgressState = { open: boolean; fileName: string; percent: number; status: UploadProgressStatus; files: UploadProgressFile[] }
 
-type ResumableSession = { sessionId: string; file: File; folderId?: string | null; targetAccountId?: string | null }
+type ResumableSession = { sessionId: string; file: File; folderId?: string | null; targetAccountId?: string | null; errorMessage?: string }
 
 type PreflightPlan = {
   fileName: string
@@ -28,7 +28,7 @@ export type UploadPreflightError = { message: string; unroutedFiles: string[] }
 type UploadContextType = {
   uploadProgress: UploadProgressState
   setUploadProgress: React.Dispatch<React.SetStateAction<UploadProgressState>>
-  uploadFiles: (files: File[], folderId: string | null, targetAccountId?: string | null) => Promise<void>
+  uploadFiles: (files: File[], folderId: string | null, targetAccountId?: string | null, pinnedAccountName?: string) => Promise<void>
   retryFailedUpload: (fileName: string) => Promise<void>
 }
 
@@ -44,7 +44,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
   })
   const [resumableSessions, setResumableSessions] = useState<Record<string, ResumableSession>>({})
 
-  async function uploadSingleFileResumable(file: File, folderId: string | null, onProgress: (percent: number) => void, sessionIdToRetry?: string, targetAccountId?: string | null) {
+  async function uploadSingleFileResumable(file: File, folderId: string | null, onProgress: (percent: number) => void, sessionIdToRetry?: string, targetAccountId?: string | null, pinnedAccountName?: string, onNotice?: (message: string) => void) {
     const CHUNK_SIZE = 5 * 1024 * 1024 // 5MB chunks (must be multiple of 256KB for Google Drive)
     let sessionId = sessionIdToRetry || ''
     let startOffset = 0
@@ -52,7 +52,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
     // Pre-save session parameters so that retry is functional even if the init API call fails
     setResumableSessions(prev => ({
       ...prev,
-      [file.name]: { sessionId, file, folderId, targetAccountId }
+      [file.name]: { sessionId, file, folderId, targetAccountId, errorMessage: undefined }
     }))
 
     // 1. Initialize or get status
@@ -71,8 +71,16 @@ export function UploadProvider({ children }: { children: ReactNode }) {
       // Update session with the active sessionId
       setResumableSessions(prev => ({
         ...prev,
-        [file.name]: { sessionId, file, folderId, targetAccountId }
+        [file.name]: { sessionId, file, folderId, targetAccountId, errorMessage: undefined }
       }))
+
+      // The user chose a specific account but the server routed elsewhere
+      // (picked account is full or missing): surface it right on the row.
+      const routedAccount = (initData as { targetAccountId?: string | null }).targetAccountId
+      if (targetAccountId && routedAccount && routedAccount !== targetAccountId && pinnedAccountName && onNotice) {
+        const routedName = (initData as { targetAccountEmail?: string | null }).targetAccountEmail
+        onNotice(`No space on ${pinnedAccountName} — uploaded to ${routedName ?? 'another account'} instead`)
+      }
     } else {
       const statusData = await apiFetch<{ status: string; offset: string }>(`/uploads/resumable/status/${sessionId}`)
       startOffset = Number(statusData.offset)
@@ -124,7 +132,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  async function uploadFiles(filesToUpload: File[], targetFolderId: string | null, targetAccountId?: string | null) {
+  async function uploadFiles(filesToUpload: File[], targetFolderId: string | null, targetAccountId?: string | null, pinnedAccountName?: string) {
     if (filesToUpload.length === 0) return
 
     // Setup initial status
@@ -191,20 +199,39 @@ export function UploadProvider({ children }: { children: ReactNode }) {
         continue
       }
       try {
-        await uploadSingleFileResumable(file, targetFolderId, (filePercent) => {
-          setUploadProgress((current) => {
-            const nextFiles = [...current.files]
-            if (nextFiles[i]) {
-              nextFiles[i] = { ...nextFiles[i], percent: filePercent, status: filePercent >= 100 ? 'done' : 'uploading' }
-            }
-            const overallPercent = Math.round(nextFiles.reduce((sum, f) => sum + f.percent, 0) / nextFiles.length)
-            return {
-              ...current,
-              percent: overallPercent,
-              files: nextFiles
-            }
-          })
-        }, undefined, plannedIds.get(file.name) ?? targetAccountId)
+        await uploadSingleFileResumable(
+          file,
+          targetFolderId,
+          (filePercent) => {
+            setUploadProgress((current) => {
+              const nextFiles = [...current.files]
+              if (nextFiles[i]) {
+                nextFiles[i] = { ...nextFiles[i], percent: filePercent, status: filePercent >= 100 ? 'done' : 'uploading' }
+              }
+              const overallPercent = Math.round(nextFiles.reduce((sum, f) => sum + f.percent, 0) / nextFiles.length)
+              return {
+                ...current,
+                percent: overallPercent,
+                files: nextFiles
+              }
+            })
+          },
+          undefined,
+          plannedIds.get(file.name) ?? targetAccountId,
+          pinnedAccountName,
+          (notice) => {
+            // Soft-pin reroute notice: the chosen account was full, so the
+            // server routed this file elsewhere — keep the row marked done
+            // but attach the explanation for the progress panel.
+            setUploadProgress((current) => {
+              const nextFiles = [...current.files]
+              if (nextFiles[i]) {
+                nextFiles[i] = { ...nextFiles[i], errorMessage: notice }
+              }
+              return { ...current, files: nextFiles }
+            })
+          },
+        )
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : 'Upload failed'
         console.error('File upload failed:', file.name, err)

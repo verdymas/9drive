@@ -575,8 +575,8 @@ export function DriveLayout() {
                           </span>
                         </div>
                       </div>
-                      {file.status === 'error' && file.errorMessage ? (
-                        <p className="break-words text-xs text-red-600" title={file.errorMessage}>{file.errorMessage}</p>
+                      {file.errorMessage ? (
+                        <p className={cn('break-words text-xs', file.status === 'error' ? 'text-red-600' : 'text-amber-600')} title={file.errorMessage}>{file.errorMessage}</p>
                       ) : null}
                       <div className="h-1.5 rounded-full bg-slate-200">
                         <div className={file.status === 'error' ? 'h-full rounded-full bg-red-500' : file.status === 'done' ? 'h-full rounded-full bg-emerald-500' : 'h-full rounded-full bg-blue-600'} style={{ width: `${file.percent}%` }} />
