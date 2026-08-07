@@ -1,6 +1,7 @@
-import { Router } from 'express'
+import { Router, type Request } from 'express'
 import { v2 } from 'webdav-server'
 import { requireWebDavAuth } from './webdav-auth.middleware.js'
+import { env } from '../../config/env.js'
 import { streamProviderFileToReadable, VirtualFileSystem } from './webdav-virtual-fs.js'
 import PropfindCommand from 'webdav-server/lib/server/v2/commands/Propfind.js'
 import { Workflow } from 'webdav-server/lib/helper/Workflow.js'
@@ -319,6 +320,11 @@ webdavServer.setFileSystem('/', new VirtualFileSystem(), (successed) => {
 })
 
 export const webdavRouter = Router()
+
+/** GET /webdav/status — whether the WebDAV interface is configured (no auth). */
+webdavRouter.get('/status', (_req: Request, res) => {
+  res.json({ configured: Boolean(env.WEBDAV_PASSWORD) })
+})
 
 webdavRouter.use(requireWebDavAuth)
 webdavRouter.use((req, res) => {

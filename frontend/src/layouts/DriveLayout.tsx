@@ -50,7 +50,7 @@ const menu = [
 
 const storageMenu = [
   { label: 'Local', icon: HardDrive, href: '/storage/local', disabled: true },
-  { label: 'WebDAV', icon: FolderCog, href: '/storage/webdav', disabled: true },
+  { label: 'WebDAV', icon: FolderCog, href: '/storage/webdav' },
   { label: 'SMB', icon: Server, href: '/smb' },
   { label: 'Remote Imports', icon: CloudDownload, href: '/remote-imports' },
 ]
