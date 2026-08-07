@@ -222,6 +222,23 @@ export async function materializeMedia(opts: MaterializeMediaOptions): Promise<M
   }
 }
 
+/**
+ * Seed a segment cache from on-disk files for a convert-only retry.
+ *
+ * Maps each segment URI to the deterministic local filename that
+ * `materializeMedia` would have chosen for it (`video-000001.ts`, …), so a
+ * resume run re-parses the media playlist and reuses the already-downloaded
+ * segments instead of re-fetching them. Keys (`.bin`) and init maps (`.mp4`)
+ * are deliberately NOT seeded — they re-download (small, bounded).
+ */
+export function buildSegmentCacheSeed(jobDir: string, segments: NormalizedSegment[], mediaLabel: MediaLabel): Map<string, string> {
+  const cache = new Map<string, string>()
+  for (const segment of segments) {
+    cache.set(segment.uri, pathInJobDir(jobDir, segmentLocalName(mediaLabel, segment.index)))
+  }
+  return cache
+}
+
 /** Re-fetch a LIVE media playlist (the worker polls it). */
 export async function fetchMediaPlaylistSegments(playlistUrl: string): Promise<NormalizedSegment[]> {
   const { body, finalUrl } = await fetchManifest(playlistUrl)

@@ -10,6 +10,9 @@ import { prisma } from '../../config/prisma.js'
 import { processRemoteImportJob } from './processor.js'
 import type { RemoteImportJobData } from './queue.js'
 import { AppError } from '../../utils/app-error.js'
+import { hlsJobDir, readResumeMarker } from './hls/job-dir.js'
+import { tempDir } from './temp-storage.js'
+import * as ffmpegModule from './hls/ffmpeg.js'
 
 /**
  * End-to-end HLS remote-import test (§31 of the spec — the controlled
@@ -264,7 +267,7 @@ afterAll(async () => {
 })
 
 describe('HLS remote import end-to-end (fixture)', () => {
-  it('flows probe → variant → segment → playlist → FFmpeg → ffprobe → upload → register', async () => {
+  it('flows probe → segment → playlist → FFmpeg → ffprobe → upload → register', async () => {
     if (!fixtureDir) return // skipped (no ffmpeg)
     validationSpy.validateRemoteUrl.mockReset()
     validationSpy.resolveAndValidateHost.mockReset()
@@ -301,5 +304,114 @@ describe('HLS remote import end-to-end (fixture)', () => {
     // MP4 — the output must carry the resolved container's extension.
     expect(createdFile.name).toMatch(/\.(mp4|mkv)$/)
     expect(createdFile.providerFileId).toContain('provider/object-key')
+  })
+
+  it('remux failure keeps the job dir + resume marker; a convert-only retry completes without re-downloading', async () => {
+    if (!fixtureDir) return // skipped (no ffmpeg)
+    validationSpy.validateRemoteUrl.mockReset()
+    validationSpy.resolveAndValidateHost.mockReset()
+    validationSpy.validateRemoteUrl.mockImplementation(async (raw: string) => new URL(raw))
+    validationSpy.resolveAndValidateHost.mockImplementation(async (host: string) => host)
+
+    const importId = 'import-hls-resume'
+    const job = { data: { importId, attempt: 1 }, id: 'job-1' } as unknown as Job<RemoteImportJobData>
+    const { encryptText } = await import('../../utils/crypto.js')
+    const row = mockRow(importId)
+    row.sourceUrlEncrypted = encryptText(`${baseUrl}/master.m3u8`)
+    prisma.remoteImport.findUnique = vi.fn(async () => row)
+    const updateMock = prisma.remoteImport.update as ReturnType<typeof vi.fn>
+    updateMock.mockClear()
+
+    const jobDir = hlsJobDir(row.userId, importId)
+    // The run is deterministic: segments land in the job dir. Clean any
+    // leftover before the first run.
+    await import('node:fs/promises').then((fsp) => fsp.rm(jobDir, { recursive: true, force: true }))
+
+    // ── Run 1: make the remux FAIL (the remux step is reached with all
+    // segments materialized). Spy on the real ffmpeg module so the processor
+    // still imports the real one — the processor imports from './hls/ffmpeg.js'
+    // which resolves to THIS module instance, so the spy intercepts it. The
+    // conversion chain runs remux → mkv-fallback remux → re-encode, so ALL
+    // three must fail for the import to fail.
+    const remuxSpy = vi.spyOn(ffmpegModule, 'runFfmpegRemux').mockRejectedValue(
+      new AppError('HLS_REMUX_FAILED', 'The HLS media could not be converted.', 502),
+    )
+    const reencodeSpy = vi.spyOn(ffmpegModule, 'runFfmpegReencode').mockRejectedValue(
+      new AppError('HLS_REMUX_FAILED', 'The HLS media could not be converted.', 502),
+    )
+    await processRemoteImportJob(job)
+    remuxSpy.mockRestore()
+    reencodeSpy.mockRestore()
+
+    // The job must be marked failed with the remux error code.
+    const failed = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'failed' && call[0]?.data?.errorCode === 'HLS_REMUX_FAILED')
+    expect(failed).toBe(true)
+
+    // The job dir was KEPT (a resume marker exists) and the materialized
+    // segments are still on disk for the convert-only retry.
+    const marker = await readResumeMarker(jobDir)
+    expect(marker).not.toBeNull()
+    expect(marker?.mode).toBe('remux-only')
+    const files = await fsp.readdir(jobDir)
+    expect(files).toContain('video.m3u8')
+    expect(files.some((f) => f.startsWith('video-000') && f.endsWith('.ts'))).toBe(true)
+
+    // ── Run 2: a convert-only retry. The row is queued again (worker status
+    // allows it), the marker is present, and the SAME segment files exist. The
+    // fixture counts segment requests so we can assert zero re-downloads.
+    let segmentRequests = 0
+    const realServer = server
+    // Wrap the server's existing segment handlers with a counter.
+    const originalListener = realServer.listeners('request')[0] as (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void
+    realServer.removeAllListeners('request')
+    realServer.on('request', (req, res) => {
+      if (new URL(req.url ?? '/', 'http://x').pathname.startsWith('/seg')) segmentRequests += 1
+      originalListener(req, res)
+    })
+
+    updateMock.mockClear()
+    prisma.remoteImport.findUnique = vi.fn(async () => ({ ...row, status: 'queued' }))
+    await processRemoteImportJob(job)
+
+    // Completed AND no segment was re-requested (the cache-seeded resume reused
+    // the on-disk files; only the small key.bin re-downloads).
+    const completed2 = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'completed')
+    expect(completed2).toBe(true)
+    expect(segmentRequests).toBe(0)
+
+    // Success drops the marker, and the dir is cleaned up.
+    expect(await readResumeMarker(jobDir)).toBeNull()
+  })
+
+  it('falls back to re-encode when the stream-copy remux fails, and still completes', async () => {
+    if (!fixtureDir) return // skipped (no ffmpeg)
+    validationSpy.validateRemoteUrl.mockReset()
+    validationSpy.resolveAndValidateHost.mockReset()
+    validationSpy.validateRemoteUrl.mockImplementation(async (raw: string) => new URL(raw))
+    validationSpy.resolveAndValidateHost.mockImplementation(async (host: string) => host)
+
+    const importId = 'import-hls-reencode'
+    const job = { data: { importId, attempt: 1 }, id: 'job-1' } as unknown as Job<RemoteImportJobData>
+    const { encryptText } = await import('../../utils/crypto.js')
+    const row = mockRow(importId)
+    row.sourceUrlEncrypted = encryptText(`${baseUrl}/master.m3u8`)
+    prisma.remoteImport.findUnique = vi.fn(async () => row)
+    const updateMock = prisma.remoteImport.update as ReturnType<typeof vi.fn>
+    updateMock.mockClear()
+
+    // The conversion chain must attempt remux, the mkv fallback, and re-encode.
+    // Only the re-encode (REAL ffmpeg) is allowed to succeed.
+    const reencodeSpy = vi.spyOn(ffmpegModule, 'runFfmpegReencode')
+    const remuxSpy = vi.spyOn(ffmpegModule, 'runFfmpegRemux').mockRejectedValue(
+      new AppError('HLS_REMUX_FAILED', 'The HLS media could not be converted.', 502),
+    )
+    await processRemoteImportJob(job)
+    remuxSpy.mockRestore()
+    reencodeSpy.mockRestore()
+
+    expect(reencodeSpy).toHaveBeenCalled()
+    const completed = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'completed')
+    expect(completed).toBe(true)
+    expect(createdFile.name).toMatch(/\.(mp4|mkv)$/)
   })
 })

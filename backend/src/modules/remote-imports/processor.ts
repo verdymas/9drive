@@ -15,7 +15,7 @@ import { uploadToGoogleResumable } from './google-resumable-uploader.js'
 import { createTempPartFile, removeTempFile, appendStreamToTemp } from './temp-storage.js'
 import { sanitizeFileName } from './filename-sanitize.js'
 import { runHlsPipeline } from './hls/pipeline.js'
-import { hlsJobDir, removeJobDir } from './hls/job-dir.js'
+import { hlsJobDir, readResumeMarker, removeJobDir, removeResumeMarker } from './hls/job-dir.js'
 import { hlsDerivedFileName } from './hls/output.js'
 import type { ContainerChoice } from './hls/output.js'
 import { ensureJobDir } from './hls/materializer.js'
@@ -200,10 +200,17 @@ async function registerFile(importId: string, remoteImport: { userId: string; fo
 }
 
 /** Mark the import failed with a safe, loggable message (never the URL). */
-async function markFailed(importId: string, code: string, message: string) {
+async function markFailed(importId: string, code: string, message: string, internalError?: string) {
   await prisma.remoteImport.update({
     where: { id: importId },
-    data: { status: 'failed', stage: STAGES.FINISHED, errorCode: code, errorMessage: message, failedAt: new Date() },
+    data: {
+      status: 'failed',
+      stage: STAGES.FINISHED,
+      errorCode: code,
+      errorMessage: message.slice(0, 4096),
+      internalError: internalError ? internalError.slice(0, 16_384) : null,
+      failedAt: new Date(),
+    },
   }).catch(() => undefined)
 }
 
@@ -242,6 +249,11 @@ async function processHlsImport(
   const jobDir = hlsJobDir(userId, importId)
   await ensureJobDir(jobDir)
 
+  // A convert-only retry (`retryRemoteConvert`) re-enqueues WITHOUT wiping the
+  // job dir; a `resume.json` marker in it tells us to resume at the remux step.
+  // A generic Retry wipes the dir, so an absent marker always means a full run.
+  const resumeMarker = await readResumeMarker(jobDir)
+
   const signalController = new AbortController()
   // The worker checks the DB between phases; this controller is only for
   // cancel requests that arrive DURING a phase (polled below).
@@ -262,6 +274,18 @@ async function processHlsImport(
         audioTrackId: record.hlsAudioTrackId,
         outputContainer: (record.hlsOutputContainer as ContainerChoice) ?? 'auto',
       },
+      // Convert-only resume: reuse the materialized segments on disk; the
+      // marker carries the resolved playlist URLs + container + expectAudio.
+      ...(resumeMarker
+        ? {
+            resume: {
+              playlistUrl: resumeMarker.playlistUrl,
+              audioPlaylistUrl: resumeMarker.audioPlaylistUrl,
+              container: resumeMarker.container,
+              expectAudio: resumeMarker.expectAudio,
+            },
+          }
+        : {}),
       signal: signalController.signal,
       onProgress: async (p) => {
         if (p.stage === 'segments' || p.stage === 'live' || p.stage === 'recording') {
@@ -336,10 +360,19 @@ async function processHlsImport(
 
     if (account.provider === 's3') syncS3Quota(account.id).catch(() => undefined)
     else syncGoogleQuota(account.id).catch(() => undefined)
+
+    // Success: a convert-only retry just completed — drop the marker so the
+    // job dir is removed by the cleanup below. A fresh run had none anyway.
+    await removeResumeMarker(jobDir).catch(() => undefined)
     return { outputPath: pipeline.outputPath }
   } finally {
     clearInterval(pollCancel)
-    await removeJobDir(jobDir).catch(() => undefined)
+    // Keep the job dir ONLY while a resume marker exists (a remux/verify
+    // failure leaves one so a convert-only retry can reuse the segments).
+    // Success and pre-remux failures leave no marker and get cleaned up.
+    if (!(await readResumeMarker(jobDir))) {
+      await removeJobDir(jobDir).catch(() => undefined)
+    }
   }
 }
 
@@ -480,8 +513,8 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error'
     const code = error instanceof AppError ? error.code : 'IMPORT_FAILED'
-    await markFailed(importId, code, message)
     const meta = (error as { meta?: string })?.meta
+    await markFailed(importId, code, message, meta)
     console.error(`[remote-import] ${importId} failed: ${code} ${message}${meta ? ` :: ${meta.slice(-800)}` : ''}`)
   } finally {
     await removeTempFile(importId)

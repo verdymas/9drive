@@ -3,7 +3,7 @@ import { API_URL, apiFetch } from '@/lib/api'
 import { getAccessToken } from '@/lib/auth'
 
 export type UploadProgressStatus = 'uploading' | 'done' | 'error' | 'partial'
-export type UploadProgressFile = { name: string; size: number; percent: number; status: UploadProgressStatus }
+export type UploadProgressFile = { name: string; size: number; percent: number; status: UploadProgressStatus; errorMessage?: string }
 export type UploadProgressState = { open: boolean; fileName: string; percent: number; status: UploadProgressStatus; files: UploadProgressFile[] }
 
 type ResumableSession = { sessionId: string; file: File; folderId?: string | null; targetAccountId?: string | null }
@@ -82,7 +82,17 @@ export function UploadProvider({ children }: { children: ReactNode }) {
       })
 
       if (!response.ok) {
-        throw new Error('Chunk upload failed')
+        let message = `Chunk upload failed (HTTP ${response.status})`
+        try {
+          const errorBody = await response.json() as { message?: string; code?: string }
+          if (errorBody?.message) {
+            message = errorBody.message
+            if (errorBody.code) message = `${errorBody.code}: ${errorBody.message}`
+          }
+        } catch {
+          // Non-JSON error body; keep the HTTP status message
+        }
+        throw new Error(message)
       }
 
       const resData = await response.json() as { status: string; offset?: string }
@@ -128,11 +138,12 @@ export function UploadProvider({ children }: { children: ReactNode }) {
           })
         }, undefined, targetAccountId)
       } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : 'Upload failed'
         console.error('File upload failed:', file.name, err)
         setUploadProgress((current) => {
           const nextFiles = [...current.files]
           if (nextFiles[i]) {
-            nextFiles[i] = { ...nextFiles[i], status: 'error' }
+            nextFiles[i] = { ...nextFiles[i], status: 'error', errorMessage }
           }
           return {
             ...current,
@@ -153,7 +164,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
     if (!session) return
 
     setUploadProgress((current) => {
-      const nextFiles = current.files.map(f => f.name === fileName ? { ...f, status: 'uploading' as const } : f)
+      const nextFiles = current.files.map(f => f.name === fileName ? { ...f, status: 'uploading' as const, errorMessage: undefined } : f)
       return {
         ...current,
         status: 'uploading',
@@ -183,9 +194,10 @@ export function UploadProvider({ children }: { children: ReactNode }) {
       window.dispatchEvent(new Event('9drive:storage-changed'))
       window.dispatchEvent(new Event('9drive:upload-completed'))
     } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Retry upload failed'
       console.error('Retry upload failed:', fileName, err)
       setUploadProgress((current) => {
-        const nextFiles = current.files.map(f => f.name === fileName ? { ...f, status: 'error' as const } : f)
+        const nextFiles = current.files.map(f => f.name === fileName ? { ...f, status: 'error' as const, errorMessage } : f)
         return {
           ...current,
           status: 'partial',

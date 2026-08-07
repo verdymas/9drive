@@ -24,12 +24,13 @@ import { env } from '../../../config/env.js'
 import { AppError } from '../../../utils/app-error.js'
 import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './errors.js'
 import { fetchManifest, parseManifest, type HlsAudioTrackMetadata, type HlsManifestInfo, type HlsVariantMetadata } from './manifest.js'
-import { materializeMedia, fetchMediaPlaylistSegments } from './materialize.js'
+import { materializeMedia, fetchMediaPlaylistSegments, buildSegmentCacheSeed } from './materialize.js'
 import { resolveSelectedVariant, resolveSelectedAudio } from './selection.js'
-import { resolveContainer, containerExtension, type ContainerChoice } from './output.js'
-import { runFfmpegRemux, verifyFfmpegAvailable } from './ffmpeg.js'
+import { resolveContainer, containerExtension, shouldAutoFallbackToMkv, type ContainerChoice } from './output.js'
+import { runFfmpegReencode, runFfmpegRemux, verifyFfmpegAvailable, type FfmpegRunResult } from './ffmpeg.js'
 import { verifyOutput, type MediaVerification } from './verify.js'
 import { ensureJobDir } from './materializer.js'
+import { writeResumeMarker } from './job-dir.js'
 import type { NormalizedSegment } from './segments.js'
 import { hlsDerivedFileName, fileNameHasExtension } from './output.js'
 
@@ -45,6 +46,20 @@ export type HlsPipelineOptions = {
   selection: HlsSelection
   isLive: boolean
   recordingDurationSeconds?: number
+  /**
+   * Convert-only retry: skip the master-manifest fetch, variant/audio
+   * selection and live poll — reuse the already-materialized segments on disk.
+   * `playlistUrl` is the final media playlist URL; the pipeline re-fetches it
+   * (cheap) to derive segment URIs, seeds `materializeMedia`'s `segmentCache`
+   * with the on-disk filenames, and resumes at the remux step. `container` /
+   * `expectAudio` honour the original selection.
+   */
+  resume?: {
+    playlistUrl: string
+    audioPlaylistUrl: string | null
+    container: 'mkv' | 'mp4'
+    expectAudio: boolean
+  }
   signal?: AbortSignal
   onProgress?: (progress: {
     stage: string
@@ -96,61 +111,99 @@ async function resolveMediaSegments(playlistUrl: string): Promise<NormalizedSegm
  * `segmentCache` until `recordingDurationSeconds` of media time, then remuxed.
  */
 export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipelineResult> {
-  const { jobDir, sourceUrl, selection, isLive, signal, recordingDurationSeconds } = opts
+  const { jobDir, sourceUrl, selection, isLive, signal, recordingDurationSeconds, resume } = opts
   await ensureJobDir(jobDir)
 
-  // ── 1. Fetch + parse the ORIGINAL source manifest. ───────────────────────
-  let sourceInfo: HlsManifestInfo
-  try {
-    const { body, finalUrl } = await fetchManifest(sourceUrl)
-    sourceInfo = parseManifest(body, finalUrl)
-  } catch (error) {
-    if (error instanceof AppError) throw error
-    throw new AppError(HLS_ERROR_CODES.HLS_INVALID_MANIFEST, HLS_ERROR_MESSAGES.HLS_INVALID_MANIFEST, 400)
-  }
-
-  // ── 2. Resolve the selected media playlist(s). ────────────────────────────
+  // Resolved during the run; needed to write the resume marker on remux failure.
   let videoPlaylistUrl: string
-  let selectedVariant: HlsVariantMetadata | null = null
-  let selectedAudio: HlsAudioTrackMetadata | null = null
-  const videoSourceType: 'master' | 'media' = sourceInfo.sourceType === 'master' ? 'master' : 'media'
+  let audioPlaylistUrl: string | null = null
+  let expectAudio: boolean
+  let container: 'mkv' | 'mp4'
 
-  if (sourceInfo.sourceType === 'master') {
-    selectedVariant = resolveSelectedVariant(sourceInfo.variants, selection.variantId)
-    selectedAudio = resolveSelectedAudio(sourceInfo.audioTracks, selection.audioTrackId ?? null)
-    videoPlaylistUrl = selectedVariant.childPlaylistUrl
+  // ── 1–4 (fresh run): fetch + parse source, select variant/audio, poll. ────
+  let segmentCache = new Map<string, string>()
+  let allVideoSegments: NormalizedSegment[]
+
+  if (resume) {
+    // ── Convert-only retry: reuse the on-disk segments. ────────────────────
+    // Skip the master manifest + variant/audio selection (the marker already
+    // holds the resolved child playlist). Re-fetch the media playlist (cheap)
+    // to derive segment URIs, then seed materializeMedia's cache with the
+    // deterministic on-disk filenames so nothing is re-downloaded.
+    assertNotAborted(signal)
+    videoPlaylistUrl = resume.playlistUrl
+    audioPlaylistUrl = resume.audioPlaylistUrl
+    expectAudio = resume.expectAudio
+    container = resume.container
+
+    allVideoSegments = await resolveMediaSegments(videoPlaylistUrl)
+    segmentCache = buildSegmentCacheSeed(jobDir, allVideoSegments, 'video')
   } else {
-    videoPlaylistUrl = sourceInfo.manifestUrl
-  }
-
-  // ── 3. Fetch the (first) media playlist snapshot. ─────────────────────────
-  const firstVideoSegments = await resolveMediaSegments(videoPlaylistUrl)
-
-  // ── 4. LIVE recording: poll the media playlist until the target is hit. ──
-  const segmentCache = new Map<string, string>()
-  const allVideoSegments: NormalizedSegment[] = [...firstVideoSegments]
-
-  if (isLive) {
-    const targetSeconds = recordingDurationSeconds ?? env.REMOTE_IMPORT_HLS_MIN_RECORD_SECONDS
-    if (!targetSeconds || targetSeconds < env.REMOTE_IMPORT_HLS_MIN_RECORD_SECONDS || targetSeconds > env.REMOTE_IMPORT_HLS_MAX_RECORD_SECONDS) {
-      throw new AppError(HLS_ERROR_CODES.HLS_LIVE_DURATION_INVALID, HLS_ERROR_MESSAGES.HLS_LIVE_DURATION_INVALID, 400)
+    // ── 1. Fetch + parse the ORIGINAL source manifest. ─────────────────────
+    let sourceInfo: HlsManifestInfo
+    try {
+      const { body, finalUrl } = await fetchManifest(sourceUrl)
+      sourceInfo = parseManifest(body, finalUrl)
+    } catch (error) {
+      if (error instanceof AppError) throw error
+      throw new AppError(HLS_ERROR_CODES.HLS_INVALID_MANIFEST, HLS_ERROR_MESSAGES.HLS_INVALID_MANIFEST, 400)
     }
 
-    const pollIntervalMs = Math.max(1000, Math.round((firstVideoSegments[0]?.duration ?? 6) * 1000 * 0.7))
+    // ── 2. Resolve the selected media playlist(s). ──────────────────────────
+    let selectedVariant: HlsVariantMetadata | null = null
+    let selectedAudio: HlsAudioTrackMetadata | null = null
+    if (sourceInfo.sourceType === 'master') {
+      selectedVariant = resolveSelectedVariant(sourceInfo.variants, selection.variantId)
+      selectedAudio = resolveSelectedAudio(sourceInfo.audioTracks, selection.audioTrackId ?? null)
+      videoPlaylistUrl = selectedVariant.childPlaylistUrl
+    } else {
+      videoPlaylistUrl = sourceInfo.manifestUrl
+    }
 
-    while (true) {
-      assertNotAborted(signal)
-      const snapshot = await resolveMediaSegments(videoPlaylistUrl)
-      if (snapshot.length > firstVideoSegments.length) {
-        allVideoSegments.push(...snapshot.slice(firstVideoSegments.length))
+    // ── 3. Fetch the (first) media playlist snapshot. ───────────────────────
+    const firstVideoSegments = await resolveMediaSegments(videoPlaylistUrl)
+    allVideoSegments = [...firstVideoSegments]
+
+    // ── 4. LIVE recording: poll until the target is hit. ────────────────────
+    if (isLive) {
+      const targetSeconds = recordingDurationSeconds ?? env.REMOTE_IMPORT_HLS_MIN_RECORD_SECONDS
+      if (!targetSeconds || targetSeconds < env.REMOTE_IMPORT_HLS_MIN_RECORD_SECONDS || targetSeconds > env.REMOTE_IMPORT_HLS_MAX_RECORD_SECONDS) {
+        throw new AppError(HLS_ERROR_CODES.HLS_LIVE_DURATION_INVALID, HLS_ERROR_MESSAGES.HLS_LIVE_DURATION_INVALID, 400)
       }
-      opts.onProgress?.({
-        stage: 'recording',
-        mediaDurationSeconds: safeMediaDuration(allVideoSegments.reduce((sum, s) => sum + (Number.isFinite(s.duration) ? s.duration : 0), 0)),
-      })
-      if (safeMediaDuration(allVideoSegments.reduce((sum, s) => sum + (Number.isFinite(s.duration) ? s.duration : 0), 0)) >= targetSeconds) break
-      await sleep(pollIntervalMs)
+
+      const pollIntervalMs = Math.max(1000, Math.round((firstVideoSegments[0]?.duration ?? 6) * 1000 * 0.7))
+
+      while (true) {
+        assertNotAborted(signal)
+        const snapshot = await resolveMediaSegments(videoPlaylistUrl)
+        if (snapshot.length > firstVideoSegments.length) {
+          allVideoSegments.push(...snapshot.slice(firstVideoSegments.length))
+        }
+        opts.onProgress?.({
+          stage: 'recording',
+          mediaDurationSeconds: safeMediaDuration(allVideoSegments.reduce((sum, s) => sum + (Number.isFinite(s.duration) ? s.duration : 0), 0)),
+        })
+        if (safeMediaDuration(allVideoSegments.reduce((sum, s) => sum + (Number.isFinite(s.duration) ? s.duration : 0), 0)) >= targetSeconds) break
+        await sleep(pollIntervalMs)
+      }
     }
+
+    // Optional alternate audio.
+    if (selectedAudio?.playlistUrl) {
+      audioPlaylistUrl = selectedAudio.playlistUrl
+      const audioSegments = await resolveMediaSegments(audioPlaylistUrl)
+      await materializeMedia({ jobDir, mediaLabel: 'audio', segments: audioSegments, segmentCache, signal })
+    }
+
+    expectAudio = Boolean(audioPlaylistUrl) || sourceInfo.sourceType === 'media'
+
+    // ── 6. Verify FFmpeg + resolve container. ───────────────────────────────
+    verifyFfmpegAvailable()
+    container = resolveContainer(selection.outputContainer, {
+      hasSeparateAudio: Boolean(audioPlaylistUrl),
+      hasSubtitles: false,
+      hasDiscontinuities: allVideoSegments.some((s) => s.discontinuity),
+    })
   }
 
   // ── 5. Materialize the FULL accumulated segment set (cache avoids
@@ -170,48 +223,99 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     }),
   })
 
-  // Optional alternate audio.
-  let audioPlaylistUrl: string | null = null
-  if (selectedAudio?.playlistUrl) {
-    audioPlaylistUrl = selectedAudio.playlistUrl
+  // ── (resume) Optional alternate audio. ────────────────────────────────────
+  if (resume && audioPlaylistUrl) {
     const audioSegments = await resolveMediaSegments(audioPlaylistUrl)
-    await materializeMedia({ jobDir, mediaLabel: 'audio', segments: audioSegments, segmentCache, signal })
+    const audioCache = buildSegmentCacheSeed(jobDir, audioSegments, 'audio')
+    await materializeMedia({ jobDir, mediaLabel: 'audio', segments: audioSegments, segmentCache: audioCache, signal })
   }
 
-  // ── 6. Verify FFmpeg + resolve container. ─────────────────────────────────
-  verifyFfmpegAvailable()
-  const container = resolveContainer(selection.outputContainer, {
-    hasSeparateAudio: Boolean(audioPlaylistUrl),
-    hasSubtitles: false,
-    hasDiscontinuities: allVideoSegments.some((s) => s.discontinuity),
-  })
-
   // ── 7. Remux. ─────────────────────────────────────────────────────────────
-  const outputPartPath = path.join(jobDir, `output.${containerExtension(container)}.part`)
-  const remux = await runFfmpegRemux(
-    video.localPlaylistPath,
-    outputPartPath,
-    container,
-    jobDir,
-    signal,
-    (p) => opts.onProgress?.({ stage: 'remux', remuxPercent: p.percent }),
-    safeMediaDuration(allVideoSegments.reduce((sum, s) => sum + s.duration, 0)),
-  )
+  const mediaSeconds = safeMediaDuration(allVideoSegments.reduce((sum, s) => sum + s.duration, 0))
+  const onFfmpegProgress = (p: { percent: number | null }) => opts.onProgress?.({ stage: 'remux', remuxPercent: p.percent })
+
+  // `actualContainer` tracks the real output container: auto-selected MP4 may
+  // fall back to MKV below if the stream-copy mux fails.
+  let actualContainer: 'mkv' | 'mp4' = container
+
+  const outputPartPath = (c: 'mkv' | 'mp4') => path.join(jobDir, `output.${containerExtension(c)}.part`)
+
+  // On a terminal remux/verify failure, write the resume marker so a
+  // convert-only retry can reuse the materialized segments, then rethrow the
+  // original error (the processor marks the row failed).
+  const writeMarkerAndRethrow = (error: unknown): never => {
+    if (error instanceof AppError && (error.code === HLS_ERROR_CODES.HLS_REMUX_FAILED || error.code === HLS_ERROR_CODES.HLS_OUTPUT_INVALID)) {
+      void writeResumeMarker(jobDir, {
+        version: 1,
+        mode: 'remux-only',
+        playlistUrl: videoPlaylistUrl,
+        audioPlaylistUrl,
+        container: actualContainer,
+        expectAudio,
+        mediaDurationSeconds: mediaSeconds,
+      }).catch((writeError) => {
+        console.error('[hls] failed to write resume marker:', writeError instanceof Error ? writeError.message : String(writeError))
+      })
+    }
+    throw error
+  }
+
+  // Conversion chain, mirroring the known-good script (code_example_convert.sh):
+  //   1. stream-copy remux (fast path),
+  //   2. auto-selected MP4 that fails to copy-mux → retry as MKV (safe default
+  //      for raw HLS streams; a user-selected container is never changed),
+  //   3. any copy failure → re-encode (H.264 + AAC) as a last resort.
+  // A re-encode always succeeds or we fail; the marker is written on a terminal
+  // failure so a convert-only retry can reuse the downloaded segments.
+  const runRemux = async (forContainer: 'mkv' | 'mp4'): Promise<FfmpegRunResult> => {
+    try {
+      return await runFfmpegRemux(video.localPlaylistPath, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
+    } catch (error) {
+      // Auto-selected MP4: if the mux failed (e.g. a container that cannot hold
+      // the stream-copied codec), retry once with MKV, which is the safe
+      // default for raw HLS streams.
+      if (error instanceof AppError && error.code === HLS_ERROR_CODES.HLS_REMUX_FAILED && forContainer === 'mp4' && shouldAutoFallbackToMkv(selection.outputContainer)) {
+        actualContainer = 'mkv'
+        try {
+          return await runFfmpegRemux(video.localPlaylistPath, outputPartPath(actualContainer), actualContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
+        } catch (fallbackError) {
+          return runReencode(actualContainer, fallbackError)
+        }
+      }
+      return runReencode(forContainer, error)
+    }
+  }
+
+  // Re-encode (H.264 + AAC) the local playlist — handles image2/png-pipe and
+  // other sources a stream copy cannot mux. On failure, write the marker +
+  // rethrow.
+  const runReencode = async (forContainer: 'mkv' | 'mp4', originalError: unknown): Promise<FfmpegRunResult> => {
+    try {
+      return await runFfmpegReencode(video.localPlaylistPath, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
+    } catch (error) {
+      return writeMarkerAndRethrow(error)
+    }
+  }
+
+  const remux = await runRemux(actualContainer)
 
   // ── 8. Verify output. ─────────────────────────────────────────────────────
-  const verification = await verifyOutput(remux.outputPath, {
-    expectVideo: true,
-    expectAudio: Boolean(audioPlaylistUrl) || videoSourceType === 'media',
-  })
+  const verification: MediaVerification = await (async (): Promise<MediaVerification> => {
+    try {
+      return await verifyOutput(remux.outputPath, { expectVideo: true, expectAudio })
+    } catch (error) {
+      return writeMarkerAndRethrow(error)
+    }
+  })()
 
   // ── 9. Final file name (matches the container). ───────────────────────────
-  const extension = containerExtension(container)
+  const extension = containerExtension(actualContainer)
   const baseName = path.basename(new URL(videoPlaylistUrl).pathname).replace(/\.m3u8?$/i, '') || 'video'
   const fileName = hlsDerivedFileName(baseName, extension)
 
   return {
     outputPath: remux.outputPath,
-    container,
+    container: actualContainer,
     verification,
     fileName,
     mediaDurationSeconds: safeMediaDuration(allVideoSegments.reduce((sum, s) => sum + s.duration, 0)),

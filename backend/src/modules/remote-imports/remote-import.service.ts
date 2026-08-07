@@ -225,6 +225,7 @@ export async function retryRemoteImport(importId: string, userId: string) {
       attempt: { increment: 1 },
       errorCode: null,
       errorMessage: null,
+      internalError: null,
       failedAt: null,
       cancelledAt: null,
       completedAt: null,
@@ -236,6 +237,36 @@ export async function retryRemoteImport(importId: string, userId: string) {
   await removeJobDirIfExists(userId, importId)
   await enqueueRemoteImport(importId)
   await createAuditLog(userId, 'IMPORT_URL_RETRY', 'remote_import', importId, { name: updated.fileName })
+  return updated
+}
+
+/** Convert-only retry: re-enqueue the HLS remux WITHOUT wiping the job dir. */
+export async function retryRemoteConvert(importId: string, userId: string) {
+  const row = await getRemoteImportForUser(importId, userId)
+  const isHls = row.sourceType === 'hls_master' || row.sourceType === 'hls_media'
+  const ok = row.status === 'failed' && isHls && (row.errorCode === 'HLS_REMUX_FAILED' || row.errorCode === 'HLS_OUTPUT_INVALID')
+  if (!ok) {
+    throw new AppError('REMOTE_IMPORT_NOT_CONVERT_RETRYABLE', 'Only a failed HLS conversion can be retried this way.', 400)
+  }
+  const updated = await prisma.remoteImport.update({
+    where: { id: importId },
+    data: {
+      status: 'queued',
+      stage: 'waiting',
+      attempt: { increment: 1 },
+      errorCode: null,
+      errorMessage: null,
+      internalError: null,
+      failedAt: null,
+      cancelledAt: null,
+      completedAt: null,
+      startedAt: null,
+    },
+  })
+  // Deliberately NOT removeJobDirIfExists: the job dir holds the downloaded
+  // segments the convert-only retry reuses (signaled by resume.json).
+  await enqueueRemoteImport(importId)
+  await createAuditLog(userId, 'IMPORT_URL_RETRY_CONVERT', 'remote_import', importId, { name: updated.fileName })
   return updated
 }
 

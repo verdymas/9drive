@@ -40,6 +40,11 @@ export async function apiFetch<T>(path: string, options: ApiOptions = {}): Promi
     throw new Error(error.message ?? 'Request failed')
   }
 
+  // 204 No Content (e.g. DELETE responses) has no body — don't try to parse it.
+  if (response.status === 204) {
+    return undefined as T
+  }
+
   return response.json() as Promise<T>
 }
 

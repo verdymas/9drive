@@ -142,61 +142,24 @@ export function parseFfmpegProgressLine(line: string, totalSeconds: number): { p
 }
 
 /**
- * Run FFmpeg against the local rewritten playlist.
- *
- * @param inputPlaylistPath absolute path of the local media playlist
- * @param outputPartPath   absolute `.part` path — renamed to final on success
- * @param container        'mkv' | 'mp4'
- * @param cwd              job directory
- * @param signal           abort (SIGTERM → SIGKILL escalation)
- * @param onProgress       throttled percent callback
+ * Shared FFmpeg process runner: spawn, cap stderr, parse `-progress pipe:1`,
+ * enforce the timeout, forward abort (SIGTERM → SIGKILL), and rename the
+ * `.part` output to its final path only on a clean exit.
  */
-export async function runFfmpegRemux(
-  inputPlaylistPath: string,
-  outputPartPath: string,
-  container: 'mkv' | 'mp4',
-  cwd: string,
-  signal?: AbortSignal,
-  onProgress?: (progress: { percent: number | null }) => void,
-  totalDurationSeconds?: number,
-): Promise<FfmpegRunResult> {
-  verifyFfmpegAvailable()
-  const args = [
-    '-nostdin',
-    '-hide_banner',
-    '-loglevel', 'warning',
-    '-progress', 'pipe:1',
-    '-protocol_whitelist', 'file,crypto',
-    // The rewritten local playlist emits .m3u8/.ts (segments), .mp4 (fMP4
-    // init maps) and .bin (AES-128 keys). FFmpeg's HLS demuxer restricts which
-    // file extensions it will open — without this, a `video-key-000001.bin`
-    // key (or `.mp4` init map) is refused ("Unable to open key file").
-    '-allowed_extensions', 'm3u8,ts,mp4,bin',
-    '-i', inputPlaylistPath,
-    '-map', '0',
-    '-c', 'copy',
-    ...(container === 'mp4' ? ['-movflags', '+faststart'] : []),
-    // The output path is `output.<ext>.part` — FFmpeg cannot infer the muxer
-    // from a `.part` suffix, so the container is pinned explicitly.
-    '-f', container === 'mp4' ? 'mp4' : 'matroska',
-    '-y',
-    outputPartPath,
-  ]
-
+function runFfmpegProcess(args: string[], outputPartPath: string, opts: { cwd: string; signal?: AbortSignal; onProgress?: (p: { percent: number | null }) => void; totalDurationSeconds?: number }): Promise<FfmpegRunResult> {
   const maxStderr = 64 * 1024
   const timeoutMs = env.REMOTE_IMPORT_FFMPEG_TIMEOUT_SECONDS * 1000
+  const { cwd, signal, onProgress, totalDurationSeconds } = opts
 
   return new Promise((resolve, reject) => {
     const child = spawn(env.REMOTE_IMPORT_FFMPEG_PATH, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
     let stderr = ''
-    let timedOut = false
 
     const kill = (signalName: NodeJS.Signals) => {
       child.kill(signalName)
     }
 
     const timer = setTimeout(() => {
-      timedOut = true
       kill('SIGKILL')
       reject(new AppError(HLS_ERROR_CODES.FFMPEG_TIMEOUT, HLS_ERROR_MESSAGES.FFMPEG_TIMEOUT, 408))
     }, timeoutMs)
@@ -238,6 +201,103 @@ export async function runFfmpegRemux(
       resolve({ outputPath: finalPath, stderrTail: stderr.slice(-2000) })
     })
   })
+}
+
+/** Shared demux flags — the known-good conversion script (code_example_convert.sh)
+ *  uses the same large probe buffers so unusual/pipe-like sources are detected. */
+const DEMUXER_ARGS = ['-analyzeduration', '100M', '-probesize', '100M']
+
+/**
+ * Run FFmpeg against the local rewritten playlist (stream copy — the fast
+ * path). A container that cannot hold the stream-copied codec fails here; the
+ * pipeline falls back to `runFfmpegReencode`.
+ *
+ * @param inputPlaylistPath absolute path of the local media playlist
+ * @param outputPartPath   absolute `.part` path — renamed to final on success
+ * @param container        'mkv' | 'mp4'
+ * @param cwd              job directory
+ * @param signal           abort (SIGTERM → SIGKILL escalation)
+ * @param onProgress       throttled percent callback
+ */
+export async function runFfmpegRemux(
+  inputPlaylistPath: string,
+  outputPartPath: string,
+  container: 'mkv' | 'mp4',
+  cwd: string,
+  signal?: AbortSignal,
+  onProgress?: (progress: { percent: number | null }) => void,
+  totalDurationSeconds?: number,
+): Promise<FfmpegRunResult> {
+  verifyFfmpegAvailable()
+  const args = [
+    '-nostdin',
+    '-hide_banner',
+    '-loglevel', 'warning',
+    '-progress', 'pipe:1',
+    '-protocol_whitelist', 'file,crypto',
+    ...DEMUXER_ARGS,
+    // The rewritten local playlist emits .m3u8/.ts (segments), .mp4 (fMP4
+    // init maps) and .bin (AES-128 keys). FFmpeg's HLS demuxer restricts which
+    // file extensions it will open — without this, a `video-key-000001.bin`
+    // key (or `.mp4` init map) is refused ("Unable to open key file").
+    '-allowed_extensions', 'm3u8,ts,mp4,bin',
+    '-i', inputPlaylistPath,
+    '-map', '0',
+    '-c', 'copy',
+    ...(container === 'mp4' ? ['-movflags', '+faststart'] : []),
+    // The output path is `output.<ext>.part` — FFmpeg cannot infer the muxer
+    // from a `.part` suffix, so the container is pinned explicitly.
+    '-f', container === 'mp4' ? 'mp4' : 'matroska',
+    '-y',
+    outputPartPath,
+  ]
+  return runFfmpegProcess(args, outputPartPath, { cwd, signal, onProgress, totalDurationSeconds })
+}
+
+/**
+ * Run FFmpeg against the local rewritten playlist with a REAL encode
+ * (H.264 + AAC) — the re-encode fallback the known-good conversion script uses
+ * when a stream-copy remux fails (e.g. image2/png-pipe sources, or a codec no
+ * container will hold). Slower than `runFfmpegRemux`; called once as a
+ * last-resort conversion.
+ *
+ * @param inputPlaylistPath absolute path of the local media playlist
+ * @param outputPartPath   absolute `.part` path — renamed to final on success
+ * @param container        'mkv' | 'mp4'
+ * @param cwd              job directory
+ * @param signal           abort (SIGTERM → SIGKILL escalation)
+ * @param onProgress       throttled percent callback
+ */
+export async function runFfmpegReencode(
+  inputPlaylistPath: string,
+  outputPartPath: string,
+  container: 'mkv' | 'mp4',
+  cwd: string,
+  signal?: AbortSignal,
+  onProgress?: (progress: { percent: number | null }) => void,
+  totalDurationSeconds?: number,
+): Promise<FfmpegRunResult> {
+  verifyFfmpegAvailable()
+  const args = [
+    '-nostdin',
+    '-hide_banner',
+    '-loglevel', 'warning',
+    '-progress', 'pipe:1',
+    '-protocol_whitelist', 'file,crypto',
+    ...DEMUXER_ARGS,
+    '-allowed_extensions', 'm3u8,ts,mp4,bin',
+    '-i', inputPlaylistPath,
+    '-map', '0',
+    // H.264 + AAC so the output plays everywhere (VLC, MP) — mirror the
+    // known-good script's re-encode flags; yuv420p for max device compatibility.
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '128k',
+    ...(container === 'mp4' ? ['-movflags', '+faststart'] : []),
+    '-f', container === 'mp4' ? 'mp4' : 'matroska',
+    '-y',
+    outputPartPath,
+  ]
+  return runFfmpegProcess(args, outputPartPath, { cwd, signal, onProgress, totalDurationSeconds })
 }
 
 /**

@@ -155,6 +155,25 @@ export function retryRemoteImport(id: string) {
   return apiFetch<RemoteImportItem>(`/remote-imports/${id}/retry`, { method: 'POST' })
 }
 
+/**
+ * Retry only the conversion (remux) step of a failed HLS import. Reuses the
+ * already-downloaded segments; requires the failure to be remux/verify-related.
+ */
+export function retryRemoteConvert(id: string) {
+  return apiFetch<RemoteImportItem>(`/remote-imports/${id}/retry-convert`, { method: 'POST' })
+}
+
+/**
+ * Error codes that mean the source finished downloading but the conversion
+ * failed — a "retry convert" re-runs only the remux step, skipping re-download.
+ */
+export const CONVERT_RETRYABLE_CODES = ['HLS_REMUX_FAILED', 'HLS_OUTPUT_INVALID'] as const
+
+export function isConvertRetryable(item: RemoteImportItem): boolean {
+  const isHls = item.sourceType === 'hls_master' || item.sourceType === 'hls_media'
+  return item.status === 'failed' && isHls && CONVERT_RETRYABLE_CODES.includes(item.errorCode as (typeof CONVERT_RETRYABLE_CODES)[number])
+}
+
 export function deleteRemoteImport(id: string) {
   return apiFetch<void>(`/remote-imports/${id}`, { method: 'DELETE' })
 }

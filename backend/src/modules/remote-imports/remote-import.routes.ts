@@ -9,6 +9,7 @@ import {
   deleteRemoteImport,
   getRemoteImportForUser,
   listRemoteImportsForUser,
+  retryRemoteConvert,
   retryRemoteImport,
   serializeRemoteImport,
 } from './remote-import.service.js'
@@ -134,6 +135,21 @@ remoteImportRouter.post('/:id/cancel', requireAuth, async (req: AuthRequest, res
 remoteImportRouter.post('/:id/retry', requireAuth, async (req: AuthRequest, res, next) => {
   try {
     const row = await retryRemoteImport(String(req.params.id), req.user!.id)
+    return res.json(serializeRemoteImport(row))
+  } catch (error) {
+    if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
+    return next(error)
+  }
+})
+
+/**
+ * Retry only the conversion step of a failed HLS import. Reuses the already
+ * downloaded segments (the job dir is kept for this purpose); requires the
+ * failure to be remux/verify-related. Re-registered before any catch-all.
+ */
+remoteImportRouter.post('/:id/retry-convert', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const row = await retryRemoteConvert(String(req.params.id), req.user!.id)
     return res.json(serializeRemoteImport(row))
   } catch (error) {
     if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })

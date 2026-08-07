@@ -3,7 +3,7 @@ import { render, screen } from '@testing-library/react'
 import { formatDisplayUrl, hlsActivityLine, hlsSummaryLine, progressPercent } from '@/pages/RemoteImportsPage'
 import { formatDuration } from '@/components/drive/RemoteImportModal'
 import { Button } from '@/components/ui/button'
-import type { RemoteImportItem } from '@/lib/remoteImports'
+import { CONVERT_RETRYABLE_CODES, isConvertRetryable, type RemoteImportItem } from '@/lib/remoteImports'
 
 /**
  * Frontend regression tests for the Remote Imports overflow fix.
@@ -143,6 +143,25 @@ describe('hlsSummaryLine', () => {
 
   it('falls back to a neutral label with no metadata', () => {
     expect(hlsSummaryLine(item({ sourceType: 'hls_master' }))).toBe('HLS video')
+  })
+})
+
+describe('isConvertRetryable', () => {
+  it('is true for a failed HLS import with a remux/verify error code', () => {
+    for (const code of CONVERT_RETRYABLE_CODES) {
+      expect(isConvertRetryable(item({ status: 'failed', sourceType: 'hls_master', errorCode: code }))).toBe(true)
+    }
+  })
+
+  it('is false for a failed HLS import with any other error code', () => {
+    expect(isConvertRetryable(item({ status: 'failed', sourceType: 'hls_media', errorCode: 'HLS_INVALID_MANIFEST' }))).toBe(false)
+    expect(isConvertRetryable(item({ status: 'failed', sourceType: 'hls_media', errorCode: 'HLS_SEGMENT_DOWNLOAD_FAILED' }))).toBe(false)
+    expect(isConvertRetryable(item({ status: 'failed', sourceType: 'hls_media', errorCode: null }))).toBe(false)
+  })
+
+  it('is false for a non-failed or non-HLS import even with a retryable code', () => {
+    expect(isConvertRetryable(item({ status: 'processing', sourceType: 'hls_master', errorCode: 'HLS_REMUX_FAILED' }))).toBe(false)
+    expect(isConvertRetryable(item({ status: 'failed', sourceType: null, errorCode: 'HLS_REMUX_FAILED' }))).toBe(false)
   })
 })
 

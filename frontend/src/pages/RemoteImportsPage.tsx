@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { CloudDownload, Loader2, Pause, RefreshCw, Trash2 } from 'lucide-react'
+import { CloudDownload, Loader2, Pause, RefreshCw, Trash2, Wand2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { PageHeader } from '@/components/drive/PageHeader'
@@ -8,7 +8,9 @@ import { apiFetch, formatBytes, formatDate } from '@/lib/api'
 import {
   cancelRemoteImport,
   deleteRemoteImport,
+  isConvertRetryable,
   listRemoteImports,
+  retryRemoteConvert,
   retryRemoteImport,
   statusLabel,
   type RemoteImportItem,
@@ -232,6 +234,18 @@ export function RemoteImportsPage() {
     }
   }
 
+  async function handleRetryConvert(id: string) {
+    setBusyId(id)
+    try {
+      await retryRemoteConvert(id)
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to retry conversion')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   async function handleDelete(id: string) {
     setBusyId(id)
     try {
@@ -327,6 +341,11 @@ export function RemoteImportsPage() {
                       {retryable && (
                         <Button size="sm" variant="outline" disabled={busyId === item.id} onClick={() => handleRetry(item.id)}>
                           <RefreshCw className="h-3.5 w-3.5" />Retry
+                        </Button>
+                      )}
+                      {isConvertRetryable(item) && (
+                        <Button size="sm" variant="outline" disabled={busyId === item.id} onClick={() => handleRetryConvert(item.id)} title="Retry only the conversion, reusing the downloaded segments">
+                          <Wand2 className="h-3.5 w-3.5" />Retry convert
                         </Button>
                       )}
                       <Button size="sm" variant="danger" disabled={busyId === item.id} onClick={() => handleDelete(item.id)} aria-label={`Delete remote import ${item.fileName}`} title={`Delete ${item.fileName}`}>

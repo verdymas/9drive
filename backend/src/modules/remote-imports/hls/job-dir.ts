@@ -58,6 +58,64 @@ export async function writeJobState(jobDir: string, state: JobState): Promise<vo
   await fsp.writeFile(jobStatePath(jobDir), JSON.stringify(state), { mode: 0o600 })
 }
 
+/**
+ * Resume marker for a "retry convert only" (remux-only) HLS import.
+ *
+ * Written into the job directory when the remux/verify step fails so a
+ * convert-only retry can resume at the remux step — reusing the already
+ * materialized segments instead of re-downloading them. `version` gates reads
+ * so a future schema change can refuse stale markers cleanly.
+ */
+export type HlsResumeMarker = {
+  version: 1
+  mode: 'remux-only'
+  /** Final media (video) playlist URL — re-fetched on resume to derive segment URIs. */
+  playlistUrl: string
+  /** Alternate audio playlist URL, or null when the video muxes its own audio. */
+  audioPlaylistUrl: string | null
+  /** Container resolved at failure — the resume honours the original selection. */
+  container: 'mkv' | 'mp4'
+  /** True when the output is expected to carry audio (from source type / audio track). */
+  expectAudio: boolean
+  mediaDurationSeconds: number
+}
+
+export function resumeMarkerPath(jobDir: string): string {
+  return path.join(jobDir, 'resume.json')
+}
+
+export async function readResumeMarker(jobDir: string): Promise<HlsResumeMarker | null> {
+  try {
+    const raw = await fsp.readFile(resumeMarkerPath(jobDir), 'utf8')
+    const parsed = JSON.parse(raw) as HlsResumeMarker
+    return parsed?.version === 1 && parsed.mode === 'remux-only' ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+export async function writeResumeMarker(jobDir: string, marker: HlsResumeMarker): Promise<void> {
+  // The job dir was created via ensureJobDir() before the pipeline ran; the
+  // containment check below mirrors removeJobDir — never write outside the
+  // configured temporary root.
+  const root = path.resolve(tempDir())
+  const resolved = path.resolve(jobDir)
+  if (resolved === root || !resolved.startsWith(root + path.sep)) {
+    throw new AppError(HLS_ERROR_CODES.HLS_OUTPUT_INVALID, 'Invalid job directory.', 500)
+  }
+  await fsp.mkdir(jobDir, { recursive: true, mode: 0o700 })
+  await fsp.writeFile(resumeMarkerPath(jobDir), JSON.stringify(marker), { mode: 0o600 })
+}
+
+/**
+ * Drop the resume marker. Used after a successful convert-only retry so the
+ * caller's job-dir cleanup (which keeps the dir only while a marker exists)
+ * removes the now-unneeded scratch directory.
+ */
+export async function removeResumeMarker(jobDir: string): Promise<void> {
+  await fsp.rm(resumeMarkerPath(jobDir), { force: true }).catch(() => undefined)
+}
+
 /** Recursively remove the job directory; never touches anything else. */
 export async function removeJobDir(jobDir: string): Promise<void> {
   const root = path.resolve(tempDir())
