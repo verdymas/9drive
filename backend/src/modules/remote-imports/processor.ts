@@ -321,7 +321,11 @@ async function processHlsImport(
       ? await prisma.folder.findFirst({ where: { id: folderId, userId, deletedAt: null } })
       : null
     const targetAccountId = record.connectedAccountId ?? folder?.connectedAccountId ?? undefined
-    const account = await selectAccount(userId, pipeline.downloadedBytes, undefined, targetAccountId)
+    // A user-chosen pin (import record) is a soft preference; a folder-ownership
+    // pin stays strict so the remuxed file lands on the account that owns the
+    // folder (Google Drive 404s otherwise).
+    const allowFallback = Boolean(record.connectedAccountId)
+    const account = await selectAccount(userId, pipeline.downloadedBytes, undefined, targetAccountId, allowFallback)
     if (!account) {
       await markFailed(importId, 'NO_ACCOUNT_WITH_ENOUGH_SPACE', 'No connected storage account has enough space.')
       return null
@@ -475,7 +479,10 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
       ? await prisma.folder.findFirst({ where: { id: folderId, userId, deletedAt: null } })
       : null
     const targetAccountId = record.connectedAccountId ?? folder?.connectedAccountId ?? undefined
-    const account = await selectAccount(userId, downloaded.contentLength ?? 0n, undefined, targetAccountId)
+    // User-chosen pin (import record) is a soft preference; folder-ownership
+    // pin stays strict so the file lands on the account that owns the folder.
+    const allowFallback = Boolean(record.connectedAccountId)
+    const account = await selectAccount(userId, downloaded.contentLength ?? 0n, undefined, targetAccountId, allowFallback)
     if (!account) {
       await markFailed(importId, 'NO_ACCOUNT_WITH_ENOUGH_SPACE', 'No connected storage account has enough space.')
       await removeTempFile(importId)

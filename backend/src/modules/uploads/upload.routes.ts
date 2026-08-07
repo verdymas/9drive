@@ -245,14 +245,21 @@ uploadRouter.post('/resumable/init', requireAuth, async (req: AuthRequest, res, 
 
     const folderId = body.folderId || null
     let targetAccountId = body.targetAccountId
+    // A pin chosen by the user (dropdown) is a soft preference — if the pinned
+    // account can't hold the file, fall back to another eligible account. A
+    // pin from the destination folder's ownership stays strict: subfolder
+    // uploads must land on the account that owns the folder or Google Drive
+    // returns 404s for the physical file.
+    let allowFallback = Boolean(body.targetAccountId)
     if (folderId) {
       const folderRecord = await prisma.folder.findFirstOrThrow({ where: { id: folderId, userId: req.user!.id, deletedAt: null } })
       if (folderRecord.connectedAccountId) {
         targetAccountId = folderRecord.connectedAccountId
+        allowFallback = false
       }
     }
 
-    const account = await selectAccount(req.user!.id, sizeBytes, undefined, targetAccountId)
+    const account = await selectAccount(req.user!.id, sizeBytes, undefined, targetAccountId, allowFallback)
     if (!account) return res.status(400).json({ code: 'NO_ACCOUNT_WITH_ENOUGH_SPACE', message: 'No connected storage account has enough space.' })
 
     if (account.provider !== 'google_drive') {

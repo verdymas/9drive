@@ -12,6 +12,13 @@ import { syncS3Quota } from '../s3/s3.service.js'
  * Quota freshness: accounts whose `lastSyncedAt` is stale are re-synced
  * (best-effort) before selection, so Remote Import sees near-real-time
  * availability — the same behavior direct uploads rely on.
+ *
+ * A pinned `targetAccountId` is normally a soft preference: if that account
+ * cannot hold the file (not enough free space), routing falls back to the
+ * best eligible account so a nearly-full pinned account never hard-blocks an
+ * upload that another connected account could take. Folder-ownership pins
+ * (subfolder uploads must land on the account that owns the folder to avoid
+ * Google Drive 404s) pass `allowFallback: false` to keep the pin strict.
  */
 type RoutingMode = 'most_available' | 'round_robin' | 'priority'
 
@@ -36,6 +43,7 @@ export async function selectAccount(
   sizeBytes: bigint,
   reservedBytesByAccount = new Map<string, bigint>(),
   targetAccountId?: string | null,
+  allowFallback = false,
 ) {
   const accounts = await prisma.connectedAccount.findMany({
     where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected', ...(targetAccountId ? { id: targetAccountId } : {}) },
@@ -75,7 +83,10 @@ export async function selectAccount(
 
   if (targetAccountId) {
     const target = eligible.find((e) => e.account.id === targetAccountId)
-    return target?.account ?? null
+    if (target) return target.account
+    // A soft (user-chosen) pin falls back to automatic routing when the pinned
+    // account lacks space; a strict (folder-ownership) pin does not.
+    if (!allowFallback) return null
   }
 
   const policy = await prisma.uploadRoutingPolicy.upsert({
