@@ -1,7 +1,7 @@
 import { apiFetch } from '@/lib/api'
 
 export type RemoteImportStatus = 'queued' | 'processing' | 'completed' | 'failed' | 'cancelled'
-export type RemoteImportStage = 'waiting' | 'probing' | 'downloading' | 'verifying' | 'selecting_storage' | 'uploading' | 'registering' | 'cleaning' | 'finished'
+export type RemoteImportStage = 'waiting' | 'probing' | 'downloading' | 'segments' | 'remuxing' | 'verifying' | 'selecting_storage' | 'uploading' | 'registering' | 'cleaning' | 'finished'
 
 export type RemoteImportItem = {
   id: string
@@ -26,6 +26,24 @@ export type RemoteImportItem = {
   folderId: string | null
   connectedAccountId: string | null
   file?: { id: string; name: string; sizeBytes: string } | null
+  // ── HLS/M3U8 fields (populated for HLS imports) ────────────────────────────
+  sourceType?: 'hls_master' | 'hls_media' | null
+  hlsPlaylistType?: 'vod' | 'event' | 'live' | null
+  hlsVariantId?: string | null
+  hlsVariantBandwidth?: number | null
+  hlsVariantWidth?: number | null
+  hlsVariantHeight?: number | null
+  hlsAudioTrackId?: string | null
+  hlsAudioTrackLanguage?: string | null
+  hlsOutputContainer?: 'auto' | 'mkv' | 'mp4' | null
+  hlsIsLive?: boolean | null
+  hlsRecordingDurationSeconds?: number | null
+  hlsMediaDurationSeconds?: number | null
+  hlsSegmentCount?: number | null
+  hlsCompletedSegmentCount?: number | null
+  remuxProgress?: number | null
+  outputDurationSeconds?: number | null
+  outputCodecSummary?: string | null
 }
 
 export type CreateRemoteImportInput = {
@@ -37,6 +55,51 @@ export type CreateRemoteImportInput = {
   /** Server-side detected filename from the probe (fallback when no custom). */
   detectedFileName?: string | null
   mimeType?: string | null
+  /** HLS import options; present only for HLS sources (from the probe). */
+  hls?: HlsImportOptions | null
+}
+
+export type HlsImportOptions = {
+  sourceType: 'hls_master' | 'hls_media'
+  /** Opaque variant id from the probe's `hls.variants[].id`. */
+  variantId?: string
+  /** Opaque audio track id from the probe's `hls.audioTracks[].id`. */
+  audioTrackId?: string
+  outputContainer?: 'auto' | 'mkv' | 'mp4'
+  /** True when the selected media playlist is live/event (no ENDLIST). */
+  isLive?: boolean
+  recordingDurationSeconds?: number
+}
+
+export type ProbeHlsVariant = {
+  id: string
+  label: string
+  bandwidth: number
+  averageBandwidth: number | null
+  width: number | null
+  height: number | null
+  frameRate: number | null
+  codecs: string[]
+  audioGroup: string | null
+}
+
+export type ProbeHlsAudioTrack = {
+  id: string
+  language: string | null
+  name: string | null
+  isDefault: boolean
+  isAutoSelect: boolean
+  groupId: string
+}
+
+export type ProbeHlsSummary = {
+  sourceType: 'hls_master' | 'hls_media'
+  playlistType: 'vod' | 'event' | 'live'
+  isFinite: boolean
+  variants: ProbeHlsVariant[]
+  audioTracks: ProbeHlsAudioTrack[]
+  durationSeconds: number | null
+  detectedInBody: boolean
 }
 
 export type ProbeResult = {
@@ -47,6 +110,10 @@ export type ProbeResult = {
   mimeType: string | null
   contentLength: number | null
   supportsRange: boolean
+  /** Source classification: direct file, HLS master, or HLS media. */
+  sourceType: 'direct_file' | 'hls_master' | 'hls_media'
+  /** HLS details when the source is HLS; null for direct files. */
+  hls: ProbeHlsSummary | null
 }
 
 /**
@@ -108,6 +175,8 @@ function stageLabel(stage: RemoteImportStage) {
   switch (stage) {
     case 'probing': return 'Checking URL'
     case 'downloading': return 'Downloading'
+    case 'segments': return 'Downloading HLS segments'
+    case 'remuxing': return 'Remuxing media'
     case 'verifying': return 'Verifying'
     case 'selecting_storage': return 'Choosing storage'
     case 'uploading': return 'Uploading'

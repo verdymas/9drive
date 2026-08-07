@@ -1,0 +1,197 @@
+/**
+ * Secure local HLS materialization (§6 of the spec).
+ *
+ * The worker NEVER lets FFmpeg fetch the remote playlist or segments. Instead:
+ *
+ *   Remote M3U8
+ *       ↓  SSRF-safe application fetcher (followRemoteUrl)
+ *   Parse + validate the manifest
+ *       ↓
+ *   Securely download playlists, segments, maps, and permitted AES-128 keys
+ *       ↓
+ *   Store under SAFE generated local filenames in {jobDir}/
+ *       ↓
+ *   Create a REWRITTEN local media playlist (references local files only)
+ *       ↓
+ *   FFmpeg reads ONLY the local playlist (-protocol_whitelist file,crypto)
+ *
+ * Safety invariants:
+ *  - No untrusted segment path is ever used as a filesystem path.
+ *  - Paths are validated within the job directory before read/write/rename.
+ *  - Byte-range resources (EXT-X-BYTERANGE) issue validated Range requests,
+ *    verify 206 / Content-Range, and materialize exact ranges.
+ *  - AES-128 keys are fetched through the secure fetcher, strictly limited,
+ *    and stored only inside the job directory.
+ *  - SAMPLE-AES / DRM KEYFORMATs are rejected up front.
+ */
+import fsp from 'node:fs/promises'
+import path from 'node:path'
+import { env } from '../../../config/env.js'
+import { AppError } from '../../../utils/app-error.js'
+import { followRemoteUrl } from '../url-downloader.js'
+import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './errors.js'
+
+export type MaterializeOptions = {
+  jobDir: string
+  signal?: AbortSignal
+  maxTotalBytes: bigint
+  onProgress?: (progress: { segmentsCompleted: number; segmentsTotal: number; bytesDownloaded: bigint }) => void
+}
+
+export type MaterializeResult = {
+  /** Absolute path of the rewritten local playlist FFmpeg reads. */
+  localPlaylistPath: string
+  /** Bytes downloaded across all local files. */
+  downloadedBytes: bigint
+  /** Number of materialized segments. */
+  segmentCount: number
+}
+
+/** Fixed-width zero-padded placeholders — never derived from remote URIs. */
+function pad(index: number, width = 6): string {
+  return String(index).padStart(width, '0')
+}
+
+/** Local segment filename under a media label (video-000001.ts / audio-000001.ts). */
+export function segmentLocalName(mediaLabel: string, index: number): string {
+  return `${mediaLabel}-${pad(index)}.ts`
+}
+
+export function mapLocalName(mediaLabel: string, counter: number): string {
+  return `${mediaLabel}-init-${pad(counter)}.mp4`
+}
+
+export function keyLocalName(mediaLabel: string, counter: number): string {
+  return `${mediaLabel}-key-${pad(counter)}.bin`
+}
+
+export function manifestLocalName(mediaLabel: string): string {
+  return `${mediaLabel}.m3u8`
+}
+
+export function masterManifestLocalName(): string {
+  return 'master.m3u8'
+}
+
+/**
+ * Resolve a local path strictly inside `jobDir`. Guards `..` / absolute
+ * traversal so no remote value can escape the job directory.
+ */
+export function pathInJobDir(jobDir: string, ...parts: string[]): string {
+  const joined = path.join(jobDir, ...parts)
+  const resolved = path.resolve(joined)
+  const root = path.resolve(jobDir)
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    throw new AppError(HLS_ERROR_CODES.HLS_OUTPUT_INVALID, 'Invalid local job path.', 500)
+  }
+  return resolved
+}
+
+/** Compatibility alias — validates `candidate` is inside `root`. */
+export function assertInside(root: string, candidate: string): string {
+  const resolvedRoot = path.resolve(root)
+  const resolved = path.resolve(candidate)
+  if (resolved !== resolvedRoot && !resolved.startsWith(resolvedRoot + path.sep)) {
+    throw new AppError(HLS_ERROR_CODES.HLS_OUTPUT_INVALID, 'Invalid local path.', 500)
+  }
+  return resolved
+}
+
+export async function ensureJobDir(jobDir: string): Promise<void> {
+  await fsp.mkdir(jobDir, { recursive: true, mode: 0o700 })
+}
+
+/**
+ * Streaming-download a remote resource into a local file with:
+ *  - SSRF validation on the final hop AND every redirect hop,
+ *  - a configured byte cap (segment/manifest/key-specific limits),
+ *  - abort support.
+ * Returns the bytes written. Partial output is removed by the caller's cleanup.
+ */
+export async function downloadResource(
+  url: string,
+  targetLocalPath: string,
+  opts: {
+    maxBytes?: bigint
+    signal?: AbortSignal
+    kind?: 'segment' | 'map' | 'key' | 'playlist' | 'audio'
+  },
+): Promise<bigint> {
+  const maxBytes = opts.maxBytes ?? BigInt(env.REMOTE_IMPORT_MAX_BYTES)
+  let written = 0n
+  await followRemoteUrl(url, {
+    onResponse: async (res) => {
+      if (res.statusCode >= 400) throw new AppError('DOWNLOAD_HTTP_ERROR', `Remote server responded ${res.statusCode}.`, 502)
+      if (typeof (res.body as { on?: unknown }).on === 'function') {
+        (res.body as unknown as { on: (event: 'error', listener: () => void) => void }).on('error', () => undefined)
+      }
+      const handle = await fsp.open(targetLocalPath, 'w')
+      try {
+        for await (const chunk of res.body) {
+          if (opts.signal?.aborted) throw new Error('ABORTED')
+          written += BigInt(chunk.byteLength)
+          if (written > maxBytes) {
+            throw new AppError(HLS_ERROR_CODES.HLS_SEGMENT_TOO_LARGE, HLS_ERROR_MESSAGES.HLS_SEGMENT_TOO_LARGE, 413)
+          }
+          await handle.write(chunk)
+        }
+      } finally {
+        await handle.close()
+      }
+    },
+  })
+  return written
+}
+
+/**
+ * Download a byte-range of a remote resource. Issues a validated Range
+ * request, verifies `206 Partial Content` + a matching `Content-Range`, and
+ * materializes exactly `[offset, offset+length)`.
+ */
+export async function downloadByteRange(
+  url: string,
+  offset: number,
+  length: number,
+  targetLocalPath: string,
+  opts: { signal?: AbortSignal },
+): Promise<bigint> {
+  const rangeHeader = `bytes=${offset}-${offset + length - 1}`
+  let written = 0n
+  let saw206 = false
+  await followRemoteUrl(url, {
+    headers: { Range: rangeHeader },
+    onResponse: async (res) => {
+      if (res.statusCode === 206) {
+        const cr = res.headers['content-range']
+        if (!cr || !new RegExp(`^bytes ${offset}-${offset + length - 1}/`).test(cr)) {
+          // Server returned a different range than requested — materialize
+          // nothing rather than silently corrupting the payload.
+          throw new AppError(HLS_ERROR_CODES.HLS_SEGMENT_RANGE_INVALID, HLS_ERROR_MESSAGES.HLS_SEGMENT_RANGE_INVALID, 502)
+        }
+        saw206 = true
+      }
+      if (typeof (res.body as { on?: unknown }).on === 'function') {
+        (res.body as unknown as { on: (event: 'error', listener: () => void) => void }).on('error', () => undefined)
+      }
+      const handle = await fsp.open(targetLocalPath, 'w')
+      try {
+        for await (const chunk of res.body) {
+          if (opts.signal?.aborted) throw new Error('ABORTED')
+          written += BigInt(chunk.byteLength)
+          if (written > BigInt(length)) throw new AppError(HLS_ERROR_CODES.HLS_SEGMENT_RANGE_INVALID, HLS_ERROR_MESSAGES.HLS_SEGMENT_RANGE_INVALID, 502)
+          await handle.write(chunk)
+        }
+      } finally {
+        await handle.close()
+      }
+    },
+  })
+  if (!saw206) {
+    // The source ignored Range (answered 200) — the range did not materialize.
+    throw new AppError(HLS_ERROR_CODES.HLS_SEGMENT_RANGE_INVALID, HLS_ERROR_MESSAGES.HLS_SEGMENT_RANGE_INVALID, 502)
+  }
+  if (written !== BigInt(length)) {
+    throw new AppError(HLS_ERROR_CODES.HLS_SEGMENT_RANGE_INVALID, HLS_ERROR_MESSAGES.HLS_SEGMENT_RANGE_INVALID, 502)
+  }
+  return written
+}

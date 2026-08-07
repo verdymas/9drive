@@ -35,6 +35,8 @@ function makeProbeResult(overrides: Partial<RemoteImports.ProbeResult> = {}): Re
     mimeType: null,
     contentLength: null,
     supportsRange: false,
+    sourceType: 'direct_file',
+    hls: null,
     ...overrides,
   }
 }
@@ -186,5 +188,102 @@ describe('RemoteImportModal probe behaviour', () => {
     await user.click(screen.getByRole('button', { name: /start import/i }))
     await waitFor(() => expect(create).toHaveBeenCalled())
     expect(create.mock.calls[0][0]).toMatchObject({ fileName: 'custom.bin', detectedFileName: 'skip.bin' })
+  })
+
+  describe('HLS sources', () => {
+    const hlsMaster = (overrides: Partial<RemoteImports.ProbeHlsSummary> = {}): RemoteImports.ProbeHlsSummary => ({
+      sourceType: 'hls_master',
+      playlistType: 'vod',
+      isFinite: true,
+      variants: [
+        { id: 'v-low', label: '360p · 0.8 Mbps', bandwidth: 800000, averageBandwidth: 700000, width: 640, height: 360, frameRate: null, codecs: ['avc1.4d001e'], audioGroup: null },
+        { id: 'v-high', label: '1080p · 5.8 Mbps', bandwidth: 6000000, averageBandwidth: 5200000, width: 1920, height: 1080, frameRate: 25, codecs: ['avc1.640028'], audioGroup: null },
+      ],
+      audioTracks: [
+        { id: 'a-en', language: 'en', name: 'English', isDefault: true, isAutoSelect: true, groupId: 'audio' },
+        { id: 'a-id', language: 'id', name: 'Indonesian', isDefault: false, isAutoSelect: true, groupId: 'audio' },
+      ],
+      durationSeconds: 5423.5,
+      detectedInBody: false,
+      ...overrides,
+    })
+
+    it('renders the HLS section with Quality, Audio, and Output Format when the probe says HLS', async () => {
+      const probe = vi.spyOn(RemoteImports, 'probeRemoteUrl')
+      probe.mockResolvedValueOnce({
+        data: makeProbeResult({
+          fileName: 'movie.mkv',
+          fileNameSource: 'final-url-path',
+          sourceType: 'hls_master',
+          mimeType: 'application/vnd.apple.mpegurl',
+          hls: hlsMaster(),
+        }),
+      })
+      renderModal()
+      await typeUrl('https://example.com/master.m3u8')
+      await waitFor(() => expect(screen.getByText(/hls video/i)).toBeInTheDocument())
+      // Quality + Audio selectors are present (multiple variants/tracks).
+      expect(screen.getByLabelText(/quality/i)).toBeInTheDocument()
+      expect(screen.getByLabelText(/audio track/i)).toBeInTheDocument()
+      // Output Format is always shown for HLS.
+      expect(screen.getByLabelText(/output format/i)).toBeInTheDocument()
+      // No recording input for a finite source.
+      expect(screen.queryByLabelText(/recording duration/i)).not.toBeInTheDocument()
+    })
+
+    it('submits the selected HLS options with the create request', async () => {
+      const probe = vi.spyOn(RemoteImports, 'probeRemoteUrl')
+      probe.mockResolvedValueOnce({
+        data: makeProbeResult({
+          fileName: 'movie.mkv',
+          sourceType: 'hls_master',
+          hls: hlsMaster(),
+        }),
+      })
+      const create = vi.spyOn(RemoteImports, 'createRemoteImport').mockResolvedValue({} as never)
+      renderModal()
+      await typeUrl('https://example.com/master.m3u8')
+      await waitFor(() => expect(screen.getByText(/hls video/i)).toBeInTheDocument())
+      const quality = screen.getByLabelText(/quality/i)
+      const user = userEvent.setup()
+      await user.selectOptions(quality, 'v-high')
+      const format = screen.getByLabelText(/output format/i)
+      await user.selectOptions(format, 'mkv')
+      await user.click(screen.getByRole('button', { name: /start import/i }))
+      await waitFor(() => expect(create).toHaveBeenCalled())
+      expect(create.mock.calls[0][0].hls).toMatchObject({
+        sourceType: 'hls_master',
+        variantId: 'v-high',
+        outputContainer: 'mkv',
+        audioTrackId: undefined,
+        recordingDurationSeconds: undefined,
+      })
+    })
+
+    it('requires a recording duration for a live source and sends it', async () => {
+      const probe = vi.spyOn(RemoteImports, 'probeRemoteUrl')
+      probe.mockResolvedValueOnce({
+        data: makeProbeResult({
+          fileName: 'live-recording.mkv',
+          sourceType: 'hls_media',
+          hls: hlsMaster({ sourceType: 'hls_media', playlistType: 'live', isFinite: false, durationSeconds: null }),
+        }),
+      })
+      const create = vi.spyOn(RemoteImports, 'createRemoteImport').mockResolvedValue({} as never)
+      renderModal()
+      await typeUrl('https://example.com/live.m3u8')
+      await waitFor(() => expect(screen.getByText(/live hls stream detected/i)).toBeInTheDocument())
+      const recording = screen.getByLabelText(/recording duration/i)
+      // Empty duration → submit blocked with a clear error.
+      await userEvent.click(screen.getByRole('button', { name: /start import/i }))
+      expect(screen.getByText('Recording duration is required for a live HLS stream.')).toBeInTheDocument()
+      expect(create).not.toHaveBeenCalled()
+      // A valid duration → sent with the request.
+      const user = userEvent.setup()
+      await user.type(recording, '1800')
+      await user.click(screen.getByRole('button', { name: /start import/i }))
+      await waitFor(() => expect(create).toHaveBeenCalled())
+      expect(create.mock.calls[0][0].hls).toMatchObject({ sourceType: 'hls_media', isLive: true, recordingDurationSeconds: 1800 })
+    })
   })
 })

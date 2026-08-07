@@ -36,6 +36,37 @@ remoteImportRouter.post('/probe', requireAuth, async (req: AuthRequest, res, nex
   }
 })
 
+const hlsOptionsSchema = z
+  .object({
+    // SourceType from the probe: 'hls_master' | 'hls_media'.
+    sourceType: z.enum(['hls_master', 'hls_media']),
+    variantId: z.string().max(64).optional(),
+    audioTrackId: z.string().max(64).optional(),
+    outputContainer: z.enum(['auto', 'mkv', 'mp4']).optional(),
+    // True when the selected media playlist is live/event (no ENDLIST).
+    isLive: z.boolean().optional(),
+    // Live-only: the RECORDING length the worker should capture; a finite
+    // source must reject this. Enforced server-side (§19).
+    recordingDurationSeconds: z.number().int().min(60).max(21600).optional(),
+  })
+  .superRefine((hls, ctx) => {
+    if (hls.isLive && hls.recordingDurationSeconds == null) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['hls', 'recordingDurationSeconds'],
+        message: 'A live HLS source requires a recording duration.',
+      })
+    }
+    if (!hls.isLive && hls.recordingDurationSeconds != null) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['hls', 'recordingDurationSeconds'],
+        message: 'A finite HLS source must not carry a recording duration.',
+      })
+    }
+  })
+  .optional()
+
 remoteImportRouter.post('/', requireAuth, async (req: AuthRequest, res, next) => {
   try {
     const body = z.object({
@@ -47,6 +78,8 @@ remoteImportRouter.post('/', requireAuth, async (req: AuthRequest, res, next) =>
       // not type one. Never trusted as-is — sanitized again at creation.
       detectedFileName: z.string().max(255).nullable().optional(),
       mimeType: z.string().max(191).nullable().optional(),
+      // HLS import knobs (from the probe's `sourceType` classification).
+      hls: hlsOptionsSchema,
     }).parse(req.body)
 
     const created = await createRemoteImport({
@@ -57,6 +90,7 @@ remoteImportRouter.post('/', requireAuth, async (req: AuthRequest, res, next) =>
       fileName: body.fileName,
       detectedFileName: body.detectedFileName,
       mimeType: body.mimeType,
+      hls: body.hls,
     })
     return res.status(201).json(serializeRemoteImport(created))
   } catch (error) {
