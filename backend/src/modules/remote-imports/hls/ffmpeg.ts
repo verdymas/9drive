@@ -16,6 +16,7 @@
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
+import path from 'node:path'
 import { env } from '../../../config/env.js'
 import { AppError } from '../../../utils/app-error.js'
 import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './errors.js'
@@ -208,6 +209,13 @@ function runFfmpegProcess(args: string[], outputPartPath: string, opts: { cwd: s
 const DEMUXER_ARGS = ['-analyzeduration', '100M', '-probesize', '100M']
 
 /**
+ * Raw-payload demux flags — the code_example_convert.sh "repair" step doubles
+ * the probe buffers so the forced `mpegts` demuxer can sync onto a large or
+ * garbage-prefixed MPEG-TS payload where default-sized probing would fail.
+ */
+const CONCAT_TS_DEMUXER_ARGS = ['-analyzeduration', '200M', '-probesize', '200M']
+
+/**
  * Run FFmpeg against the local rewritten playlist (stream copy — the fast
  * path). A container that cannot hold the stream-copied codec fails here; the
  * pipeline falls back to `runFfmpegReencode`.
@@ -299,6 +307,88 @@ export async function runFfmpegRemux(
       }
     }
     throw error
+  }
+}
+
+/**
+ * Concatenate the materialized MPEG-TS segments and stream-copy them into the
+ * output container — the "repair" method from code_example_convert.sh (the
+ * script's final block: `ffmpeg ... -f mpegts -i "$TEMP_FILE" -c copy`).
+ *
+ * When the HLS *demuxer* refuses the playlist/segments (a non-TS first segment,
+ * a quirk in one segment), the raw payload itself may still be fine — the
+ * lenient `mpegts` demuxer skips garbage and syncs onto the stream where the
+ * HLS demuxer hard-fails. We concat the local TS segments ourselves (shell `cat`
+ * is safe on a fixed concatenation, unlike glob expansion — none of the
+ * segment filenames are untrusted input), then force `-f mpegts` on the
+ * payload with doubled probe buffers exactly like the script. If this copy
+ * also fails, the caller reports HLS_CONCAT_TS_COPY_FAILED (the terminal
+ * conversion error) — the pipeline's final re-encode attempt is not
+ * re-attempted, since the HLS demuxer failure that started this chain is
+ * independent of the codec.
+ *
+ * Only usable when every segment was materialized as a standalone MPEG-TS file
+ * with no init-map/byterange dependencies (discontinuities also make the
+ * raw concat unsafe) — the pipeline guards this before calling.
+ *
+ * @param segmentPaths   absolute paths of the materialized local TS segments, in order
+ * @param outputPartPath absolute `.part` path — renamed to final on success
+ * @param container      'mkv' | 'mp4'
+ * @param cwd            job directory
+ * @param signal         abort (SIGTERM → SIGKILL escalation)
+ * @param onProgress     throttled percent callback
+ */
+export async function runFfmpegConcatTsCopy(
+  segmentPaths: string[],
+  outputPartPath: string,
+  container: 'mkv' | 'mp4',
+  cwd: string,
+  signal?: AbortSignal,
+  onProgress?: (progress: { percent: number | null }) => void,
+): Promise<FfmpegRunResult> {
+  verifyFfmpegAvailable()
+
+  // Concatenate the segments into a single raw MPEG-TS payload. Fixed
+  // concatenation of known local paths — no shell, no globs, no untrusted
+  // input in any argument position.
+  const payloadPath = path.join(cwd, 'concat-payload.ts')
+  const handle = await fsp.open(payloadPath, 'w')
+  try {
+    for (const segmentPath of segmentPaths) {
+      const segment = await fsp.readFile(segmentPath)
+      await handle.write(segment)
+    }
+  } finally {
+    await handle.close()
+  }
+
+  const args = [
+    '-nostdin',
+    '-hide_banner',
+    '-loglevel', 'warning',
+    '-progress', 'pipe:1',
+    '-protocol_whitelist', 'file,crypto',
+    ...CONCAT_TS_DEMUXER_ARGS,
+    // Force the MPEG-TS demuxer — do NOT let FFmpeg sniff the extension-less
+    // payload. The lenient TS demuxer syncs onto the stream where the HLS
+    // demuxer hard-fails.
+    '-f', 'mpegts',
+    '-i', payloadPath,
+    '-map', '0',
+    '-c', 'copy',
+    ...(container === 'mp4' ? ['-movflags', '+faststart'] : []),
+    '-f', container === 'mp4' ? 'mp4' : 'matroska',
+    '-y',
+  ]
+
+  try {
+    // NOTE: `runFfmpegProcess` spawns the args VERBATIM — the output path must
+    // be appended here (the remux caller does `[...baseArgs, outputPartPath]`).
+    return await runFfmpegProcess([...args, outputPartPath], outputPartPath, { cwd, signal, onProgress })
+  } finally {
+    // The payload is scratch — never leave it in the job dir (the output
+    // `.part` file stays for the caller to rename on success).
+    await fsp.rm(payloadPath, { force: true }).catch(() => undefined)
   }
 }
 

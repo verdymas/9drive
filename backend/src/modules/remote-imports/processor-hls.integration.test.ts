@@ -191,6 +191,12 @@ let fmp4FileBytes: Buffer
 // Fixture F (§23): EXT-X-BYTERANGE over a single contiguous MPEG-TS file.
 let brMediaBody = ''
 let brFileBytes: Buffer
+// Fixture C (§16): UNENCRYPTED plain MPEG-TS segments — the only source shape
+// that can reach the raw-concat fallback (keys/maps/byteranges/discontinuities
+// all disqualify the raw TS join).
+let plainMediaBody = ''
+let plainSegBytes: Buffer[] = []
+let plainSegmentRequests = 0
 // Re-request counters, asserted by the byte-range test (exact bytes only).
 let brFileRequests = 0
 let fmp4FileRequests = 0
@@ -356,6 +362,33 @@ ${sizes.map((s, i) => `#EXTINF:4.000,\n#EXT-X-BYTERANGE:${s}@${offsets[i]}\nbrfi
 #EXT-X-ENDLIST`
   }
   await fsp.writeFile(path.join(fixtureDir, 'brfile.bin'), brFileBytes)
+
+  // ── Fixture C: UNENCRYPTED plain MPEG-TS segments (raw-concat path). ──────
+  // `-hls_key_info_file` is omitted so NO EXT-X-KEY is emitted — the segments
+  // are clean TS, and the raw payload concat (`-f mpegts` on the joined bytes)
+  // is safe for this shape. The HLS demuxer path (remux) is still exercised;
+  // the raw-concat test forces it to fail via the mocked boundary.
+  const plainOut = path.join(fixtureDir, 'plain.m3u8')
+  const plainKeyInfo = path.join(fixtureDir, 'plain.keyinfo') // never created
+  await runFfmpeg([
+    '-f', 'lavfi', '-i', 'testsrc=duration=8:size=640x360:rate=25',
+    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=8',
+    '-c:v', 'libx264', '-preset', 'ultrafast',
+    '-force_key_frames', '0:2,0:4,0:6',
+    '-c:a', 'aac', '-f', 'hls',
+    '-hls_time', '4', '-hls_playlist_type', 'vod',
+    '-hls_segment_filename', path.join(fixtureDir, 'pseg%d.ts'),
+    plainOut,
+  ])
+  plainMediaBody = await fsp.readFile(plainOut, 'utf8')
+  // The generated body references pseg0.ts / pseg1.ts (bare relative names —
+  // the fixture server URL is substituted in beforeAll like the other bodies).
+  const psegFiles = (await fsp.readdir(fixtureDir))
+    .filter((f) => f.startsWith('pseg') && f.endsWith('.ts'))
+    .sort((a, b) => Number(a.match(/\d+/)?.[0]) - Number(b.match(/\d+/)?.[0]))
+  plainSegBytes = await Promise.all(psegFiles.map((f) => fsp.readFile(path.join(fixtureDir, f))))
+  // Sanity: no encryption in the generated playlist (the test relies on it).
+  if (plainMediaBody.includes('#EXT-X-KEY')) throw new Error('Fixture C unexpectedly encrypted')
 }
 
 function runFfmpeg(args: string[]): Promise<void> {
@@ -437,6 +470,25 @@ beforeAll(async () => {
       res.end(slice)
       return
     }
+    // Fixture C: unencrypted plain MPEG-TS segments (raw-concat path).
+    if (pathname === '/plain.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' })
+      res.end(plainMediaBody)
+      return
+    }
+    if (pathname.startsWith('/pseg')) {
+      plainSegmentRequests += 1
+      const idx = Number(pathname.match(/pseg(\d+)\.ts/)?.[1] ?? -1)
+      const bytes = plainSegBytes[idx]
+      if (!bytes) {
+        res.writeHead(404)
+        res.end()
+        return
+      }
+      res.writeHead(200, { 'Content-Type': 'video/mp2t' })
+      res.end(bytes)
+      return
+    }
     // Fixture F: one contiguous media file served in byte ranges.
     if (pathname === '/brfile.bin') {
       const range = req.headers.range
@@ -475,6 +527,9 @@ beforeAll(async () => {
   // uses `brfile.bin`. Rewrite EITHER placeholder to the server URL — a single
   // pass (replacing both in one expression so the result is never re-matched).
   brMediaBody = brMediaBody.replace(/\bbrfile\.(ts|bin)\b/g, `${baseUrl}/brfile.bin`)
+  // Fixture C's generated playlist references bare psegN.ts names — point them
+  // at the fixture server.
+  plainMediaBody = plainMediaBody.replaceAll('pseg', `${baseUrl}/pseg`)
 })
 
 afterAll(async () => {
@@ -622,6 +677,43 @@ describe('HLS remote import end-to-end (fixture)', () => {
     const completed = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'completed')
     expect(completed).toBe(true)
     expect(createdFile.name).toMatch(/\.(mp4|mkv)$/)
+  })
+
+  it('raw-concat fallback: remux + re-encode fail, the TS join copy completes (code_example_convert.sh method)', async () => {
+    if (!fixtureDir) return // skipped (no ffmpeg)
+    validationSpy.validateRemoteUrl.mockReset()
+    validationSpy.resolveAndValidateHost.mockReset()
+    validationSpy.validateRemoteUrl.mockImplementation(async (raw: string) => new URL(raw))
+    validationSpy.resolveAndValidateHost.mockImplementation(async (host: string) => host)
+
+    const importId = 'import-hls-rawconcat'
+    const job = { data: { importId, attempt: 1 }, id: 'job-1' } as unknown as Job<RemoteImportJobData>
+    const { encryptText } = await import('../../utils/crypto.js')
+    const row = mockRow(importId)
+    row.sourceType = 'hls_media'
+    row.sourceUrlEncrypted = encryptText(`${baseUrl}/plain.m3u8`)
+    prisma.remoteImport.findUnique = vi.fn(async () => row)
+    const updateMock = prisma.remoteImport.update as ReturnType<typeof vi.fn>
+    updateMock.mockClear()
+    plainSegmentRequests = 0
+    await fsp.rm(hlsJobDir(row.userId, importId), { recursive: true, force: true })
+
+    // Force BOTH the stream-copy remux AND the re-encode to fail. The raw
+    // concat copy (the REAL ffmpeg `-f mpegts` on the joined segments) is the
+    // only step allowed to succeed — exactly the code_example_convert.sh
+    // repair method the fallback implements.
+    ffmpegFailures.remux = true
+    ffmpegFailures.reencode = true
+    await processRemoteImportJob(job)
+    ffmpegFailures.remux = false
+    ffmpegFailures.reencode = false
+
+    const completed = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'completed')
+    expect(completed).toBe(true)
+    expect(createdFile.name).toMatch(/\.(mp4|mkv)$/)
+    // All segments were downloaded exactly once — the concat reused the
+    // materialized files (no extra fetch pass).
+    expect(plainSegmentRequests).toBe(plainSegBytes.length)
   })
 
   it('Fixture B: fMP4 (EXT-X-MAP) + byte-range media materializes and remuxes (§23)', async () => {

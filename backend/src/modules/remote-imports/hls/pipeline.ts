@@ -29,7 +29,7 @@ import { resolveSelectedVariant, resolveSelectedAudio } from './selection.js'
 import { resolveContainer, containerExtension, type ContainerChoice } from './output.js'
 import * as ffmpeg from './ffmpeg.js'
 import { verifyOutput, type MediaVerification } from './verify.js'
-import { ensureJobDir } from './materializer.js'
+import { ensureJobDir, segmentLocalName } from './materializer.js'
 import { writeResumeMarker } from './job-dir.js'
 import type { NormalizedSegment } from './segments.js'
 import { hlsDerivedFileName, fileNameHasExtension } from './output.js'
@@ -290,15 +290,19 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     throw error
   }
 
-  // Conversion chain (§3, §9, §16 of the refactor spec):
+  // Conversion chain (§3, §9, §16 of the refactor spec, plus the raw-payload
+  // fallback from code_example_convert.sh):
   //   1. stream-copy remux (fast path). MKV is the auto default — the safe
   //      container for raw HLS streams (MPEG-TS, fMP4, separate audio).
   //   2. a USER-selected MP4 that cannot stream-copy mux → stable error
   //      HLS_MP4_STREAM_COPY_UNSUPPORTED suggesting MKV (§16) — never a
   //      silent transcode, never a silent container swap.
-  //   3. any auto/MKV copy failure → re-encode (H.264 + AAC) as a last resort.
-  // A re-encode always succeeds or we fail; the marker is written on a terminal
-  // failure so a convert-only retry can reuse the downloaded segments.
+  //   3. any auto/MKV copy failure → re-encode (H.264 + AAC).
+  //   4. re-encode failure → concat-raw-TS copy: the HLS demuxer refusal is
+  //      often a playlist/segment quirk while the raw MPEG-TS payload is fine
+  //      — the lenient forced `-f mpegts` demuxer (200M probes) syncs onto it.
+  // A conversion always succeeds or we fail; the marker is written on a
+  // terminal failure so a convert-only retry can reuse the downloaded segments.
   const runRemux = async (forContainer: 'mkv' | 'mp4'): Promise<ffmpeg.FfmpegRunResult> => {
     try {
       return await ffmpeg.runFfmpegRemux(video.localPlaylistPath, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
@@ -320,11 +324,31 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
   }
 
   // Re-encode (H.264 + AAC) the local playlist — handles image2/png-pipe and
-  // other sources a stream copy cannot mux. On failure, write the marker +
-  // rethrow.
+  // other sources a stream copy cannot mux. On failure, fall through to the
+  // raw-payload concat copy below.
   const runReencode = async (forContainer: 'mkv' | 'mp4', originalError: unknown): Promise<ffmpeg.FfmpegRunResult> => {
     try {
       return await ffmpeg.runFfmpegReencode(video.localPlaylistPath, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
+    } catch (error) {
+      return runConcatTsCopy(forContainer, error)
+    }
+  }
+
+  // Raw-payload fallback: concat the local TS segments and force `-f mpegts`
+  // (the code_example_convert.sh repair method). Only safe when every segment
+  // is a standalone MPEG-TS file — no init maps, byteranges, key URIs or
+  // discontinuities (a discontinuity invalidates the raw concat; those streams
+  // go through the HLS demuxer which honors the discontinuity markers).
+  // NOTE: `NormalizedSegment.key` is ALWAYS an object (`normalizeKey` returns
+  // a null-valued shape) — check `key.uri`, not the object itself.
+  const canConcatRawTs = (): boolean =>
+    allVideoSegments.every((s) => !s.map && !s.byterange && !s.key?.uri) && !allVideoSegments.some((s) => s.discontinuity)
+
+  const runConcatTsCopy = async (forContainer: 'mkv' | 'mp4', originalError: unknown): Promise<ffmpeg.FfmpegRunResult> => {
+    if (!canConcatRawTs()) return writeMarkerAndRethrow(originalError)
+    const segmentPaths = allVideoSegments.map((s) => path.join(jobDir, segmentLocalName('video', s.index)))
+    try {
+      return await ffmpeg.runFfmpegConcatTsCopy(segmentPaths, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress)
     } catch (error) {
       return writeMarkerAndRethrow(error)
     }

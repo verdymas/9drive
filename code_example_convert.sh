@@ -18,3 +18,21 @@ else
   echo "❌ Re-encode gagal."
   exit 1
 fi
+
+if [ ! -f "$TEMP_FILE" ]; then
+  echo ""
+  echo "❌ Gagal mengunduh video. File sementara tidak dibuat."
+  exit 1
+fi
+
+echo ""
+echo "=== Memperbaiki container video… ==="
+
+ffmpeg -analyzeduration 200M -probesize 200M \
+  -f mpegts -i "$TEMP_FILE" \
+  -c copy "$FINAL_FILE"
+
+rm "$TEMP_FILE"
+
+echo ""
+echo "✅ BERHASIL! File final: $FINAL_FILE"
