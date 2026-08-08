@@ -260,6 +260,37 @@ describe('RemoteImportModal probe behaviour', () => {
       })
     })
 
+    it('blocks submission when the typed extension contradicts the selected output container', async () => {
+      const probe = vi.spyOn(RemoteImports, 'probeRemoteUrl')
+      probe.mockResolvedValueOnce({
+        data: makeProbeResult({
+          fileName: 'movie.mkv',
+          sourceType: 'hls_master',
+          hls: hlsMaster(),
+        }),
+      })
+      const create = vi.spyOn(RemoteImports, 'createRemoteImport').mockResolvedValue({} as never)
+      renderModal()
+      await typeUrl('https://example.com/master.m3u8')
+      await waitFor(() => expect(screen.getByText(/hls video/i)).toBeInTheDocument())
+      // Select MP4 output, then type an explicit .mkv name (contradiction).
+      const user = userEvent.setup()
+      await user.selectOptions(screen.getByLabelText(/output format/i), 'mp4')
+      const field = screen.getByLabelText(/file name/i)
+      await user.clear(field)
+      await user.type(field, 'Movie.mkv')
+      await user.click(screen.getByRole('button', { name: /start import/i }))
+      // The mismatch error blocks the request; the typed name is not sent.
+      expect(screen.getByText('The file name extension (.mkv) must match the selected output format (MP4).')).toBeInTheDocument()
+      expect(create).not.toHaveBeenCalled()
+      // Fixing the name to match unblocks submission.
+      await user.clear(field)
+      await user.type(field, 'Movie.mp4')
+      await user.click(screen.getByRole('button', { name: /start import/i }))
+      await waitFor(() => expect(create).toHaveBeenCalled())
+      expect(create.mock.calls[0][0]).toMatchObject({ fileName: 'Movie.mp4' })
+    })
+
     it('requires a recording duration for a live source and sends it', async () => {
       const probe = vi.spyOn(RemoteImports, 'probeRemoteUrl')
       probe.mockResolvedValueOnce({

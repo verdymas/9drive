@@ -3,7 +3,16 @@ import { render, screen } from '@testing-library/react'
 import { formatDisplayUrl, hlsActivityLine, hlsSummaryLine, progressPercent } from '@/pages/RemoteImportsPage'
 import { formatDuration } from '@/components/drive/RemoteImportModal'
 import { Button } from '@/components/ui/button'
-import { CONVERT_RETRYABLE_CODES, isConvertRetryable, type RemoteImportItem } from '@/lib/remoteImports'
+import {
+  CONVERT_RETRYABLE_CODES,
+  accountLabel,
+  bytesOf,
+  elapsedSecondsSince,
+  formatShortDuration,
+  isConvertRetryable,
+  percentOf,
+  type RemoteImportItem,
+} from '@/lib/remoteImports'
 
 /**
  * Frontend regression tests for the Remote Imports overflow fix.
@@ -24,6 +33,12 @@ const baseItem: RemoteImportItem = {
   totalBytes: '1000',
   downloadedBytes: '250',
   uploadedBytes: '0',
+  uploadTotalBytes: null,
+  uploadProgress: 0,
+  queuedAt: null,
+  retryRequestedAt: null,
+  heartbeatAt: null,
+  retryFromStage: null,
   mimeType: null,
   errorCode: null,
   errorMessage: null,
@@ -90,6 +105,20 @@ describe('progressPercent', () => {
     expect(progressPercent(item({ stage: 'uploading', downloadedBytes: '1000', uploadedBytes: '250' }))).toBe(25)
   })
 
+  it('measures the upload against uploadTotalBytes (final output size) when present', () => {
+    // HLS: source totalBytes 1 GB, output 500 MB — the bar must move against
+    // the OUTPUT size, never the source total (which would read 6% etc.).
+    expect(
+      progressPercent(
+        item({ stage: 'uploading', totalBytes: '1073741824', uploadTotalBytes: '536870912', downloadedBytes: '1073741824', uploadedBytes: '268435456' }),
+      ),
+    ).toBe(50)
+  })
+
+  it('falls back to totalBytes when uploadTotalBytes is absent (older rows)', () => {
+    expect(progressPercent(item({ stage: 'uploading', totalBytes: '1000', uploadTotalBytes: null, uploadedBytes: '250' }))).toBe(25)
+  })
+
   it('clamps below 100 until the active stage finishes', () => {
     expect(progressPercent(item({ stage: 'downloading', downloadedBytes: '999', uploadedBytes: '0' }))).toBe(99)
     expect(progressPercent(item({ stage: 'uploading', downloadedBytes: '1000', uploadedBytes: '999' }))).toBe(99)
@@ -97,6 +126,48 @@ describe('progressPercent', () => {
 
   it('never goes negative', () => {
     expect(progressPercent(item({ stage: 'downloading', downloadedBytes: '-5', uploadedBytes: '0' }))).toBe(0)
+  })
+})
+
+describe('bytesOf / percentOf', () => {
+  it('parses byte strings to numbers, NaN and negative to 0', () => {
+    expect(bytesOf('512')).toBe(512)
+    expect(bytesOf('12.5')).toBe(12.5)
+    expect(bytesOf('')).toBe(0)
+    expect(bytesOf(null)).toBe(0)
+    expect(bytesOf('-5')).toBe(0)
+    expect(bytesOf('not-a-number')).toBe(0)
+  })
+
+  it('clamps percent to [0, 100]', () => {
+    expect(percentOf('500', '1000')).toBe(50)
+    expect(percentOf('1500', '1000')).toBe(100)
+    expect(percentOf('-5', '1000')).toBe(0)
+    expect(percentOf('250', '0')).toBe(0)
+  })
+})
+
+describe('accountLabel', () => {
+  it('prefers displayName, then email, then a provider fallback', () => {
+    expect(accountLabel(item({ connectedAccount: { id: 'a', provider: 'google_drive', email: 'a@example.com', displayName: 'Alice' } }))).toBe('Alice')
+    expect(accountLabel(item({ connectedAccount: { id: 'a', provider: 's3', email: 'a@example.com', displayName: null } }))).toBe('a@example.com')
+    expect(accountLabel(item({ connectedAccount: { id: 'a', provider: 's3', email: null, displayName: null } }))).toBe('S3')
+    expect(accountLabel(item({ connectedAccount: null }))).toBe('storage')
+  })
+})
+
+describe('elapsedSecondsSince / formatShortDuration', () => {
+  it('computes elapsed seconds from an ISO timestamp', () => {
+    const t = Date.now()
+    expect(elapsedSecondsSince(new Date(t - 90_000).toISOString(), t)).toBe(90)
+    expect(elapsedSecondsSince(null, t)).toBe(0)
+    expect(elapsedSecondsSince('garbage', t)).toBe(0)
+  })
+
+  it('formats short durations like the "waiting 2m 3s" label', () => {
+    expect(formatShortDuration(3)).toBe('3s')
+    expect(formatShortDuration(123)).toBe('2m 3s')
+    expect(formatShortDuration(3_723)).toBe('1h 2m')
   })
 })
 

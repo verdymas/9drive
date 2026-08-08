@@ -65,12 +65,33 @@ export function buildS3ObjectKey(config: Pick<S3Config, 'prefix'>, userId: strin
   return `${root}/${userId}/${fileId}/${safeFileName(fileName)}`
 }
 
-export async function uploadS3Object(config: S3Config, key: string, body: NodeJS.ReadableStream, mimeType: string) {
+export type UploadS3ObjectOptions = {
+  /**
+   * Called with the number of bytes uploaded so far. `httpUploadProgress`
+   * reports per-part completions, so this is a step function of confirmed
+   * bytes (plus parts already sent) — close enough for a live progress bar.
+   */
+  onProgress?: (uploadedBytes: bigint) => void
+}
+
+export async function uploadS3Object(
+  config: S3Config,
+  key: string,
+  body: NodeJS.ReadableStream,
+  mimeType: string,
+  opts?: UploadS3ObjectOptions,
+) {
   const client = createS3Client(config)
-  await new Upload({
+  const upload = new Upload({
     client,
     params: { Bucket: config.bucket, Key: key, Body: body as Readable, ContentType: mimeType },
-  }).done()
+  })
+  if (opts?.onProgress) {
+    upload.on('httpUploadProgress', (event) => {
+      if (event.loaded != null) opts.onProgress!(BigInt(event.loaded))
+    })
+  }
+  await upload.done()
 }
 
 export async function deleteS3Object(file: FileWithAccount) {

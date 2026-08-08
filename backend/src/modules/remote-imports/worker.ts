@@ -36,11 +36,25 @@ export function createRemoteImportWorker(): Worker<RemoteImportJobData> {
     if (!remoteImport) return
     const userId = remoteImport.userId
 
-    // Per-user concurrency gate: re-delay rather than queue-jump.
+    // Per-user concurrency gate: re-delay rather than queue-jump. The DB row
+    // stays `queued` here — nothing visible to the user changes while the job
+    // waits for a slot.
     if (!acquirePerUserSlot(userId)) {
       throw new (await import('bullmq')).DelayedError()
     }
     try {
+      // The moment the worker actually begins this execution, persist an
+      // explicit started transition (§31) — status processing + startedAt +
+      // heartbeatAt — BEFORE any expensive work, so a retry picked up by the
+      // worker never stays visible as `queued`.
+      await prisma.remoteImport.update({
+        where: { id: importId },
+        data: { status: 'processing', startedAt: new Date(), heartbeatAt: new Date(), jobId: job.id },
+      }).catch((err) => {
+        // A DB blip here must not silently drop the job; surface it so the
+        // processor's failure path finalizes the row.
+        console.error('[remote-import] failed to mark execution started for', importId, err instanceof Error ? err.message : String(err))
+      })
       await processRemoteImportJob(job)
     } finally {
       releasePerUserSlot(userId)
@@ -56,6 +70,13 @@ export function createRemoteImportWorker(): Worker<RemoteImportJobData> {
     // The domain status is finalized inside the processor (for terminal
     // errors) or by the API's retry/cancel endpoints. This listener only logs
     // BullMQ-level failures so we never double-finalize a job.
+  })
+
+  worker.on('stalled', (jobId) => {
+    // A stalled job means BullMQ lost the lock (process crash mid-job). BullMQ
+    // will retry up to `maxStalledCount`; the reconciliation sweep catches rows
+    // that stay processing without a fresh heartbeat (§37).
+    console.error(`[remote-import] job ${jobId} stalled — worker lock was not renewed`)
   })
 
   worker.on('error', (err) => {
@@ -74,6 +95,7 @@ let shutdownHandler: (() => Promise<void>) | null = null
  */
 export function startRemoteImportWorker() {
   const worker = createRemoteImportWorker()
+  console.log(`[remote-import] worker started queue=remote-imports concurrency=${worker.concurrency}`)
   const shutdown = async () => {
     console.log('[remote-import] shutting down worker...')
     await worker.close()

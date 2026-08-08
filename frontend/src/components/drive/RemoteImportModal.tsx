@@ -337,6 +337,24 @@ export function RemoteImportModal({
       setHlsOptions({ ...hlsOptions, recordingDurationSeconds: undefined })
     }
 
+    // Client-side mirror of the server's §4 rule: when the user typed an
+    // explicit filename whose extension contradicts the selected output
+    // container, block submission and tell them — the name displayed in this
+    // modal must be the name ultimately uploaded. Only HLS imports with an
+    // explicit container set are checked.
+    const trimmedName = fileName.trim()
+    const outputContainer = hlsOptions?.outputContainer
+    if (hlsOptions && outputContainer && outputContainer !== 'auto' && trimmedName) {
+      const explicit = trimmedName.match(/\.([a-zA-Z0-9]{1,8})$/)
+      if (explicit && !/^\.(m3u8|m3u)$/i.test(explicit[0])) {
+        const given = explicit[1].toLowerCase()
+        if (given !== outputContainer) {
+          setError(`The file name extension (.${given}) must match the selected output format (${outputContainer.toUpperCase()}).`)
+          return
+        }
+      }
+    }
+
     setSubmitting(true)
     setError('')
     try {

@@ -12,6 +12,17 @@ export type RemoteImportItem = {
   totalBytes: string | null
   downloadedBytes: string
   uploadedBytes: string
+  /** Final output size being uploaded (HLS: the remuxed file; may differ from totalBytes). */
+  uploadTotalBytes: string | null
+  /** 0–100 int computed server-side from uploadedBytes / uploadTotalBytes. */
+  uploadProgress: number
+  /** When the last successful queue.add() happened (retry shows a waiting timer). */
+  queuedAt: string | null
+  retryRequestedAt: string | null
+  /** Rolling liveness evidence from the worker. */
+  heartbeatAt: string | null
+  /** Server-derived resume stage for a retry (never trusted from the client). */
+  retryFromStage: string | null
   mimeType: string | null
   errorCode: string | null
   errorMessage: string | null
@@ -25,6 +36,8 @@ export type RemoteImportItem = {
   fileId: string | null
   folderId: string | null
   connectedAccountId: string | null
+  /** Resolved destination account (safe fields only, for the upload label). */
+  connectedAccount?: { id: string; provider: string; email: string | null; displayName: string | null } | null
   file?: { id: string; name: string; sizeBytes: string } | null
   // ── HLS/M3U8 fields (populated for HLS imports) ────────────────────────────
   sourceType?: 'hls_master' | 'hls_media' | null
@@ -178,6 +191,30 @@ export function deleteRemoteImport(id: string) {
   return apiFetch<void>(`/remote-imports/${id}`, { method: 'DELETE' })
 }
 
+/** Parse a server byte string to a number (safe: NaN → 0). */
+export function bytesOf(value: string | null | undefined): number {
+  const n = value ? Number(value) : 0
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+/**
+ * Percent from a byte pair, clamped to [0, 100]. Never NaN, never negative.
+ * Used when the server-computed `uploadProgress` is absent (older rows).
+ */
+export function percentOf(current: string | null | undefined, total: string | null | undefined): number {
+  const cur = bytesOf(current)
+  const tot = bytesOf(total)
+  if (tot <= 0) return 0
+  return Math.min(100, Math.max(0, Math.round((cur / tot) * 100)))
+}
+
+/** Human label for the storage account the import uploads into. */
+export function accountLabel(item: RemoteImportItem): string {
+  const account = item.connectedAccount
+  if (!account) return 'storage'
+  return account.displayName || account.email || (account.provider === 's3' ? 'S3' : 'Google Drive')
+}
+
 /** Human label for a status + stage pair (used in tables and badges). */
 export function statusLabel(item: RemoteImportItem) {
   switch (item.status) {
@@ -204,4 +241,19 @@ function stageLabel(stage: RemoteImportStage) {
     case 'waiting': return 'Waiting'
     default: return 'Processing'
   }
+}
+
+/** Safe elapsed-seconds since a timestamp (0 when absent/parse failure). */
+export function elapsedSecondsSince(iso: string | null | undefined, now = Date.now()): number {
+  if (!iso) return 0
+  const t = Date.parse(iso)
+  if (!Number.isFinite(t)) return 0
+  return Math.max(0, Math.floor((now - t) / 1000))
+}
+
+/** Short human duration for the retry "waiting Xs" line. */
+export function formatShortDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`
 }

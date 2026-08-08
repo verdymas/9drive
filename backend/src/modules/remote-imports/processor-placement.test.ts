@@ -69,6 +69,7 @@ const h = vi.hoisted(() => {
     downloader: vi.fn(),
     googleUploader: vi.fn(async () => ({ providerFileId: 'drive-file-1', name: 'movie.mkv', mimeType: 'video/x-matroska', sizeBytes: 1000n })),
     audit: vi.fn(async () => undefined),
+    s3UploadSpy: vi.fn(async () => undefined),
   }
 })
 
@@ -150,7 +151,7 @@ vi.mock('../google/google.service.js', () => ({
 
 vi.mock('../s3/s3.service.js', () => ({
   getS3ConfigForAccount: vi.fn(async () => ({ bucket: 'test', region: 'us-east-1' })),
-  uploadS3Object: vi.fn(async () => undefined),
+  uploadS3Object: (...args: unknown[]) => h.s3UploadSpy(...args),
   buildS3ObjectKey: vi.fn(() => 'provider/object-key.mkv'),
   syncS3Quota: vi.fn(async () => undefined),
 }))
@@ -256,5 +257,93 @@ describe('processRemoteImportJob — placement routing (direct)', () => {
     // File registered on B with the virtual folder id.
     const createCalls = (h.prismaMock.file.create as ReturnType<typeof vi.fn>).mock.calls
     expect(createCalls.some((c) => c[0].data.connectedAccountId === 'acc-b' && c[0].data.folderId === 'movies')).toBe(true)
+  })
+
+  it('opens the upload with uploadTotalBytes set from the local file size (canonical total)', async () => {
+    const accA = account('acc-a', 'google_drive')
+    h.resolvePlacement.mockResolvedValue({
+      connectedAccount: accA,
+      folderStorageLocation: { id: 'loc-movies-a', folderId: 'movies', connectedAccountId: 'acc-a', provider: 'google_drive', providerFolderId: 'drive-movies-a' },
+    })
+    h.downloader.mockResolvedValue({ finalUrl: 'https://example.com/movie.mkv', tempPartPath: '/tmp/import-1.part', contentLength: 1000n, supportsRange: true })
+
+    await processRemoteImportJob(job())
+
+    // The upload phase records the FINAL output size — stat'd from the local
+    // temp file (here the mocked downloader streamed only 3 bytes) — and
+    // resets uploadedBytes for this execution. This is the number the live
+    // progress bar divides against, NOT the source totalBytes.
+    const updates = (h.prismaMock.remoteImport.update as ReturnType<typeof vi.fn>).mock.calls
+    const phase = updates.find((c) => c[0].data?.uploadTotalBytes !== undefined)
+    expect(phase).toBeDefined()
+    // Note: the actual file on disk is 3 bytes (the downloader mock body).
+    expect(phase![0].data.uploadTotalBytes).toBe(3n)
+    expect(phase![0].data.uploadedBytes).toBe(0)
+    // The uploader got an onProgress callback (live bar, not post-hoc only).
+    const googleArgs = (h.googleUploader as ReturnType<typeof vi.fn>).mock.calls[0]
+    expect(typeof googleArgs[7]).toBe('function')
+    // Completing the import stores the final total consistently.
+    const finalRow = h.rows.get('import-1')!
+    expect(finalRow.uploadedBytes).toBe(finalRow.uploadTotalBytes)
+  })
+
+  it('propagates live progress through the upload callback (S3 branch)', async () => {
+    // Route placement to an S3 account; the S3 uploader is mocked in s3.service.
+    const accS3 = account('acc-s3', 's3')
+    h.resolvePlacement.mockResolvedValue({
+      connectedAccount: accS3,
+      folderStorageLocation: { id: 'loc-movies-s3', folderId: 'movies', connectedAccountId: 'acc-s3', provider: 's3', providerPrefix: 'test' },
+    })
+    h.downloader.mockResolvedValue({ finalUrl: 'https://example.com/movie.mp4', tempPartPath: '/tmp/import-1.part', contentLength: 1000n, supportsRange: true })
+    // The mocked `uploadS3Object` accepts the opts and calls onProgress.
+    ;(h.s3UploadSpy as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (_config: unknown, _key: unknown, _body: unknown, _mime: unknown, opts?: { onProgress?: (bytes: bigint) => void }) => {
+      opts?.onProgress?.(500n)
+      opts?.onProgress?.(1000n)
+    })
+
+    await processRemoteImportJob(job())
+
+    // The upload callback reported live bytes; the row recorded them.
+    const updates = (h.prismaMock.remoteImport.update as ReturnType<typeof vi.fn>).mock.calls
+    const progressWrites = updates.flatMap((c) => (c[0].data?.uploadedBytes !== undefined ? [c[0].data.uploadedBytes] : []))
+    expect(progressWrites).toContain('500')
+    const finalRow = h.rows.get('import-1')!
+    expect(finalRow.uploadedBytes).toBe(1000n)
+    expect(finalRow.uploadTotalBytes).toBe(1000n)
+    // S3 opts.onProgress was supplied.
+    const s3Args = (h.s3UploadSpy as unknown as ReturnType<typeof vi.fn>).mock.calls[0]
+    expect(typeof s3Args[4]?.onProgress).toBe('function')
+  })
+
+  it('finalizes uploadedBytes to the upload total once the upload completes', async () => {
+    const accA = account('acc-a', 'google_drive')
+    h.resolvePlacement.mockResolvedValue({
+      connectedAccount: accA,
+      folderStorageLocation: { id: 'loc-movies-a', folderId: 'movies', connectedAccountId: 'acc-a', provider: 'google_drive', providerFolderId: 'drive-movies-a' },
+    })
+    h.downloader.mockResolvedValue({ finalUrl: 'https://example.com/movie.mkv', tempPartPath: '/tmp/import-1.part', contentLength: 1000n, supportsRange: true })
+
+    await processRemoteImportJob(job())
+
+    const finalRow = h.rows.get('import-1')!
+    expect(finalRow.status).toBe('completed')
+    expect(finalRow.uploadTotalBytes).toBe(1000n) // content-length is authoritative
+    expect(finalRow.uploadedBytes).toBe(1000n)
+  })
+
+  it('uses the user-entered filename (canonical) as the provider object name', async () => {
+    const accA = account('acc-a', 'google_drive')
+    h.resolvePlacement.mockResolvedValue({
+      connectedAccount: accA,
+      folderStorageLocation: { id: 'loc-movies-a', folderId: 'movies', connectedAccountId: 'acc-a', provider: 'google_drive', providerFolderId: 'drive-movies-a' },
+    })
+    h.downloader.mockResolvedValue({ finalUrl: 'https://example.com/some-remote-name.mkv', tempPartPath: '/tmp/import-1.part', contentLength: 1000n, supportsRange: true })
+    // The user typed "My Movie.mkv" (stored as the row's canonical fileName);
+    // the remote URL basename is different and must NEVER override it.
+    h.rows.set('import-1', h.baseRow({ fileName: 'My Movie.mkv' }))
+    await processRemoteImportJob(job())
+    expect(h.googleUploader).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), 'My Movie.mkv', expect.anything(), expect.anything(), expect.anything(), expect.any(Function))
+    const createCalls = (h.prismaMock.file.create as ReturnType<typeof vi.fn>).mock.calls
+    expect(createCalls[0][0].data.name).toBe('My Movie.mkv')
   })
 })

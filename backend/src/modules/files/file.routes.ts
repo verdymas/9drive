@@ -5,7 +5,8 @@ import { prisma } from '../../config/prisma.js'
 import { env } from '../../config/env.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
 import { hashToken, randomToken } from '../../utils/crypto.js'
-import { getAuthedGoogleClient, syncGoogleAppFolderFiles, syncGoogleQuota } from '../google/google.service.js'
+import { getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
+import { runSyncAll, runAccountSync } from '../sync/sync.service.js'
 import { deleteS3Object, syncS3Quota, createS3Client, getS3ConfigForAccount } from '../s3/s3.service.js'
 import { ensureFolderStorageLocation } from '../storage/folder-materialization.service.js'
 import { streamProviderFile } from './stream-file.js'
@@ -286,19 +287,19 @@ fileRouter.get('/shared-links', async (req: AuthRequest, res, next) => {
 
 fileRouter.post('/sync-google', async (req: AuthRequest, res, next) => {
   try {
+    // Legacy route kept for the frontend "Sync Google Drive" button — now
+    // delegates to the multi-storage Provider → Virtual sync engine.
     const body = z.object({ connectedAccountId: z.string().min(1).optional() }).parse(req.body ?? {})
-    const accounts = await prisma.connectedAccount.findMany({
-      where: { userId: req.user!.id, provider: 'google_drive', status: 'connected', ...(body.connectedAccountId ? { id: body.connectedAccountId } : {}) },
-      select: { id: true },
-    })
 
-    const results = []
-    for (const account of accounts) results.push(await syncGoogleAppFolderFiles(account.id, req.user!.id))
+    // Single-account sync keeps its old per-account isolation; no connected
+    // account that belongs to this user → runAccountSync throws 404 like before.
+    if (body.connectedAccountId) {
+      const result = await runAccountSync(req.user!.id, body.connectedAccountId)
+      return res.json({ status: 'ok', results: [result] })
+    }
 
-    return res.json({
-      status: 'ok',
-      results,
-    })
+    const { results } = await runSyncAll(req.user!.id)
+    return res.json({ status: 'ok', results })
   } catch (error) {
     return next(error)
   }

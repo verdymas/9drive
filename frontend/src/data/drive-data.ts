@@ -7,6 +7,8 @@ export type FolderItem = {
   parentId?: string | null
   providerFolderId?: string | null
   primaryLocation?: { connectedAccountId: string; provider: string; providerFolderId: string } | null
+  /** Number of physical storage locations across connected accounts. */
+  storageLocationCount?: number
 }
 
 export type FileItem = {

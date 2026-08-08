@@ -60,7 +60,7 @@ function mapFile(file: BackendFile): FileItem {
 }
 
 function mapFolder(folder: BackendFolder): FolderItem {
-  return { id: folder.id, name: folder.name, color: folder.color, iconUrl: folder.iconUrl, parentId: folder.parentId, providerFolderId: folder.providerFolderId, primaryLocation: folder.primaryLocation ?? null, updated: `Updated ${formatDate(folder.updatedAt)}` }
+  return { id: folder.id, name: folder.name, color: folder.color, iconUrl: folder.iconUrl, parentId: folder.parentId, providerFolderId: folder.providerFolderId, primaryLocation: folder.primaryLocation ?? null, storageLocationCount: folder.storageLocationCount ?? 1, updated: `Updated ${formatDate(folder.updatedAt)}` }
 }
 
 
@@ -317,21 +317,24 @@ export function AllFilesPage() {
     setSyncingDrive(true)
     setMessage('')
     try {
-      const response = await apiFetch<{ results: { created: number; updated: number; deleted: number }[] }>('/files/sync-google', { method: 'POST', body: JSON.stringify({}) })
+      // Multi-storage Provider → Virtual sync (all accounts, bounded
+      // concurrency). Per-account stats are scalar SyncRun fields.
+      const response = await apiFetch<{ results: { accountId: string; provider: string; status: string; stats: { filesCreated: number; filesUpdated: number; filesMoved: number; filesMissing: number } }[] }>('/sync/all', { method: 'POST', body: JSON.stringify({}) })
 
-      let created = 0, updated = 0, deleted = 0
+      let created = 0, updated = 0, moved = 0, removed = 0
       for (const res of response.results) {
-        created += res.created
-        updated += res.updated
-        deleted += res.deleted
+        created += res.stats.filesCreated
+        updated += res.stats.filesUpdated
+        moved += res.stats.filesMoved
+        removed += res.stats.filesMissing
       }
       const accounts = response.results.length
 
-      setMessage(`Google Drive synced. ${created} added, ${updated} updated, ${deleted} removed across ${accounts} account${accounts === 1 ? '' : 's'}.`)
+      setMessage(`Synced ${accounts} account${accounts === 1 ? '' : 's'}. ${created} added, ${updated} updated, ${moved} moved, ${removed} removed.`)
       await loadAll()
       window.dispatchEvent(new Event('9drive:storage-changed'))
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Failed to sync Google Drive')
+      setMessage(error instanceof Error ? error.message : 'Failed to sync storage accounts')
     } finally {
       setSyncingDrive(false)
     }

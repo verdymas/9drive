@@ -17,7 +17,7 @@
 - Email/password auth plus Google sign-in/register with automatic first Drive connection.
 - Multi-account storage quota summary.
 - Quota tracker page.
-- Manual sync from the Google Drive `9drive` folder back into MySQL.
+- Manual sync from the Google Drive `9drive` folder / S3 prefixes back into MySQL — one virtual tree across ALL connected accounts (`POST /sync/all`, see [docs/SYNC.md](docs/SYNC.md)).
 - Virtual folders.
 - File preview, download, rename, move, and delete actions.
 - In-app API documentation with cURL and JavaScript upload examples.
@@ -639,7 +639,7 @@ GET /files/:id
 PATCH /files/:id
 PATCH /files/batch
 DELETE /files/batch
-POST /files/sync-google
+POST /files/sync-google  # legacy alias → POST /sync/all (kept for old clients)
 POST /files/:id/share
 DELETE /files/:id/share
 POST /files/:id/preview-token
@@ -667,6 +667,15 @@ GET    /remote-imports/:id            Get one import
 POST   /remote-imports/:id/cancel     Cancel a queued/processing import
 POST   /remote-imports/:id/retry      Retry a failed/cancelled import
 DELETE /remote-imports/:id            Delete an import record
+```
+
+Storage sync (multi-account, Provider → Virtual; see [docs/SYNC.md](docs/SYNC.md)):
+
+```txt
+POST  /sync/all                 Sync ALL connected accounts (bounded concurrency)
+POST  /sync/account/:id        Sync one account
+POST  /sync/account/:id/cancel  Cancel an in-flight sync (never cleans up)
+GET   /sync/runs?limit=50       Recent run history
 ```
 
 ```txt

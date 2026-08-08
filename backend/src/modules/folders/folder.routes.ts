@@ -8,6 +8,7 @@ import { deleteS3Object, syncS3Quota } from '../s3/s3.service.js'
 import { createAuditLog } from '../../utils/audit.js'
 import { deleteProviderFolder, ensureProviderRoot, moveProviderFolder, renameProviderFolder } from '../storage/provider-folder.service.js'
 import { ensureFolderStorageLocation } from '../storage/folder-materialization.service.js'
+import { normalizeFolderName } from '../sync/normalize-folder-name.js'
 
 export const folderRouter = Router()
 folderRouter.use(requireAuth)
@@ -131,6 +132,13 @@ folderRouter.post('/', async (req: AuthRequest, res, next) => {
       })
     }
 
+    // A duplicated sibling name (same virtual parent) is allowed for
+    // user-created folders — the folder unique index `folders_user_parent_normalized_name_unique`
+    // permits multiple NULL normalized_names. Only write the normalized name
+    // when it does not already exist under this parent, so the index stays
+    // truthful and the new folder remains valid.
+    const normalizedName = await normalizedNameIfFree(req.user!.id, body.name, body.parentId ?? null)
+
     // Virtual-first: a folder exists only in the virtual tree until an upload
     // (or a move) needs a physical location on some storage account.
     const folder = await prisma.folder.create({
@@ -140,6 +148,7 @@ folderRouter.post('/', async (req: AuthRequest, res, next) => {
         color: body.color ?? defaultFolderColor,
         iconUrl: body.iconUrl ?? defaultFolderIconUrl,
         parentId: body.parentId ?? null,
+        ...(normalizedName ? { normalizedName } : {}),
       },
       select: { id: true, name: true, color: true, iconUrl: true, parentId: true, providerFolderId: true, createdAt: true, updatedAt: true },
     })
@@ -178,9 +187,30 @@ folderRouter.patch('/:id', async (req: AuthRequest, res, next) => {
       if (descendantIds.has(body.parentId)) return res.status(400).json({ code: 'FOLDER_INVALID_PARENT', message: 'Folder cannot be moved into itself or a child folder.' })
     }
 
+    // Rename keeps the normalized name index truthful; a name that collides
+    // with an existing sibling (or a parent move that would collide) leaves
+    // normalizedName NULL so both rows coexist under MySQL NULL semantics.
+    let normalizedName: string | null | undefined
+    const renameWith = body.name ?? (body.parentId !== undefined ? folderRecord.name : undefined)
+    if (renameWith) {
+      const norm = await normalizedNameIfFree(
+        req.user!.id,
+        renameWith,
+        body.parentId !== undefined ? (body.parentId ?? null) : (folderRecord.parentId ?? null),
+        folderId,
+      )
+      normalizedName = norm
+    }
+
     const folder = await prisma.folder.updateMany({
       where: { id: folderId, userId: req.user!.id, deletedAt: null },
-      data: { ...(body.name ? { name: body.name } : {}), ...(body.color ? { color: body.color } : {}), ...(body.iconUrl !== undefined ? { iconUrl: body.iconUrl } : {}), ...(body.parentId !== undefined ? { parentId: body.parentId } : {}) },
+      data: {
+        ...(body.name ? { name: body.name } : {}),
+        ...(normalizedName !== undefined ? { normalizedName } : {}),
+        ...(body.color ? { color: body.color } : {}),
+        ...(body.iconUrl !== undefined ? { iconUrl: body.iconUrl } : {}),
+        ...(body.parentId !== undefined ? { parentId: body.parentId } : {}),
+      },
     })
     if (folder.count === 0) return res.status(404).json({ code: 'FOLDER_NOT_FOUND', message: 'Folder not found.' })
 
@@ -292,3 +322,25 @@ folderRouter.delete('/:id', async (req: AuthRequest, res, next) => {
     return next(error)
   }
 })
+
+/**
+ * Compute the normalized name for a folder being created/renamed under a
+ * virtual parent, or `null` when the normalized name would collide with an
+ * existing sibling. The folder unique index allows multiple NULL normalized
+ * names, so a user-created duplicate simply stays unconstrained instead of
+ * failing the create/update.
+ */
+async function normalizedNameIfFree(
+  userId: string,
+  name: string,
+  parentId: string | null,
+  excludeId?: string,
+): Promise<string | null> {
+  const normalizedName = normalizeFolderName(name)
+  if (normalizedName === '') return null
+  const existing = await prisma.folder.findFirst({
+    where: { userId, parentId, normalizedName, deletedAt: null, id: excludeId ? { not: excludeId } : undefined },
+    select: { id: true },
+  })
+  return existing ? null : normalizedName
+}

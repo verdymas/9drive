@@ -95,6 +95,11 @@ export function FolderGrid({
           </button>
           <FolderVisual folder={folder} className={cn('transition group-hover:scale-110', cfg.icon)} />
           <h2 className={cn('line-clamp-2 text-center font-extrabold leading-tight', cfg.title)}>{folder.name}</h2>
+          {(folder.storageLocationCount ?? 1) > 1 && (
+            <span className={cn('rounded-full bg-blue-50 px-2 py-0.5 text-center font-medium text-blue-600', cfg.sub)} title={`Stored across ${folder.storageLocationCount} connected accounts`}>
+              {folder.storageLocationCount} accounts
+            </span>
+          )}
           <p className={cn('line-clamp-1 text-center text-slate-500', cfg.sub)}>{folder.updated}</p>
         </Card>
       ))}

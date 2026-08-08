@@ -16,9 +16,9 @@ import { createTempPartFile, removeTempFile, appendStreamToTemp } from './temp-s
 import { sanitizeFileName } from './filename-sanitize.js'
 import { runHlsPipeline } from './hls/pipeline.js'
 import { hlsJobDir, readResumeMarker, removeJobDir, removeResumeMarker } from './hls/job-dir.js'
-import { hlsDerivedFileName } from './hls/output.js'
 import type { ContainerChoice } from './hls/output.js'
 import { ensureJobDir } from './hls/materializer.js'
+import { verifyOutput } from './hls/verify.js'
 
 const STAGES = {
   PROBING: 'probing',
@@ -44,12 +44,40 @@ function isHlsRecord(record: { sourceType?: string | null }): boolean {
  * Update the domain row's stage + progress. `progress` must be a small
  * object of bytes/fields (never the URL, never tokens). Errors are swallowed
  * so a transient DB blip never fails the import itself.
+ *
+ * Every progress write doubles as heartbeat evidence (§38): meaningful,
+ * throttled progress IS liveness. The HLS conversion additionally writes a
+ * heartbeat from its 5s poll loop so an idle (byte-silent) FFmpeg process
+ * still proves the worker is alive.
  */
 async function updateStage(importId: string, stage: Stage, progress: Record<string, unknown> = {}) {
   await prisma.remoteImport.update({
     where: { id: importId },
-    data: { stage, ...progress },
+    data: { stage, ...progress, heartbeatAt: new Date() },
   }).catch(() => undefined)
+}
+
+/** Rolling liveness evidence for long, byte-silent phases (idle FFmpeg). */
+async function writeHeartbeat(importId: string) {
+  await prisma.remoteImport.update({
+    where: { id: importId },
+    data: { heartbeatAt: new Date() },
+  }).catch(() => undefined)
+}
+
+/**
+ * Begin the upload phase: record the upload's total bytes (final output size,
+ * distinct from the SOURCE `totalBytes` — for HLS the two differ) and reset
+ * the uploaded counter for this execution. Returns the stat for the caller.
+ */
+async function startUploadPhase(importId: string, localPath: string) {
+  const stat = await fsp.stat(localPath)
+  const totalBytes = BigInt(stat.size)
+  await updateStage(importId, STAGES.UPLOADING, {
+    uploadedBytes: 0,
+    uploadTotalBytes: totalBytes,
+  })
+  return totalBytes
 }
 
 /** Throttle a stage-update call to REMOTE_IMPORT_PROGRESS_UPDATE_INTERVAL_MS. */
@@ -126,7 +154,12 @@ async function downloadToTemp(importId: string, startUrl: string, maxBytes: bigi
   return { finalUrl, tempPartPath: partPath, contentLength, supportsRange }
 }
 
-/** Stream the temp part file into the destination provider and return provider metadata. */
+/**
+ * Stream the temp part file into the destination provider and return provider
+ * metadata. The upload phase is started here (stage `uploading` + uploadTotal
+ * bytes from the local file) and the completed progress is written back
+ * through the same `onUploadProgress` channel used by the live bar.
+ */
 async function uploadTempFile(
   importId: string,
   account: { id: string; provider: string },
@@ -138,8 +171,8 @@ async function uploadTempFile(
   providerFolderId: string,
   onUploadProgress?: (uploadedBytes: bigint) => void,
 ) {
+  const uploadTotalBytes = await startUploadPhase(importId, tempPartPath)
   const fileStream = fs.createReadStream(tempPartPath)
-  await updateStage(importId, STAGES.UPLOADING)
 
   if (account.provider === 's3') {
     const config = await getS3ConfigForAccount(account.id, userId)
@@ -148,9 +181,17 @@ async function uploadTempFile(
     })
     const providerFileId = buildS3ObjectKey(config, userId, provisionalFile.id, fileName, folderId ? providerFolderId : undefined)
     try {
-      await uploadS3Object(config, providerFileId, fileStream, mimeType)
-      const s3Size = BigInt((await fsp.stat(tempPartPath)).size)
-      await prisma.remoteImport.update({ where: { id: importId }, data: { uploadedBytes: s3Size } }).catch(() => undefined)
+      // One throttled updater for the whole upload (per-call creations would
+      // reset the throttle window and write on every part event).
+      const uploadProgress = throttledProgressUpdater(importId, STAGES.UPLOADING)
+      await uploadS3Object(config, providerFileId, fileStream, mimeType, {
+        onProgress: (uploadedBytes) => {
+          void uploadProgress({ uploadedBytes: uploadedBytes.toString() })
+        },
+      })
+      // S3's httpUploadProgress is per-part; force the final write so the bar
+      // reaches 100% the moment the upload completes (§ spec).
+      await prisma.remoteImport.update({ where: { id: importId }, data: { uploadedBytes: uploadTotalBytes } }).catch(() => undefined)
       await prisma.file.update({ where: { id: provisionalFile.id }, data: { providerFileId, status: 'active' } })
       return { providerFileId, fileId: provisionalFile.id }
     } catch (error) {
@@ -235,6 +276,8 @@ async function processHlsImport(
     hlsIsLive: boolean | null
     hlsRecordingDurationSeconds: number | null
     sourceUrlEncrypted: string
+    fileId: string | null
+    retryFromStage?: string | null
   },
 ) {
   const importId = record.id
@@ -257,62 +300,152 @@ async function processHlsImport(
 
   const signalController = new AbortController()
   // The worker checks the DB between phases; this controller is only for
-  // cancel requests that arrive DURING a phase (polled below).
+  // cancel requests that arrive DURING a phase (polled below). The same 5s
+  // loop doubles as the heartbeat writer (§38): an idle FFmpeg process still
+  // proves the worker is alive.
   const pollCancel = setInterval(async () => {
     const current = await prisma.remoteImport.findUnique({ where: { id: importId } }).catch(() => null)
     if (current?.status === 'cancelled') signalController.abort()
+    else if (current?.status === 'processing') await writeHeartbeat(importId)
   }, 5000)
 
   try {
-    await updateStage(importId, STAGES.SEGMENTS)
-    const pipeline = await runHlsPipeline({
-      jobDir,
-      sourceUrl,
-      isLive: Boolean(record.hlsIsLive),
-      recordingDurationSeconds: record.hlsRecordingDurationSeconds ?? undefined,
-      selection: {
-        variantId: record.hlsVariantId,
-        audioTrackId: record.hlsAudioTrackId,
-        outputContainer: (record.hlsOutputContainer as ContainerChoice) ?? 'auto',
-      },
-      // Convert-only resume: reuse the materialized segments on disk; the
-      // marker carries the resolved playlist URLs + container + expectAudio.
-      ...(resumeMarker
-        ? {
-            resume: {
-              playlistUrl: resumeMarker.playlistUrl,
-              audioPlaylistUrl: resumeMarker.audioPlaylistUrl,
-              container: resumeMarker.container,
-              expectAudio: resumeMarker.expectAudio,
-            },
-          }
-        : {}),
-      signal: signalController.signal,
-      onProgress: async (p) => {
-        if (p.stage === 'segments' || p.stage === 'live' || p.stage === 'recording') {
-          await updateStage(importId, p.stage === 'recording' ? STAGES.SEGMENTS : STAGES.SEGMENTS, {
-            hlsCompletedSegmentCount: p.segmentsCompleted,
-            hlsSegmentCount: p.segmentsTotal,
-            hlsMediaDurationSeconds: p.mediaDurationSeconds ?? null,
-            downloadedBytes: p.downloadedBytes?.toString(),
-          })
-        } else if (p.stage === 'remux') {
-          await updateStage(importId, STAGES.REMUXING, { remuxProgress: p.remuxPercent ?? null })
-        }
-      },
-    })
+    // ── Stage-aware retry (§32) ─────────────────────────────────────────────
+    // `retryFromStage` is set server-side by the retry API. Resume rather than
+    // re-run:
+    //  - `registering` — the provider upload already succeeded and the File
+    //    row exists; only the finalize step remains (no second upload — the
+    //    stored provider object must never be duplicated).
+    //  - `uploading` — the remuxed output exists on disk and is valid; skip
+    //    FFmpeg (and segment download) entirely, upload + register.
+    //  - `remuxing`    — segments materialized; `resume.json` carries the
+    //    resolved playlist so the pipeline resumes at remux.
+    //  - otherwise — full run (segments → remux → upload).
+    const retryFromStage = record.retryFromStage
 
-    if (!pipeline) {
-      await markFailed(importId, 'HLS_INVALID_MANIFEST', 'The source is not a valid HLS playlist.')
-      return null
+    if (retryFromStage === 'registering' && record.fileId) {
+      await updateStage(importId, STAGES.REGISTERING)
+      const existing = await prisma.file.findUnique({ where: { id: record.fileId } })
+      if (existing) {
+        await prisma.remoteImport.update({
+          where: { id: importId },
+          data: {
+            status: 'completed',
+            stage: STAGES.FINISHED,
+            fileId: existing.id,
+            completedAt: new Date(),
+            tempPath: null,
+            finalUrlEncrypted: encryptText(sourceUrl),
+          },
+        })
+        logProgress(importId, STAGES.FINISHED, 'hls register-retry completed')
+        if (record.connectedAccountId) {
+          const prov = existing.provider ?? ''
+          if (prov === 's3') syncS3Quota(record.connectedAccountId).catch(() => undefined)
+          else syncGoogleQuota(record.connectedAccountId).catch(() => undefined)
+        }
+        return { outputPath: null }
+      }
+      // File row gone (shouldn't happen) — fall through to a full re-run.
+    }
+
+    // A convert-only retry resumes at remuxing (marker present); a full run
+    // materializes segments first. Only the stage label differs — the pipeline
+    // decides the real resume by the marker handed below.
+    let outputPath: string | null = null
+    // Metadata for the upload/finalize tail; empty for an upload-resume (only
+    // the container is known), fully populated by a pipeline run.
+    let mediaDurationSeconds: number | null = null
+    let segmentCount: number | null = null
+    let outputDurationSeconds: number | null = null
+    let outputCodecSummary: string | undefined = undefined
+    let downloadedBytes: bigint = 0n
+    let mimeCodeSuffix: 'mp4' | 'mkv' = 'mkv'
+    if (retryFromStage === 'uploading') {
+      // The output already exists and was verified last attempt (§32 Case C).
+      // Locate it (the container may have been auto-resolved), verify again
+      // (cheap), then jump to upload.
+      for (const ext of ['mp4', 'mkv'] as const) {
+        const candidate = `${jobDir}/output.${ext}`
+        try {
+          await fsp.access(candidate)
+          outputPath = candidate
+          mimeCodeSuffix = ext
+          break
+        } catch {
+          /* try next container */
+        }
+      }
+      if (outputPath) {
+        await updateStage(importId, STAGES.VERIFYING)
+        const verification = await verifyOutput(outputPath, { expectVideo: true, expectAudio: Boolean(record.hlsAudioTrackId && resumeMarker?.expectAudio) })
+        outputDurationSeconds = verification.durationSeconds
+        outputCodecSummary = verification.codecs.join(', ')
+      } else {
+        // Output vanished — fall back to a full run below.
+        outputPath = null
+      }
+    }
+
+    if (!outputPath) {
+      // Full run or remux-resume: run the pipeline.
+      await updateStage(importId, resumeMarker ? STAGES.REMUXING : STAGES.SEGMENTS)
+      const pipeline = await runHlsPipeline({
+        jobDir,
+        sourceUrl,
+        isLive: Boolean(record.hlsIsLive),
+        recordingDurationSeconds: record.hlsRecordingDurationSeconds ?? undefined,
+        selection: {
+          variantId: record.hlsVariantId,
+          audioTrackId: record.hlsAudioTrackId,
+          outputContainer: (record.hlsOutputContainer as ContainerChoice) ?? 'auto',
+        },
+        // Convert-only resume: reuse the materialized segments on disk; the
+        // marker carries the resolved playlist URLs + container + expectAudio.
+        ...(resumeMarker
+          ? {
+              resume: {
+                playlistUrl: resumeMarker.playlistUrl,
+                audioPlaylistUrl: resumeMarker.audioPlaylistUrl,
+                container: resumeMarker.container,
+                expectAudio: resumeMarker.expectAudio,
+              },
+            }
+          : {}),
+        signal: signalController.signal,
+        onProgress: async (p) => {
+          if (p.stage === 'segments' || p.stage === 'live' || p.stage === 'recording') {
+            await updateStage(importId, STAGES.SEGMENTS, {
+              hlsCompletedSegmentCount: p.segmentsCompleted,
+              hlsSegmentCount: p.segmentsTotal,
+              hlsMediaDurationSeconds: p.mediaDurationSeconds ?? null,
+              downloadedBytes: p.downloadedBytes?.toString(),
+            })
+          } else if (p.stage === 'remux') {
+            await updateStage(importId, STAGES.REMUXING, { remuxProgress: p.remuxPercent ?? null })
+          }
+        },
+      })
+
+      if (!pipeline) {
+        await markFailed(importId, 'HLS_INVALID_MANIFEST', 'The source is not a valid HLS playlist.')
+        return null
+      }
+      outputPath = pipeline.outputPath
+      mediaDurationSeconds = pipeline.mediaDurationSeconds
+      segmentCount = pipeline.segmentCount
+      outputDurationSeconds = pipeline.outputDurationSeconds
+      outputCodecSummary = pipeline.codecSummary
+      downloadedBytes = pipeline.downloadedBytes
+      mimeCodeSuffix = pipeline.container
     }
 
     // ── Finalize HLS metadata before upload. ────────────────────────────────
     await updateStage(importId, STAGES.VERIFYING, {
-      hlsMediaDurationSeconds: pipeline.mediaDurationSeconds,
-      hlsSegmentCount: pipeline.segmentCount,
-      outputDurationSeconds: pipeline.outputDurationSeconds,
-      outputCodecSummary: pipeline.codecSummary.slice(0, 191),
+      hlsMediaDurationSeconds: mediaDurationSeconds,
+      hlsSegmentCount: segmentCount,
+      outputDurationSeconds: outputDurationSeconds,
+      outputCodecSummary: outputCodecSummary?.slice(0, 191) ?? null,
       remuxProgress: null,
     })
 
@@ -324,7 +457,8 @@ async function processHlsImport(
     // locations are only a soft preference).
     let placement
     try {
-      placement = await resolveUploadPlacement(userId, folderId, record.connectedAccountId, pipeline.downloadedBytes, undefined, 'remote-import')
+      const reportedBytes = downloadedBytes > 0n ? downloadedBytes : BigInt((await fsp.stat(outputPath!)).size)
+      placement = await resolveUploadPlacement(userId, folderId, record.connectedAccountId, reportedBytes, undefined, 'remote-import')
     } catch (error: any) {
       const code = error?.code === 'AUTOMATIC_STORAGE_NO_ELIGIBLE_ACCOUNT' ? 'NO_ACCOUNT_WITH_ENOUGH_SPACE' : (error?.code ?? 'IMPORT_FAILED')
       await markFailed(importId, code, error?.message ?? 'No connected storage account has enough space.')
@@ -333,21 +467,25 @@ async function processHlsImport(
     const account = placement.connectedAccount
 
     // ── Upload the remuxed file. ────────────────────────────────────────────
-    const mimeType = record.mimeType ?? (pipeline.container === 'mp4' ? 'video/mp4' : 'video/x-matroska')
+    // The provider object must carry the user's CANONICAL name
+    // (`record.fileName`), never the pipeline-derived one (playlist basename
+    // or `output.<ext>`) — the name shown in the create modal is the name
+    // ultimately uploaded (§3/§5).
+    const mimeType = record.mimeType ?? (mimeCodeSuffix === 'mp4' ? 'video/mp4' : 'video/x-matroska')
     const uploaded = await uploadTempFile(
       importId,
       { id: account.id, provider: account.provider },
       userId,
       folderId,
-      pipeline.fileName,
+      record.fileName,
       mimeType,
-      pipeline.outputPath,
+      outputPath!,
       placement.folderStorageLocation.providerFolderId,
     )
-    const sizeBytes = BigInt((await fsp.stat(pipeline.outputPath)).size)
+    const sizeBytes = BigInt((await fsp.stat(outputPath!)).size)
 
     // ── Register + link. ────────────────────────────────────────────────────
-    const file = await registerFile(importId, { ...record, connectedAccountId: account.id, fileName: pipeline.fileName, mimeType }, uploaded.providerFileId, sizeBytes)
+    const file = await registerFile(importId, { ...record, connectedAccountId: account.id, fileName: record.fileName, mimeType }, uploaded.providerFileId, sizeBytes)
 
     await prisma.remoteImport.update({
       where: { id: importId },
@@ -356,8 +494,9 @@ async function processHlsImport(
         stage: STAGES.FINISHED,
         fileId: file.id,
         completedAt: new Date(),
-        downloadedBytes: pipeline.downloadedBytes,
+        downloadedBytes: downloadedBytes || sizeBytes,
         uploadedBytes: sizeBytes,
+        uploadTotalBytes: sizeBytes,
         tempPath: null,
         finalUrlEncrypted: encryptText(sourceUrl),
       },
@@ -370,7 +509,7 @@ async function processHlsImport(
     // Success: a convert-only retry just completed — drop the marker so the
     // job dir is removed by the cleanup below. A fresh run had none anyway.
     await removeResumeMarker(jobDir).catch(() => undefined)
-    return { outputPath: pipeline.outputPath }
+    return { outputPath: outputPath! }
   } finally {
     clearInterval(pollCancel)
     // Keep the job dir ONLY while a resume marker exists (a remux/verify
@@ -411,10 +550,15 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
   try {
     if (record.status !== 'queued' && record.status !== 'failed' && record.status !== 'processing') return
 
-    await prisma.remoteImport.update({
-      where: { id: importId },
-      data: { status: 'processing', stage: STAGES.PROBING, startedAt: new Date(), jobId: job.id },
-    })
+    // The worker already transitioned the row to processing at pickup (§31).
+    // Here we only align the stage: a retry resumes where its retryFromStage
+    // says to (remuxing for convert-retries), never reverting to probing.
+    if (record.status !== 'processing' || record.stage === 'waiting') {
+      await prisma.remoteImport.update({
+        where: { id: importId },
+        data: { status: 'processing', stage: record.retryFromStage ?? STAGES.PROBING, jobId: job.id },
+      })
+    }
 
     // ── HLS imports skip the direct-download path entirely. ─────────────────
     if (isHlsRecord(record)) {
@@ -492,7 +636,8 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
     }
     const account = placement.connectedAccount
 
-    // Upload.
+    // Upload. `uploadTempFile` starts the upload phase (stage + uploadTotalBytes
+    // from the local file) and writes throttled progress for both providers.
     const uploaded = await uploadTempFile(importId, { id: account.id, provider: account.provider }, userId, folderId, fileName, mimeType, downloaded.tempPartPath, placement.folderStorageLocation.providerFolderId)
     assertWithinTimeout()
     await updateStage(importId, STAGES.REGISTERING)
@@ -511,6 +656,7 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
         completedAt: new Date(),
         downloadedBytes: totalSize,
         uploadedBytes: totalSize,
+        uploadTotalBytes: totalSize,
         tempPath: null,
         finalUrlEncrypted: encryptText(finalUrl),
       },

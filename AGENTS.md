@@ -213,7 +213,7 @@ Files:
 - `PATCH /files/:id`
 - `PATCH /files/batch`
 - `DELETE /files/batch`
-- `POST /files/sync-google`
+- `POST /files/sync-google` (legacy alias → `POST /sync/all`)
 - `POST /files/:id/share`
 - `DELETE /files/:id/share`
 - `POST /files/:id/preview-token`
@@ -232,6 +232,12 @@ Public shared files:
 - `GET /public/files/:token/download`
 - `GET /public/files/:token/preview`
 
+Sync (Provider → Virtual, see `docs/SYNC.md`):
+- `POST /sync/all`
+- `POST /sync/account/:id`
+- `POST /sync/account/:id/cancel`
+- `GET /sync/runs`
+
 Uploads:
 - `POST /uploads`
 - Content type: `multipart/form-data`.
@@ -239,7 +245,7 @@ Uploads:
 - File fields then match `filesMeta[*].fieldName`, e.g. `file-0`, `file-1`.
 - Backend selects a connected Drive account with enough available quota and streams each file directly to Google Drive.
 - Google Drive uploads are placed under the root Drive folder named `9drive`; virtual folders remain app/database-only.
-- `POST /files/sync-google` treats Google Drive folder `9drive` as source of truth for physical files: create missing MySQL file rows, update changed metadata, and mark missing Drive files as deleted.
+- `POST /sync/all` (legacy `POST /files/sync-google` aliases it) treats connected Drive/S3 accounts as source of truth: discover the physical folder tree (Drive BFS / S3 prefix walk), merge same-path folders into ONE virtual folder, create/update/move MySQL file rows, and mark missing resources deleted — account-scoped, only after a full successful scan (see `docs/SYNC.md`).
 
 ## Docker
 

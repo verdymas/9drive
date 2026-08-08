@@ -32,6 +32,7 @@ model User {
   uploadRoutingPolicy  UploadRoutingPolicy?
   apiKeys              ApiKey[]
   remoteImports        RemoteImport[]
+  syncRuns             SyncRun[]
 
   @@map("users")
 }
@@ -161,6 +162,7 @@ model ConnectedAccount {
   uploadSessions        UploadSession[]
   s3StorageConfig       S3StorageConfig?
   remoteImports         RemoteImport[]
+  syncRuns              SyncRun[]
 
   @@unique([userId, provider, providerAccountId])
   @@index([userId])
@@ -219,6 +221,11 @@ model File {
   sizeBytes          BigInt             @map("size_bytes")
   checksum           String?            @db.VarChar(191)
   status             String             @default("active") @db.VarChar(32)
+  // Generation marker for account-scoped missing reconciliation: the SyncRun
+  // that last saw this provider file during a successful complete scan. NULL
+  // = never stamped (legacy row) — never treated as missing. Deliberately NOT
+  // a foreign key: compared, never joined.
+  lastSeenSyncRunId  String?            @map("last_seen_sync_run_id") @db.VarChar(36)
   createdAt          DateTime           @default(now()) @map("created_at")
   updatedAt          DateTime           @updatedAt @map("updated_at")
   deletedAt          DateTime?          @map("deleted_at")
@@ -235,6 +242,7 @@ model File {
   @@index([connectedAccountId])
   @@index([folderId])
   @@index([providerFileId])
+  @@index([connectedAccountId, status, lastSeenSyncRunId])
   @@map("files")
 }
 
@@ -254,6 +262,9 @@ model RemoteImport {
   totalBytes                  BigInt?           @map("total_bytes")
   downloadedBytes             BigInt            @default(0) @map("downloaded_bytes")
   uploadedBytes               BigInt            @default(0) @map("uploaded_bytes")
+  // Final output size (the file being uploaded) — distinct from `totalBytes`,
+  // which is the SOURCE download size. For HLS the two often differ.
+  uploadTotalBytes            BigInt?           @map("upload_total_bytes")
   sourceETag                  String?           @map("source_etag") @db.VarChar(191)
   sourceLastModified          DateTime?         @map("source_last_modified")
   sourceRangeSupported        Boolean           @default(false) @map("source_range_supported")
@@ -279,6 +290,14 @@ model RemoteImport {
   resumeSessionEncrypted      String?           @map("resume_session_encrypted") @db.Text
   jobId                       String?           @map("job_id") @db.VarChar(191)
   attempt                     Int               @default(0)
+  // Queue-lifecycle metadata (spec: retry/queue fix). `queuedAt` is set only
+  // when queue.add() actually succeeded; `heartbeatAt` is the rolling liveness
+  // signal while the worker is active; `retryFromStage` is the server-derived
+  // resume stage for a retry (never frontend-supplied).
+  queuedAt                    DateTime?         @map("queued_at")
+  retryRequestedAt            DateTime?         @map("retry_requested_at")
+  heartbeatAt                 DateTime?         @map("heartbeat_at")
+  retryFromStage              String?           @map("retry_from_stage") @db.VarChar(32)
   errorCode                   String?           @map("error_code") @db.VarChar(64)
   errorMessage                String?           @map("error_message") @db.Text
   internalError               String?           @map("internal_error") @db.Text
@@ -298,6 +317,7 @@ model RemoteImport {
   @@index([status, createdAt])
   @@index([jobId])
   @@index([folderId])
+  @@index([status, queuedAt])
   @@map("remote_imports")
 }
 
@@ -344,6 +364,15 @@ model Folder {
   provider           String                  @default("google_drive") @db.VarChar(32)
   providerFolderId   String?                 @map("provider_folder_id") @db.VarChar(191)
   name               String                  @db.VarChar(255)
+  // Normalized name used by Sync folder matching (NFC + trim + lowercase).
+  // NULL for user-created rows — MySQL unique indexes allow multiple NULLs, so
+  // user-created duplicates stay unconstrained while sync-created names are
+  // always normalized and enforced.
+  normalizedName     String?                 @map("normalized_name") @db.VarChar(255)
+  // 'user' = user-created virtual folder (never auto-pruned/auto-renamed by
+  // Sync); 'sync' = discovered on a provider, eligible for the safe
+  // single-location in-place rename optimization.
+  origin             String                  @default("user") @db.VarChar(16)
   color              String                  @default("text-blue-500") @db.VarChar(64)
   iconUrl            String?                 @map("icon_url") @db.Text
   createdAt          DateTime                @default(now()) @map("created_at")
@@ -358,6 +387,7 @@ model Folder {
   uploadSessions     UploadSession[]         @relation("UploadSessionFolder")
   remoteImports      RemoteImport[]
 
+  @@unique([userId, parentId, normalizedName], map: "folders_user_parent_normalized_name_unique")
   @@index([userId])
   @@index([userId, deletedAt, updatedAt])
   @@index([userId, deletedAt, parentId, updatedAt])
@@ -372,6 +402,9 @@ model FolderStorageLocation {
   connectedAccountId String           @map("connected_account_id") @db.Char(36)
   provider           String           @db.VarChar(32)
   providerFolderId   String           @map("provider_folder_id") @db.VarChar(191)
+  // Generation marker for account-scoped missing reconciliation — see File.
+  // Plain indexed column, deliberately NOT a foreign key.
+  lastSeenSyncRunId  String?          @map("last_seen_sync_run_id") @db.VarChar(36)
   createdAt          DateTime         @default(now()) @map("created_at")
   updatedAt          DateTime         @updatedAt @map("updated_at")
   folder             Folder           @relation(fields: [folderId], references: [id], onDelete: Cascade)
@@ -380,7 +413,41 @@ model FolderStorageLocation {
   @@unique([folderId, connectedAccountId])
   @@index([connectedAccountId])
   @@index([folderId])
+  @@index([connectedAccountId, lastSeenSyncRunId])
   @@map("folder_storage_locations")
+}
+
+model SyncRun {
+  id                 String           @id @default(uuid()) @db.Char(36)
+  userId             String           @map("user_id") @db.Char(36)
+  connectedAccountId String           @map("connected_account_id") @db.Char(36)
+  provider           String           @db.VarChar(32)
+  status             String           @default("running") @db.VarChar(16) // running|completed|failed|cancelled
+  startedAt          DateTime         @default(now()) @map("started_at")
+  completedAt        DateTime?        @map("completed_at")
+  errorCode          String?          @map("error_code") @db.VarChar(64)
+  errorMessage       String?          @map("error_message") @db.Text
+  // Run statistics as scalar columns (mirrors the RemoteImport scalar style).
+  foldersDiscovered  Int              @default(0) @map("folders_discovered")
+  filesDiscovered    Int              @default(0) @map("files_discovered")
+  foldersCreated     Int              @default(0) @map("folders_created")
+  mappingsCreated    Int              @default(0) @map("mappings_created")
+  mappingsReused     Int              @default(0) @map("mappings_reused")
+  mappingsDetached   Int              @default(0) @map("mappings_detached")
+  filesCreated       Int              @default(0) @map("files_created")
+  filesUpdated       Int              @default(0) @map("files_updated")
+  filesMoved         Int              @default(0) @map("files_moved")
+  filesMissing       Int              @default(0) @map("files_missing")
+  mappingsMissing    Int              @default(0) @map("mappings_missing")
+  collisionsDetected Int              @default(0) @map("collisions_detected")
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime         @updatedAt @map("updated_at")
+  user               User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  connectedAccount   ConnectedAccount @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([connectedAccountId, createdAt])
+  @@map("sync_runs")
 }
 
 model UploadSession {

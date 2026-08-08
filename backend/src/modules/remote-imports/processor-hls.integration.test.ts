@@ -159,7 +159,7 @@ function mockRow(id: string) {
     userId: 'user-1',
     folderId: null,
     connectedAccountId: 'acc-1',
-    fileName: 'movie.m3u8',
+    fileName: 'movie.mkv', // canonical (service already appended the container ext)
     mimeType: 'application/vnd.apple.mpegurl',
     sourceType: 'hls_master',
     hlsVariantId: null,
@@ -570,10 +570,10 @@ describe('HLS remote import end-to-end (fixture)', () => {
     const completed = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'completed')
     expect(completed).toBe(true)
 
-    // Registration happened with the real remuxed output name. `auto` for this
-    // simple fixture (no separate audio/subtitles/discontinuities) resolves to
-    // MP4 — the output must carry the resolved container's extension.
-    expect(createdFile.name).toMatch(/\.(mp4|mkv)$/)
+    // Registration happened with the REAL remuxed output under the canonical
+    // row name (`movie.mkv` — the user-entered name, never the playlist URL
+    // basename, never the pipeline's internal derivation).
+    expect(createdFile.name).toBe('movie.mkv')
     expect(createdFile.providerFileId).toContain('provider/object-key')
   })
 
@@ -676,7 +676,7 @@ describe('HLS remote import end-to-end (fixture)', () => {
     expect(ffmpegFailures.reencodeCalls).toBeGreaterThan(0)
     const completed = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'completed')
     expect(completed).toBe(true)
-    expect(createdFile.name).toMatch(/\.(mp4|mkv)$/)
+    expect(createdFile.name).toBe('movie.mkv')
   })
 
   it('raw-concat fallback: remux + re-encode fail, the TS join copy completes (code_example_convert.sh method)', async () => {
@@ -758,7 +758,7 @@ describe('HLS remote import end-to-end (fixture)', () => {
     const completed = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'completed')
     expect(completed).toBe(true)
     expect(fmp4FileRequests).toBeGreaterThan(0)
-    expect(createdFile.name).toMatch(/\.(mp4|mkv)$/)
+    expect(createdFile.name).toBe('movie.mkv')
   })
 
   it('Fixture F: EXT-X-BYTERANGE-only source materializes via Range requests and remuxes (§23)', async () => {
@@ -801,6 +801,6 @@ describe('HLS remote import end-to-end (fixture)', () => {
     expect(completed).toBe(true)
     // Each EXT-X-BYTERANGE segment is one Range request: 2 segments → 2 hits.
     expect(brFileRequests).toBe(2)
-    expect(createdFile.name).toMatch(/\.(mp4|mkv)$/)
+    expect(createdFile.name).toBe('movie.mkv')
   })
 })

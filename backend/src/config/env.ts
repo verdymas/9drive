@@ -30,6 +30,12 @@ const envSchema = z.object({
   REMOTE_IMPORT_UPLOAD_ATTEMPTS: z.coerce.number().default(2),
   REMOTE_IMPORT_TEMP_RETENTION_HOURS: z.coerce.number().default(24),
   REMOTE_IMPORT_PROGRESS_UPDATE_INTERVAL_MS: z.coerce.number().default(1000),
+  // Max time a `queued` import may sit without evidence of a valid waiting/
+  // delayed queue job before the reconcile sweep starts checking queue state.
+  REMOTE_IMPORT_QUEUE_START_TIMEOUT_SECONDS: z.coerce.number().default(300),
+  // Max time a `processing` import may go without a worker heartbeat before it
+  // is considered stalled.
+  REMOTE_IMPORT_WORKER_HEARTBEAT_TIMEOUT_SECONDS: z.coerce.number().default(120),
   REMOTE_IMPORT_TEMP_DIR: z.string().default('./data/remote-import-tmp'),
   REDIS_URL: z.string().default('redis://redis:6379'),
   // HLS/M3U8 remote import support (worker-side FFmpeg remux).
@@ -52,6 +58,13 @@ const envSchema = z.object({
   REMOTE_IMPORT_HLS_MAX_HEIGHT: z.coerce.number().default(2160),
   REMOTE_IMPORT_HLS_MAX_BANDWIDTH: z.coerce.number().default(0),
   REMOTE_IMPORT_HLS_MAX_KEY_BYTES: z.coerce.number().default(65536),
+  // Storage Sync (Provider → Virtual reconciliation). Account-level and
+  // within-account folder-listing concurrency are bounded separately so Sync
+  // All never launches unlimited provider scans simultaneously.
+  SYNC_ACCOUNT_CONCURRENCY: z.coerce.number().default(2),
+  SYNC_FOLDER_LIST_CONCURRENCY: z.coerce.number().default(2),
+  SYNC_MAX_DEPTH: z.coerce.number().default(40),
+  SYNC_DRIVE_MAX_RETRIES: z.coerce.number().default(3),
 })
 
 export const env = envSchema.parse(process.env)

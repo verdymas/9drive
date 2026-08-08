@@ -18,6 +18,8 @@ import { systemRouter } from './modules/system/system.routes.js'
 import { webdavRouter } from './modules/webdav/webdav.routes.js'
 import { createSmbRouter } from './modules/smb/smb.routes.js'
 import { remoteImportRouter } from './modules/remote-imports/remote-import.routes.js'
+import { remoteImportQueueHealth } from './modules/remote-imports/queue.js'
+import { syncRouter } from './modules/sync/sync.routes.js'
 
 export const app = express()
 app.set('trust proxy', true)
@@ -25,7 +27,12 @@ app.set('trust proxy', true)
 app.use(cors({ origin: env.FRONTEND_URL }))
 app.use(express.json({ limit: '1mb' }))
 
-app.get('/health', (_req, res) => res.json({ status: 'ok' }))
+app.get('/health', async (_req, res) => {
+  res.json({
+    status: 'ok',
+    remoteImportQueue: await remoteImportQueueHealth(),
+  })
+})
 app.use('/api', publicApiRouter)
 app.use('/public', publicRouter)
 app.use('/auth', authRouter)
@@ -41,6 +48,7 @@ app.use('/audit-logs', auditLogRouter)
 app.use('/system', systemRouter)
 app.use('/webdav', webdavRouter)
 app.use('/remote-imports', remoteImportRouter)
+app.use('/sync', syncRouter)
 app.use(
   '/smb',
   createSmbRouter({

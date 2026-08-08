@@ -29,30 +29,95 @@ export type RemoteImportJobData = {
 }
 
 /**
- * Enqueue a fresh Remote Import job for `importId`. Idempotent per row:
- * duplicate calls return the existing jobId without creating a second job.
+ * Build the deterministic BullMQ job id for a given execution of an import.
+ * One job per (importId, attempt): a retry enqueues a new job with the next
+ * attempt, so a stale failed job can never shadow a fresh execution (which the
+ * old `jobId: importId` scheme did, leaving retries stuck in `queued`).
  */
-export async function enqueueRemoteImport(importId: string): Promise<string> {
-  const data: RemoteImportJobData = { importId, attempt: 1 }
-  const existing = await remoteImportQueue.getJob(importId)
-  if (existing) return existing.id ?? importId
+export function remoteImportJobId(importId: string, attempt: number): string {
+  return `${importId}:${attempt}`
+}
+
+/**
+ * Enqueue a Remote Import execution. Every call creates a distinct job keyed
+ * by (importId, attempt); the DB row's status is the single-flight guard, not
+ * a Redis lookup, so duplicates cannot silently skip enqueueing.
+ */
+export async function enqueueRemoteImport(
+  importId: string,
+  attempt: number,
+): Promise<string> {
+  const data: RemoteImportJobData = { importId, attempt }
+  const jobId = remoteImportJobId(importId, attempt)
   const job = await remoteImportQueue.add(JOB_NAME, data, {
-    jobId: importId,
+    jobId,
     attempts: env.REMOTE_IMPORT_DOWNLOAD_ATTEMPTS,
     backoff: { type: 'exponential', delay: 5_000 },
   })
-  return job.id ?? importId
+  return job.id ?? jobId
 }
 
-/** Remove a job from the queue entirely (cancel). Returns true if it existed. */
-export async function removeRemoteImportJob(importId: string): Promise<boolean> {
-  const existing = await remoteImportQueue.getJob(importId)
-  if (!existing) return false
-  await existing.remove()
+/** Remove a job for a specific execution (cancel). Returns true if it existed. */
+export async function removeRemoteImportJob(
+  importId: string,
+  attempt: number,
+): Promise<boolean> {
+  const job = await remoteImportQueue.getJob(remoteImportJobId(importId, attempt))
+  if (!job) return false
+  await job.remove()
   return true
+}
+
+/**
+ * Load the BullMQ job for a specific execution, or null when it is missing
+ * (used by the reconciliation sweep to distinguish "waiting" from "lost").
+ */
+export async function getRemoteImportJob(
+  importId: string,
+  attempt: number,
+) {
+  return remoteImportQueue.getJob(remoteImportJobId(importId, attempt))
+}
+
+/** Load a BullMQ job by its raw stored id (row.jobId). Returns null when gone. */
+export async function getJobById(jobId: string) {
+  return remoteImportQueue.getJob(jobId)
+}
+
+/**
+ * Resolve a stored row to its execution job, tolerating legacy rows whose
+ * `jobId` was just the import id (pre-fix) instead of `${id}:${attempt}`.
+ */
+export async function resolveJobForRow(row: { jobId: string | null; id: string; attempt: number }) {
+  if (row.jobId) {
+    const job = await remoteImportQueue.getJob(row.jobId)
+    if (job) return job
+  }
+  return remoteImportQueue.getJob(remoteImportJobId(row.id, Math.max(row.attempt, 1)))
 }
 
 /** Gracefully close the producer connection (used on API shutdown). */
 export async function closeRemoteImportQueue() {
   await remoteImportQueue.close()
+}
+
+/**
+ * Safe Remote Import health probe for the `/health` endpoint (§42).
+ *
+ * The queue producer lives in the API process and the worker in a separate
+ * process, so a single round-trip against Redis (`getWorkersCount` → CLIENT
+ * LIST) asserts both that the queue is reachable and whether a worker is
+ * currently connected. `worker: "unknown"` covers environments where the
+ * CLIENT LIST query is unsupported (e.g. GCP) or where no worker happens to
+ * be connected right now — that is a soft signal, never a hard failure. Never
+ * throws: a Redis outage yields `{ redis: "down", worker: "unknown" }` instead
+ * of breaking the health endpoint, and no sensitive Redis details are exposed.
+ */
+export async function remoteImportQueueHealth(): Promise<{ redis: 'ok' | 'down'; worker: 'ok' | 'unknown' }> {
+  try {
+    const workers = await remoteImportQueue.getWorkersCount()
+    return { redis: 'ok', worker: workers > 0 ? 'ok' : 'unknown' }
+  } catch {
+    return { redis: 'down', worker: 'unknown' }
+  }
 }

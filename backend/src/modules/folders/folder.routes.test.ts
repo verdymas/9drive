@@ -20,6 +20,8 @@ const h = vi.hoisted(() => {
     iconUrl: string | null
     parentId: string | null
     providerFolderId: string | null
+    normalizedName: string | null
+    origin: string
     deletedAt: Date | null
     createdAt: Date
     updatedAt: Date
@@ -57,7 +59,7 @@ const h = vi.hoisted(() => {
   const folder = (id: string, name: string, parentId: string | null = null, overrides: Partial<Folder> = {}) => {
     const row: Folder = {
       id, userId: 'user-1', name, color: '#3b82f6', iconUrl: 'https://api.iconify.design/lucide:folder.svg',
-      parentId, providerFolderId: null, deletedAt: null, createdAt: now, updatedAt: now, ...overrides,
+      parentId, providerFolderId: null, normalizedName: null, origin: 'user', deletedAt: null, createdAt: now, updatedAt: now, ...overrides,
     }
     folders.push(row)
     return row
@@ -85,6 +87,7 @@ const h = vi.hoisted(() => {
       if (typeof where.id === 'string' && f.id !== where.id) return false
       if (Array.isArray(where.id?.in) && !where.id.in.includes(f.id)) return false
     }
+    if (where?.id?.not && f.id === where.id.not) return false
     return true
   }
 
@@ -98,6 +101,10 @@ const h = vi.hoisted(() => {
             ...(select?._count ? { _count: { storageLocations: locations.filter((l) => l.folderId === f.id).length } } : {}),
           })),
       ),
+      findFirst: vi.fn(async ({ where }: { where?: any } = {}) => {
+        const f = folders.find((x) => matchFolder(x, where) && (where?.normalizedName === undefined || x.normalizedName === where.normalizedName))
+        return f ?? null
+      }),
       findFirstOrThrow: vi.fn(async ({ where, include }: { where?: any; include?: any } = {}) => {
         const f = folders.find((x) => matchFolder(x, where))
         if (!f) throw new Error('Folder not found')

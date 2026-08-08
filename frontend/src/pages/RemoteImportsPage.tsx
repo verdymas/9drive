@@ -6,8 +6,12 @@ import { PageHeader } from '@/components/drive/PageHeader'
 import { RemoteImportModal, formatDuration } from '@/components/drive/RemoteImportModal'
 import { apiFetch, formatBytes, formatDate } from '@/lib/api'
 import {
+  accountLabel,
+  bytesOf,
   cancelRemoteImport,
   deleteRemoteImport,
+  elapsedSecondsSince,
+  formatShortDuration,
   isConvertRetryable,
   listRemoteImports,
   retryRemoteConvert,
@@ -62,17 +66,24 @@ export function formatDisplayUrl(url: string, maxPathSegments = 1): string {
  * spinner/indeterminate bar instead of a bogus percentage.
  */
 export function progressPercent(item: RemoteImportItem) {
-  const total = Number(item.totalBytes ?? 0)
-  if (total <= 0) return null
   if (item.status === 'completed') return 100
   if (item.status === 'failed' || item.status === 'cancelled') return 0
 
-  const bytes =
-    item.status === 'processing' && item.stage === 'uploading'
-      ? Number(item.uploadedBytes ?? 0)
-      : Number(item.downloadedBytes ?? 0)
+  if (item.status === 'processing' && item.stage === 'uploading') {
+    // The upload measures against `uploadTotalBytes` (the final output size —
+    // for HLS the remuxed file, which differs from the SOURCE totalBytes).
+    const total = bytesOf(item.uploadTotalBytes ?? item.totalBytes)
+    if (total <= 0) return null
+    const bytes = bytesOf(item.uploadedBytes)
+    if (bytes <= 0) return 0
+    // Cap at 99 so the bar never claims completion while the stage is unfinished.
+    return Math.min(99, Math.round((bytes / total) * 100))
+  }
+
+  const total = bytesOf(item.totalBytes)
+  if (total <= 0) return null
+  const bytes = bytesOf(item.downloadedBytes)
   if (bytes <= 0) return 0
-  // Cap at 99 so the bar never claims completion while the stage is unfinished.
   return Math.min(99, Math.round((bytes / total) * 100))
 }
 
@@ -367,11 +378,27 @@ export function RemoteImportsPage() {
                         {item.status === 'completed' ? 'Complete' : `${percent}%`}
                         {active ? (
                           item.stage === 'uploading'
-                            ? ` · ${formatBytes(item.uploadedBytes)}`
+                            ? ` · ${formatBytes(item.uploadedBytes)} / ${formatBytes(item.uploadTotalBytes ?? item.totalBytes)}`
                             : ` · ${formatBytes(item.downloadedBytes)}`
                         ) : null}
                       </span>
                     </div>
+                  ) : null}
+
+                  {item.status === 'processing' && item.stage === 'uploading' ? (
+                    <p className="mt-1.5 text-[11px] font-semibold text-blue-700">
+                      Uploading to {accountLabel(item)}
+                      {item.uploadTotalBytes && item.uploadedBytes !== item.uploadTotalBytes ? ` · ${formatBytes(item.uploadedBytes)} / ${formatBytes(item.uploadTotalBytes)}` : ''}
+                      {item.attempt > 1 ? ` · Attempt ${item.attempt}` : ''}
+                    </p>
+                  ) : null}
+
+                  {item.status === 'queued' && item.attempt > 1 ? (
+                    <p className="mt-1.5 text-[11px] font-semibold text-slate-500">
+                      {item.retryFromStage === 'remuxing' ? 'Queued for conversion retry' : 'Queued for retry'}
+                      {` · Attempt ${item.attempt}`}
+                      {` · waiting ${formatShortDuration(elapsedSecondsSince(item.queuedAt))}`}
+                    </p>
                   ) : null}
 
                   {item.errorMessage && item.status === 'failed' ? (
