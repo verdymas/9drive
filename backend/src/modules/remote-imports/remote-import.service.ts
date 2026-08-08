@@ -4,6 +4,12 @@ import { AppError } from '../../utils/app-error.js'
 import { createAuditLog } from '../../utils/audit.js'
 import { encryptText } from '../../utils/crypto.js'
 import { sanitizeFileName } from './filename-sanitize.js'
+import {
+  decryptRequestContext,
+  encryptRequestContext,
+  serializeRequestContext,
+  type RemoteImportRequestContext,
+} from './request-context.js'
 import { enqueueRemoteImport, removeRemoteImportJob, remoteImportJobId } from './queue.js'
 import { validateRemoteUrl } from './ssrf.js'
 import { removeTempFile, tempFilePath } from './temp-storage.js'
@@ -40,6 +46,8 @@ export type CreateRemoteImportInput = {
   mimeType?: string | null
   /** HLS import options; when present the import is routed to the HLS pipeline. */
   hls?: CreateRemoteImportHlsOptions | null
+  /** User-supplied referer/origin/user-agent/cookie for protected sources. */
+  requestContext?: RemoteImportRequestContext | null
 }
 
 /**
@@ -87,6 +95,7 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
       folderId,
       connectedAccountId,
       sourceUrlEncrypted: encryptText(input.sourceUrl),
+      requestContextEncrypted: input.requestContext ? encryptRequestContext(input.requestContext) : null,
       displayUrl: displayUrl(input.sourceUrl),
       fileName: finalFileName,
       mimeType: input.mimeType || null,
@@ -201,9 +210,19 @@ export function computeUploadProgress(row: {
  * JSON serialization (Node: "Do not know how to serialize a BigInt").
  */
 export function serializeRemoteImport(importRow: any) {
-  const { sourceUrlEncrypted: _encrypted, finalUrlEncrypted: _final, resumeSessionEncrypted: _session, internalError: _internal, ...rest } = importRow
+  const {
+    sourceUrlEncrypted: _encrypted,
+    requestContextEncrypted: _requestContextEncrypted,
+    finalUrlEncrypted: _final,
+    resumeSessionEncrypted: _session,
+    internalError: _internal,
+    ...rest
+  } = importRow
   return {
     ...rest,
+    // Never the encrypted blob NOR the decrypted values — booleans only, so
+    // the UI can say "Request context attached" without ever seeing secrets.
+    requestContext: serializeRequestContext(decryptRequestContext(importRow.requestContextEncrypted)),
     totalBytes: importRow.totalBytes?.toString() ?? null,
     downloadedBytes: importRow.downloadedBytes.toString(),
     uploadedBytes: importRow.uploadedBytes.toString(),

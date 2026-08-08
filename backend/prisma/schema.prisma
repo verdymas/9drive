@@ -253,6 +253,9 @@ model RemoteImport {
   connectedAccountId          String?           @map("connected_account_id") @db.Char(36)
   fileId                      String?           @unique @map("file_id") @db.Char(36)
   sourceUrlEncrypted          String            @map("source_url_encrypted") @db.Text
+  // User-supplied Referer/Origin/User-Agent/Cookie for protected sources,
+  // AES-256-GCM encrypted at rest; never returned by any API (booleans only).
+  requestContextEncrypted     String?           @map("request_context_encrypted") @db.Text
   displayUrl                  String            @map("display_url") @db.Text
   finalUrlEncrypted           String?           @map("final_url_encrypted") @db.Text
   fileName                    String            @map("file_name") @db.VarChar(255)

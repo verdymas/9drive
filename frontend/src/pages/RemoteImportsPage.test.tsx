@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { formatDisplayUrl, hlsActivityLine, hlsSummaryLine, progressPercent } from '@/pages/RemoteImportsPage'
 import { formatDuration } from '@/components/drive/RemoteImportModal'
@@ -57,6 +57,10 @@ const baseItem: RemoteImportItem = {
 function item(overrides: Partial<RemoteImportItem> = {}): RemoteImportItem {
   return { ...baseItem, ...overrides }
 }
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
 
 describe('formatDisplayUrl', () => {
   it('shows hostname + first path segment with an ellipsis', () => {
@@ -244,5 +248,43 @@ describe('overflow-safe structure contract', () => {
       </Button>,
     )
     expect(screen.getByRole('button', { name: /delete remote import very-long-file-name/i })).toBeTruthy()
+  })
+})
+
+vi.mock('@/lib/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/api')>()
+  return {
+    ...actual,
+    apiFetch: vi.fn(async (path: string) => {
+      if (path.startsWith('/remote-imports')) {
+        return {
+          items: [
+            item({
+              id: 'with-ctx',
+              fileName: 'protected.mkv',
+              status: 'completed',
+              requestContext: { attached: true, referer: true, origin: false, userAgent: false, cookie: true },
+            }),
+            item({ id: 'plain', fileName: 'plain.bin', status: 'completed' }),
+          ],
+          cursor: null,
+        }
+      }
+      if (path.startsWith('/connected-accounts')) return { accounts: [] }
+      if (path.startsWith('/folders')) return { folders: [] }
+      return {}
+    }),
+  }
+})
+
+describe('request-context badge (spec §36)', () => {
+  it('shows "Request context attached" when the row carries attached context, and never values', async () => {
+    const { RemoteImportsPage } = await import('@/pages/RemoteImportsPage')
+    render(<RemoteImportsPage />)
+    expect(await screen.findByText('Request context attached')).toBeInTheDocument()
+    expect(screen.getByText('protected.mkv')).toBeInTheDocument()
+    // Values are never rendered — only the boolean summary drives the badge.
+    expect(screen.queryByText(/session=/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/cookie/i)).not.toBeInTheDocument()
   })
 })

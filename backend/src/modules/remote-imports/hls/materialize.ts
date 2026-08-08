@@ -20,6 +20,7 @@ import { env } from '../../../config/env.js'
 import { AppError } from '../../../utils/app-error.js'
 import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './errors.js'
 import { fetchManifest, parseMediaPlaylist } from './manifest.js'
+import { assertChildAccessible, type RemoteImportRequestContext } from '../request-context.js'
 import {
   downloadResource,
   downloadByteRange,
@@ -48,6 +49,14 @@ export type MaterializeMediaOptions = {
   /** Persistent cache {absoluteUri → localPath} for live windows. */
   segmentCache?: Map<string, string>
   signal?: AbortSignal
+  /**
+   * Request context (user-supplied referer/origin/user-agent/cookie) applied to
+   * every map/key/segment fetch through the centralized header policy. The
+   * cookie is source-host-scoped and the cross-origin child fail-safe applies.
+   */
+  requestContext?: RemoteImportRequestContext
+  /** Original import source URL — the cookie-scope anchor (spec §13). */
+  sourceUrl?: string
   onProgress?: (progress: { segmentsCompleted: number; segmentsTotal: number; bytesDownloaded: bigint }) => void
 }
 
@@ -106,6 +115,17 @@ function assertNotAborted(signal: AbortSignal | undefined) {
 export async function materializeMedia(opts: MaterializeMediaOptions): Promise<MaterializeMediaResult> {
   const { jobDir, segments, mediaLabel, signal } = opts
   const cache = opts.segmentCache ?? new Map<string, string>()
+  const requestContext = opts.requestContext
+  // Cross-origin child fail-safe (spec §16): a Cookie that cannot legally be
+  // sent to a child host must never be leaked to make the request work.
+  let anchorUrl: URL | null = null
+  if (requestContext?.cookie && opts.sourceUrl) {
+    try {
+      anchorUrl = new URL(opts.sourceUrl)
+    } catch {
+      anchorUrl = null
+    }
+  }
 
   assertSupportedEncryption(segments)
 
@@ -129,18 +149,20 @@ export async function materializeMedia(opts: MaterializeMediaOptions): Promise<M
 
   for (const [uri, targetPath] of mapPaths) {
     assertNotAborted(signal)
+    if (anchorUrl) assertChildAccessible(anchorUrl, new URL(uri), requestContext)
     const map = segments.find((s) => s.map?.uri === uri)?.map as SegmentMap | undefined
     if (map?.byterange) {
-      downloadedBytes += await downloadByteRange(uri, map.byterange.offset, map.byterange.length, targetPath, { signal })
+      downloadedBytes += await downloadByteRange(uri, map.byterange.offset, map.byterange.length, targetPath, { signal, requestContext })
     } else {
-      downloadedBytes += await downloadResource(uri, targetPath, { maxBytes: MAX_SEGMENT_BYTES(), signal, kind: 'map' })
+      downloadedBytes += await downloadResource(uri, targetPath, { maxBytes: MAX_SEGMENT_BYTES(), signal, kind: 'map', requestContext })
     }
   }
 
   for (const [uri, targetPath] of keyPaths) {
     assertNotAborted(signal)
+    if (anchorUrl) assertChildAccessible(anchorUrl, new URL(uri), requestContext)
     try {
-      downloadedBytes += await downloadResource(uri, targetPath, { maxBytes: MAX_KEY_BYTES(), signal, kind: 'key' })
+      downloadedBytes += await downloadResource(uri, targetPath, { maxBytes: MAX_KEY_BYTES(), signal, kind: 'key', requestContext })
     } catch (error) {
       if (error instanceof AppError && error.code === HLS_ERROR_CODES.HLS_SEGMENT_TOO_LARGE) {
         throw new AppError(HLS_ERROR_CODES.HLS_KEY_DOWNLOAD_FAILED, HLS_ERROR_MESSAGES.HLS_KEY_DOWNLOAD_FAILED, 502)
@@ -172,10 +194,11 @@ export async function materializeMedia(opts: MaterializeMediaOptions): Promise<M
       segmentPaths.set(segment.uri, target)
 
       const attemptDownload = () => {
+        if (anchorUrl) assertChildAccessible(anchorUrl, new URL(segment.uri), requestContext)
         if (segment.byterange) {
-          return downloadByteRange(segment.uri, segment.byterange.offset, segment.byterange.length, target, { signal })
+          return downloadByteRange(segment.uri, segment.byterange.offset, segment.byterange.length, target, { signal, requestContext })
         }
-        return downloadResource(segment.uri, target, { maxBytes: MAX_SEGMENT_BYTES(), signal, kind: 'segment' })
+        return downloadResource(segment.uri, target, { maxBytes: MAX_SEGMENT_BYTES(), signal, kind: 'segment', requestContext })
       }
 
       let lastError: unknown = null
@@ -264,8 +287,12 @@ export function buildSegmentCacheSeed(jobDir: string, segments: NormalizedSegmen
 /**
  * Re-fetch a media playlist (the worker polls it) into normalized segments +
  * the original body (needed for the hls-parser round-trip serialization).
+ * `requestContext` covers the initial fetch, live refresh and resume re-fetch.
  */
-export async function fetchMediaPlaylistSegments(playlistUrl: string): Promise<{ segments: NormalizedSegment[]; body: string }> {
-  const { body, finalUrl } = await fetchManifest(playlistUrl)
+export async function fetchMediaPlaylistSegments(
+  playlistUrl: string,
+  requestContext?: RemoteImportRequestContext,
+): Promise<{ segments: NormalizedSegment[]; body: string }> {
+  const { body, finalUrl } = await fetchManifest(playlistUrl, env.REMOTE_IMPORT_HLS_MAX_MANIFEST_BYTES, requestContext)
   return { segments: (await parseMediaPlaylist(body, finalUrl)).segments, body }
 }

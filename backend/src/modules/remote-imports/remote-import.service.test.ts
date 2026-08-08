@@ -190,6 +190,41 @@ describe('serializeRemoteImport', () => {
     expect(JSON.parse(JSON.stringify(serialized)).file.sizeBytes).toBe('100')
   })
 
+  it('serializes requestContext as booleans only — never the values', () => {
+    const row = {
+      id: 'import-ctx',
+      totalBytes: null,
+      downloadedBytes: 0n,
+      uploadedBytes: 0n,
+      // crypto is identity-mocked: encryptText(JSON.stringify(ctx)) === the JSON
+      // string itself, so this is the exact shape the real AES path yields.
+      requestContextEncrypted: JSON.stringify({ referer: 'https://site.example/1', cookie: 'session=valid' }),
+    }
+    const serialized = serializeRemoteImport(row as never)
+    expect(serialized.requestContext).toEqual({
+      attached: true,
+      referer: true,
+      origin: false,
+      userAgent: false,
+      cookie: true,
+    })
+    const wire = JSON.stringify(serialized)
+    expect(wire).not.toContain('session=valid')
+    expect(wire).not.toContain('https://site.example/1')
+    expect(wire).not.toContain('requestContextEncrypted')
+  })
+
+  it('reports attached=false when the row has no context', () => {
+    const serialized = serializeRemoteImport({ id: 'import-plain', totalBytes: null, downloadedBytes: 0n, uploadedBytes: 0n } as never)
+    expect(serialized.requestContext).toEqual({
+      attached: false,
+      referer: false,
+      origin: false,
+      userAgent: false,
+      cookie: false,
+    })
+  })
+
   it('passes HLS fields through unchanged and stays JSON-safe', () => {
     const row = {
       id: 'import-4',
@@ -432,6 +467,21 @@ describe('createRemoteImport', () => {
       detectedFileName: 'Detected Name.mp4',
     })
     expect(created.fileName).toBe('Detected Name.mp4')
+  })
+
+  it('stores an encrypted requestContext when one is supplied (never plaintext)', async () => {
+    const created = await createRemoteImport({
+      userId: 'user-1',
+      sourceUrl: 'https://cdn.example/file.mp4',
+      fileName: 'File.mp4',
+      requestContext: { referer: 'https://site.example/watch/1', cookie: 'session=valid' },
+    })
+    const createArgs = (h.prismaMock.remoteImport.create as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    expect(createArgs.data.requestContextEncrypted).toBeDefined()
+    // crypto is identity-mocked — assert the SHAPE (encrypted JSON), and that
+    // the raw cookie never leaks into other persisted fields.
+    expect(createArgs.data.sourceUrlEncrypted).not.toContain('session=valid')
+    expect(JSON.stringify(createArgs.data)).not.toContain('"cookie"')
   })
 
   it('does not leave the row queued when enqueuing fails', async () => {

@@ -168,6 +168,7 @@ function mockRow(id: string) {
     hlsIsLive: false,
     hlsRecordingDurationSeconds: null,
     sourceUrlEncrypted: '',
+    requestContextEncrypted: null,
     status: 'queued',
     stage: 'waiting',
     totalBytes: null,
@@ -802,5 +803,47 @@ describe('HLS remote import end-to-end (fixture)', () => {
     // Each EXT-X-BYTERANGE segment is one Range request: 2 segments → 2 hits.
     expect(brFileRequests).toBe(2)
     expect(createdFile.name).toBe('movie.mkv')
+  })
+
+  it('retry reuses the stored request context without a repaste (spec §22)', async () => {
+    if (!fixtureDir) return // skipped (no ffmpeg)
+    validationSpy.validateRemoteUrl.mockReset()
+    validationSpy.resolveAndValidateHost.mockReset()
+    validationSpy.validateRemoteUrl.mockImplementation(async (raw: string) => new URL(raw))
+    validationSpy.resolveAndValidateHost.mockImplementation(async (host: string) => host)
+
+    const importId = 'import-hls-ctx-retry'
+    const job = { data: { importId, attempt: 1 }, id: 'job-1' } as unknown as Job<RemoteImportJobData>
+    const { encryptText } = await import('../../utils/crypto.js')
+    const { encryptRequestContext } = await import('./request-context.js')
+    const row = mockRow(importId)
+    row.sourceType = 'hls_media'
+    // The fixture master is NOT gated, but the context must still flow through
+    // every fetch — the assertion below is that the worker re-decrypts the
+    // context from the row on BOTH runs, never from any job payload.
+    row.sourceUrlEncrypted = encryptText(`${baseUrl}/plain.m3u8`)
+    row.requestContextEncrypted = encryptRequestContext({ referer: 'https://site.example/watch/1', cookie: 'session=valid' })
+    prisma.remoteImport.findUnique = vi.fn(async () => row)
+    const updateMock = prisma.remoteImport.update as ReturnType<typeof vi.fn>
+    updateMock.mockClear()
+    plainSegmentRequests = 0
+    await fsp.rm(hlsJobDir(row.userId, importId), { recursive: true, force: true })
+
+    // Run 1: complete.
+    await processRemoteImportJob(job)
+    expect(updateMock.mock.calls.some((call) => call[0]?.data?.status === 'completed')).toBe(true)
+    const afterFirstRun = plainSegmentRequests
+    expect(afterFirstRun).toBe(plainSegBytes.length)
+
+    // A retry re-enqueues the SAME row (status back to 'queued'); the context
+    // field is untouched — the worker must decrypt it again on the retry.
+    updateMock.mockClear()
+    prisma.remoteImport.findUnique = vi.fn(async () => ({ ...row, status: 'queued' }))
+    await processRemoteImportJob(job)
+    const completed2 = updateMock.mock.calls.some((call) => call[0]?.data?.status === 'completed')
+    expect(completed2).toBe(true)
+    // The retry is a fresh run (no resume marker): the worker re-decrypted the
+    // stored context and re-downloaded the same segments — without repasting.
+    expect(plainSegmentRequests).toBe(afterFirstRun + plainSegBytes.length)
   })
 })

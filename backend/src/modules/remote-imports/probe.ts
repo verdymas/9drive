@@ -47,6 +47,7 @@ import {
 } from './hls/manifest.js'
 import { validateRemoteUrl } from './ssrf.js'
 import { followRemoteUrl } from './url-downloader.js'
+import { hopHeaderResolver, type RemoteImportRequestContext } from './request-context.js'
 import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './hls/errors.js'
 
 export type HlsProbeSummary = {
@@ -131,8 +132,9 @@ function hlsHint(base: Pick<ProbeResult, 'mimeType' | 'finalUrl' | 'originalUrl'
 /**
  * Request profile for probing HLS-looking sources (manifest GET) and for the
  * direct-file probe (HEAD / ranged GET). 9Drive never sends browser cookies,
- * Authorization, Origin or Referer — a source that requires them is answered
- * with a clear unsupported/authentication error instead of guessing.
+ * Authorization, Origin or Referer unless the user explicitly supplied a
+ * request context — a source that requires them is answered with a clear
+ * unsupported/authentication error instead of guessing.
  */
 const PROBE_MANIFEST_HEADERS: Record<string, string> = {
   ...HLS_MANIFEST_PROFILE_HEADERS,
@@ -142,9 +144,11 @@ const PROBE_MANIFEST_HEADERS: Record<string, string> = {
 /**
  * Probe a remote URL without downloading the file. Returns the detected
  * filename (always sanitized), its source, response metadata, and an HLS
- * classification. Throws `AppError` for validation / SSRF / network failures.
+ * classification. `requestContext` (user-supplied referer/origin/user-agent/
+ * cookie) is applied to every probe request through the centralized policy.
+ * Throws `AppError` for validation / SSRF / network failures.
  */
-export async function probeRemoteUrl(rawUrl: string, correlationId: string): Promise<ProbeResult> {
+export async function probeRemoteUrl(rawUrl: string, correlationId: string, requestContext?: RemoteImportRequestContext): Promise<ProbeResult> {
   const originalUrl = await validateRemoteUrl(rawUrl)
   const originalUrlHref = originalUrl.href
   const log = (message: string, extra: Record<string, string | number | boolean> = {}) => {
@@ -162,6 +166,7 @@ export async function probeRemoteUrl(rawUrl: string, correlationId: string): Pro
   try {
     const head = await followRemoteUrl(originalUrlHref, {
       method: 'HEAD',
+      getHopHeaders: hopHeaderResolver(originalUrlHref, requestContext),
       onResponse: async (res, finalUrl) => {
         headStatus = res.statusCode
         return buildProbeResult(originalUrlHref, finalUrl, res, null)
@@ -182,7 +187,7 @@ export async function probeRemoteUrl(rawUrl: string, correlationId: string): Pro
     // A successful HEAD with a server-supplied filename and no HLS hint is a
     // complete probe — no body fetch is needed.
     if (headHasCdFilename && !hlsHint(headResult, null)) {
-      return finalizeProbe(headResult, null, log)
+      return finalizeProbe(headResult, null, log, requestContext)
     }
   } else {
     log('head_rejected', { status: headStatus, redirects: headRedirects, host: headResult ? hostOf(headResult.finalUrl) : '' })
@@ -190,9 +195,9 @@ export async function probeRemoteUrl(rawUrl: string, correlationId: string): Pro
 
   // ── Phase 2: probable HLS? → one bounded manifest GET; else ranged GET. ──
   if (headResult && hlsHint(headResult, null)) {
-    return finalizeProbe(headResult, null, log)
+    return finalizeProbe(headResult, null, log, requestContext)
   }
-  return getProbe(originalUrlHref, log)
+  return getProbe(originalUrlHref, log, requestContext)
 }
 
 /** Hostname of a (redacted) URL — the only URL data ever logged. */
@@ -213,12 +218,14 @@ function hostOf(url: string): string {
 async function getProbe(
   originalUrlHref: string,
   log: (message: string, extra?: Record<string, string | number | boolean>) => void,
+  requestContext?: RemoteImportRequestContext,
 ): Promise<ProbeResult> {
   let sampledPrefix = ''
   try {
     const ranged = await followRemoteUrl(originalUrlHref, {
       method: 'GET',
       headers: { Range: 'bytes=0-0' },
+      getHopHeaders: hopHeaderResolver(originalUrlHref, requestContext),
       onResponse: async (res, finalUrl) => {
         // Servers that ignore the Range and stream a 200 with the whole body
         // are aborted once we have a small prefix — we only need headers.
@@ -236,7 +243,7 @@ async function getProbe(
       },
     })
     log('ranged GET ok', { redirects: ranged.redirectCount })
-    return await finalizeProbe(ranged.result, sampledPrefix, log)
+    return await finalizeProbe(ranged.result, sampledPrefix, log, requestContext)
   } catch (getError) {
     log('ranged GET rejected', { code: getError instanceof AppError ? getError.code : 'network' })
     if (getError instanceof AppError) throw getError
@@ -295,6 +302,7 @@ async function finalizeProbe(
   base: ProbeResult,
   sampledPrefix: string | null,
   log: (message: string, extra?: Record<string, string | number | boolean>) => void,
+  requestContext?: RemoteImportRequestContext,
 ): Promise<ProbeResult> {
   const hint = hlsHint(base, sampledPrefix)
   if (!hint) return base
@@ -305,7 +313,7 @@ async function finalizeProbe(
   // so the probe route returns the normal structured error envelope.
   let fetch: { body: string; finalUrl: string }
   try {
-    fetch = await fetchManifestForProbe(base.sourceUrlForFetch)
+    fetch = await fetchManifestForProbe(base.sourceUrlForFetch, { requestContext })
   } catch (manifestError) {
     if (manifestError instanceof AppError) {
       log('manifest GET rejected', { code: manifestError.code, host: hostOf(base.finalUrl) })

@@ -29,6 +29,7 @@ import path from 'node:path'
 import { env } from '../../../config/env.js'
 import { AppError } from '../../../utils/app-error.js'
 import { followRemoteUrl } from '../url-downloader.js'
+import { hopHeaderResolver, type RemoteImportRequestContext } from '../request-context.js'
 import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './errors.js'
 
 export type MaterializeOptions = {
@@ -115,16 +116,23 @@ export async function downloadResource(
     maxBytes?: bigint
     signal?: AbortSignal
     kind?: 'segment' | 'map' | 'key' | 'playlist' | 'audio'
+    requestContext?: RemoteImportRequestContext
   },
 ): Promise<bigint> {
   const maxBytes = opts.maxBytes ?? BigInt(env.REMOTE_IMPORT_MAX_BYTES)
   let written = 0n
   await followRemoteUrl(url, {
+    getHopHeaders: hopHeaderResolver(url, opts.requestContext),
     onResponse: async (res) => {
-      // An authenticated source (401/403 on a resource the manifest references)
-      // is classified as unsupported — 9Drive never forwards cookies/credentials
-      // (§14), so the only honest answer is a stable error, not a retry storm.
+      // With a request context attached, a 401/403 means the user's context or
+      // signed URL has expired (§23). Without context, an authenticated source
+      // is classified as unsupported — 9Drive never forwards credentials it
+      // was not explicitly given, so the only honest answer is a stable error,
+      // not a retry storm.
       if (res.statusCode === 401 || res.statusCode === 403) {
+        if (opts.requestContext) {
+          throw new AppError(HLS_ERROR_CODES.REMOTE_SOURCE_ACCESS_EXPIRED, HLS_ERROR_MESSAGES.REMOTE_SOURCE_ACCESS_EXPIRED, res.statusCode)
+        }
         throw new AppError(HLS_ERROR_CODES.HLS_AUTHENTICATED_SOURCE_UNSUPPORTED, HLS_ERROR_MESSAGES.HLS_AUTHENTICATED_SOURCE_UNSUPPORTED, 400)
       }
       if (res.statusCode >= 400) throw new AppError('DOWNLOAD_HTTP_ERROR', `Remote server responded ${res.statusCode}.`, 502)
@@ -159,13 +167,14 @@ export async function downloadByteRange(
   offset: number,
   length: number,
   targetLocalPath: string,
-  opts: { signal?: AbortSignal },
+  opts: { signal?: AbortSignal; requestContext?: RemoteImportRequestContext },
 ): Promise<bigint> {
   const rangeHeader = `bytes=${offset}-${offset + length - 1}`
   let written = 0n
   let saw206 = false
   await followRemoteUrl(url, {
     headers: { Range: rangeHeader },
+    getHopHeaders: hopHeaderResolver(url, opts.requestContext),
     onResponse: async (res) => {
       if (res.statusCode === 206) {
         const cr = res.headers['content-range']

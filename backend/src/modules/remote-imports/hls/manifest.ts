@@ -22,6 +22,7 @@ import crypto from 'node:crypto'
 import { env } from '../../../config/env.js'
 import { AppError } from '../../../utils/app-error.js'
 import { followRemoteUrl } from '../url-downloader.js'
+import { hopHeaderResolver, type RemoteImportRequestContext } from '../request-context.js'
 import { normalizeSegments, type NormalizedSegment } from './segments.js'
 import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './errors.js'
 
@@ -160,12 +161,32 @@ function parseCodecs(codecAttr: string | undefined): string[] {
 
 /**
  * Request profile for probing and fetching HLS manifests. 9Drive never sends
- * browser cookies, Authorization, Origin or Referer — an authenticated source
- * is answered with a clear unsupported-auth error instead of guessing.
+ * browser cookies, Authorization, Origin or Referer unless the user explicitly
+ * supplied a request context (see request-context.ts) — an authenticated
+ * source without context is answered with a clear auth error instead of
+ * guessing.
  */
 export const HLS_MANIFEST_PROFILE_HEADERS: Record<string, string> = {
   Accept: 'application/vnd.apple.mpegurl, application/x-mpegurl, audio/mpegurl, */*',
   'Accept-Encoding': 'identity',
+}
+
+/**
+ * Context-aware status mapping (spec §23): with a request context attached, a
+ * 401/403 means the user's context (or signed URL) has expired — the spec
+ * message tells them to capture a fresh media request. Without context the
+ * caller's own mapping (auth-required / forbidden) applies.
+ */
+function contextAwareStatusError(statusCode: number, hasContext: boolean): AppError {
+  if (hasContext && (statusCode === 401 || statusCode === 403)) {
+    return new AppError(HLS_ERROR_CODES.REMOTE_SOURCE_ACCESS_EXPIRED, HLS_ERROR_MESSAGES.REMOTE_SOURCE_ACCESS_EXPIRED, statusCode)
+  }
+  switch (statusCode) {
+    case 401: return new AppError(HLS_ERROR_CODES.REMOTE_SOURCE_AUTHENTICATION_REQUIRED, HLS_ERROR_MESSAGES.REMOTE_SOURCE_AUTHENTICATION_REQUIRED, 401)
+    case 403: return new AppError(HLS_ERROR_CODES.HLS_MANIFEST_FORBIDDEN, HLS_ERROR_MESSAGES.HLS_MANIFEST_FORBIDDEN, 403)
+    case 404: return new AppError(HLS_ERROR_CODES.HLS_MANIFEST_NOT_FOUND, HLS_ERROR_MESSAGES.HLS_MANIFEST_NOT_FOUND, 404)
+    default: return new AppError(HLS_ERROR_CODES.HLS_MANIFEST_FETCH_FAILED, HLS_ERROR_MESSAGES.HLS_MANIFEST_FETCH_FAILED, 502)
+  }
 }
 
 /**
@@ -179,7 +200,7 @@ export const HLS_MANIFEST_PROFILE_HEADERS: Record<string, string> = {
  */
 export async function fetchManifestForProbe(
   url: string,
-  opts: { maxBytes?: number; signal?: AbortSignal } = {},
+  opts: { maxBytes?: number; signal?: AbortSignal; requestContext?: RemoteImportRequestContext } = {},
 ): Promise<{ body: string; finalUrl: string }> {
   const maxBytes = opts.maxBytes ?? env.REMOTE_IMPORT_HLS_MAX_MANIFEST_BYTES
   let collected = 0
@@ -187,14 +208,10 @@ export async function fetchManifestForProbe(
   try {
     const result = await followRemoteUrl(url, {
       headers: HLS_MANIFEST_PROFILE_HEADERS,
+      getHopHeaders: hopHeaderResolver(url, opts.requestContext),
       onResponse: async (res, finalURL) => {
         if (res.statusCode >= 400) {
-          switch (res.statusCode) {
-            case 401: throw new AppError(HLS_ERROR_CODES.REMOTE_SOURCE_AUTHENTICATION_REQUIRED, HLS_ERROR_MESSAGES.REMOTE_SOURCE_AUTHENTICATION_REQUIRED, 401)
-            case 403: throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_FORBIDDEN, HLS_ERROR_MESSAGES.HLS_MANIFEST_FORBIDDEN, 403)
-            case 404: throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_NOT_FOUND, HLS_ERROR_MESSAGES.HLS_MANIFEST_NOT_FOUND, 404)
-            default: throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_FETCH_FAILED, HLS_ERROR_MESSAGES.HLS_MANIFEST_FETCH_FAILED, 502)
-          }
+          throw contextAwareStatusError(res.statusCode, Boolean(opts.requestContext))
         }
         if (typeof (res.body as { on?: unknown }).on === 'function') {
           (res.body as unknown as { on: (event: 'error', listener: () => void) => void }).on('error', () => undefined)
@@ -247,12 +264,21 @@ function isManifestTimeoutError(error: unknown): boolean {
 export async function fetchManifest(
   url: string,
   maxBytes: number = env.REMOTE_IMPORT_HLS_MAX_MANIFEST_BYTES,
+  requestContext?: RemoteImportRequestContext,
 ): Promise<{ body: string; finalUrl: string }> {
   let collected = 0
   let body = ''
   const result = await followRemoteUrl(url, {
+    getHopHeaders: hopHeaderResolver(url, requestContext),
     onResponse: async (res, finalURL) => {
-      if (res.statusCode >= 400) throw new AppError('DOWNLOAD_HTTP_ERROR', `Remote server responded ${res.statusCode}.`, 502)
+      if (res.statusCode >= 400) {
+        // Worker parity with the probe: a context-bearing 401/403 is an
+        // expired source/context, not a plain download error (§23).
+        if (requestContext && (res.statusCode === 401 || res.statusCode === 403)) {
+          throw new AppError(HLS_ERROR_CODES.REMOTE_SOURCE_ACCESS_EXPIRED, HLS_ERROR_MESSAGES.REMOTE_SOURCE_ACCESS_EXPIRED, res.statusCode)
+        }
+        throw new AppError('DOWNLOAD_HTTP_ERROR', `Remote server responded ${res.statusCode}.`, 502)
+      }
       if (typeof (res.body as { on?: unknown }).on === 'function') {
         (res.body as unknown as { on: (event: 'error', listener: () => void) => void }).on('error', () => undefined)
       }

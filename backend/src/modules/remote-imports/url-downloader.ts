@@ -17,8 +17,11 @@ import { resolveAndValidateHost, urlHasCredentials, validateRemoteUrl } from './
  *    never a re-resolved hostname),
  *  - keep the Host header and TLS server name equal to the URL's host (we
  *    never rewrite them to the IP),
- *  - forward no credentials across hops (no auth / cookie / original-query
- *    leakage),
+ *  - forward no credentials across hops by default (no auth / cookie /
+ *    original-query leakage). The ONLY exception is the Remote Import request
+ *    context (referer/origin/user-agent/cookie) the user explicitly supplied:
+ *    `getHopHeaders` recomputes the allowlisted headers for EACH hop and the
+ *    cookie is dropped the moment the host changes (see request-context.ts),
  *  - cap redirects, enforce max bytes and idle timeout during streaming.
  *
  * Redirects are walked manually (not via undici's built-in follow) so every
@@ -73,6 +76,13 @@ export async function followRemoteUrl<T>(
   options: {
     method?: 'GET' | 'HEAD'
     headers?: Record<string, string>
+    /**
+     * Per-hop header resolver for the Remote Import request context. Called
+     * with the CURRENT hop URL AFTER SSRF validation, so sensitive headers are
+     * recomputed for every redirect (spec §14) and cookie scope is enforced
+     * against the current target. Absent → the default no-credential behavior.
+     */
+    getHopHeaders?: (hopUrl: URL) => Record<string, string> | undefined
     onResponse: (
       res: { statusCode: number; headers: Record<string, string>; body: AsyncIterable<Uint8Array> },
       finalUrl: string,
@@ -82,6 +92,7 @@ export async function followRemoteUrl<T>(
   const { onResponse } = options
   const method = options.method ?? 'GET'
   const requestHeaders = options.headers
+  const getHopHeaders = options.getHopHeaders
   let currentUrl = startUrl
   let redirectCount = 0
 
@@ -92,8 +103,12 @@ export async function followRemoteUrl<T>(
       'User-Agent': '9Drive-RemoteImport/1.0',
     }
     if (requestHeaders) Object.assign(headers, requestHeaders)
-    // Never forward Authorization or Cookie from `startUrl` — only headers the
-    // caller explicitly supplies for the CURRENT hop are allowed.
+    // Request-context headers (explicitly authorized by the user) are merged
+    // per hop — the cookie is dropped automatically when the host differs.
+    if (getHopHeaders) {
+      const hopHeaders = getHopHeaders(url)
+      if (hopHeaders) Object.assign(headers, hopHeaders)
+    }
     const res = await request(url.href, {
       method,
       headers,

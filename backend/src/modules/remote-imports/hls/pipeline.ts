@@ -31,6 +31,7 @@ import * as ffmpeg from './ffmpeg.js'
 import { verifyOutput, type MediaVerification } from './verify.js'
 import { ensureJobDir, segmentLocalName } from './materializer.js'
 import { writeResumeMarker } from './job-dir.js'
+import { assertChildAccessible, type RemoteImportRequestContext } from '../request-context.js'
 import type { NormalizedSegment } from './segments.js'
 import { hlsDerivedFileName, fileNameHasExtension } from './output.js'
 
@@ -46,6 +47,12 @@ export type HlsPipelineOptions = {
   selection: HlsSelection
   isLive: boolean
   recordingDurationSeconds?: number
+  /**
+   * User-supplied request context (referer/origin/user-agent/cookie) applied to
+   * the master manifest, child playlists, segments, maps, keys and live
+   * refresh — everything passes through the centralized header policy.
+   */
+  requestContext?: RemoteImportRequestContext
   /**
    * Convert-only retry: skip the master-manifest fetch, variant/audio
    * selection and live poll — reuse the already-materialized segments on disk.
@@ -102,8 +109,11 @@ function assertNotAborted(signal: AbortSignal | undefined) {
  * body (the body drives the hls-parser round-trip serialization of the
  * rewritten local playlist).
  */
-async function resolveMediaSegments(playlistUrl: string): Promise<{ segments: NormalizedSegment[]; body: string }> {
-  const fetched = await fetchMediaPlaylistSegments(playlistUrl)
+async function resolveMediaSegments(
+  playlistUrl: string,
+  requestContext?: RemoteImportRequestContext,
+): Promise<{ segments: NormalizedSegment[]; body: string }> {
+  const fetched = await fetchMediaPlaylistSegments(playlistUrl, requestContext)
   if (fetched.segments.length === 0) throw new AppError(HLS_ERROR_CODES.HLS_NO_VALID_VARIANT, HLS_ERROR_MESSAGES.HLS_NO_VALID_VARIANT, 400)
   return fetched
 }
@@ -115,7 +125,7 @@ async function resolveMediaSegments(playlistUrl: string): Promise<{ segments: No
  * `segmentCache` until `recordingDurationSeconds` of media time, then remuxed.
  */
 export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipelineResult> {
-  const { jobDir, sourceUrl, selection, isLive, signal, recordingDurationSeconds, resume } = opts
+  const { jobDir, sourceUrl, selection, isLive, signal, recordingDurationSeconds, resume, requestContext } = opts
   await ensureJobDir(jobDir)
 
   // Resolved during the run; needed to write the resume marker on remux failure.
@@ -143,7 +153,7 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     expectAudio = resume.expectAudio
     container = resume.container
 
-    const fetchedVideo = await resolveMediaSegments(videoPlaylistUrl)
+    const fetchedVideo = await resolveMediaSegments(videoPlaylistUrl, requestContext)
     allVideoSegments = fetchedVideo.segments
     videoPlaylistBody = fetchedVideo.body
     segmentCache = buildSegmentCacheSeed(jobDir, allVideoSegments, 'video')
@@ -151,7 +161,7 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     // ── 1. Fetch + parse the ORIGINAL source manifest. ─────────────────────
     let sourceInfo: HlsManifestInfo
     try {
-      const { body, finalUrl } = await fetchManifest(sourceUrl)
+      const { body, finalUrl } = await fetchManifest(sourceUrl, env.REMOTE_IMPORT_HLS_MAX_MANIFEST_BYTES, requestContext)
       sourceInfo = parseManifest(body, finalUrl)
     } catch (error) {
       if (error instanceof AppError) throw error
@@ -170,7 +180,7 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     }
 
     // ── 3. Fetch the (first) media playlist snapshot. ───────────────────────
-    const firstVideoFetched = await resolveMediaSegments(videoPlaylistUrl)
+    const firstVideoFetched = await resolveMediaSegments(videoPlaylistUrl, requestContext)
     const firstVideoSegments = firstVideoFetched.segments
     videoPlaylistBody = firstVideoFetched.body
     allVideoSegments = [...firstVideoSegments]
@@ -186,7 +196,7 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
 
       while (true) {
         assertNotAborted(signal)
-        const snapshot = await resolveMediaSegments(videoPlaylistUrl)
+        const snapshot = await resolveMediaSegments(videoPlaylistUrl, requestContext)
         if (snapshot.segments.length > firstVideoSegments.length) {
           allVideoSegments.push(...snapshot.segments.slice(firstVideoSegments.length))
         }
@@ -202,7 +212,7 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     // Optional alternate audio.
     if (selectedAudio?.playlistUrl) {
       audioPlaylistUrl = selectedAudio.playlistUrl
-      const audioFetched = await resolveMediaSegments(audioPlaylistUrl)
+      const audioFetched = await resolveMediaSegments(audioPlaylistUrl, requestContext)
       await materializeMedia({
         jobDir,
         mediaLabel: 'audio',
@@ -210,6 +220,8 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
         originalBody: audioFetched.body,
         segmentCache,
         signal,
+        requestContext,
+        sourceUrl,
       })
     }
 
@@ -233,6 +245,8 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     originalBody: videoPlaylistBody,
     segmentCache,
     signal,
+    requestContext,
+    sourceUrl,
     onProgress: (p) => opts.onProgress?.({
       stage: isLive ? 'live' : 'segments',
       segmentsCompleted: p.segmentsCompleted,
@@ -254,6 +268,8 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
       originalBody: audioFetched.body,
       segmentCache: audioCache,
       signal,
+      requestContext,
+      sourceUrl,
     })
   }
 

@@ -58,6 +58,15 @@ const envSchema = z.object({
   REMOTE_IMPORT_HLS_MAX_HEIGHT: z.coerce.number().default(2160),
   REMOTE_IMPORT_HLS_MAX_BANDWIDTH: z.coerce.number().default(0),
   REMOTE_IMPORT_HLS_MAX_KEY_BYTES: z.coerce.number().default(65536),
+  // Request context (Referer/Origin/User-Agent/Cookie) for protected sources.
+  // When disabled, context-bearing probe/create requests are REJECTED (403) —
+  // never silently dropped, which would break the download.
+  REMOTE_IMPORT_REQUEST_CONTEXT_ENABLED: z.coerce.boolean().default(true),
+  // Paste-as-cURL input mode. Same fail-closed semantics when disabled.
+  REMOTE_IMPORT_CURL_INPUT_ENABLED: z.coerce.boolean().default(true),
+  REMOTE_IMPORT_REQUEST_CONTEXT_MAX_CURL_BYTES: z.coerce.number().default(65536),
+  REMOTE_IMPORT_REQUEST_CONTEXT_MAX_COOKIE_BYTES: z.coerce.number().default(16384),
+  REMOTE_IMPORT_REQUEST_CONTEXT_COOKIE_SCOPE: z.enum(['source-host']).default('source-host'),
   // Storage Sync (Provider → Virtual reconciliation). Account-level and
   // within-account folder-listing concurrency are bounded separately so Sync
   // All never launches unlimited provider scans simultaneously.

@@ -62,6 +62,7 @@ function deferredProbe(): { promise: Promise<{ data: RemoteImports.ProbeResult }
 
 beforeEach(() => {
   vi.spyOn(RemoteImports, 'probeRemoteUrl').mockImplementation(() => new Promise(() => {}))
+  vi.spyOn(RemoteImports, 'parseCurl').mockImplementation(() => new Promise(() => {}))
   vi.spyOn(RemoteImports, 'createRemoteImport').mockResolvedValue({} as never)
 })
 
@@ -352,6 +353,165 @@ describe('RemoteImportModal probe behaviour', () => {
       await user.click(screen.getByRole('button', { name: /start import/i }))
       await waitFor(() => expect(create).toHaveBeenCalled())
       expect(create.mock.calls[0][0].hls).toMatchObject({ sourceType: 'hls_media', isLive: true, recordingDurationSeconds: 1800 })
+    })
+  })
+
+  describe('request context + paste-as-cURL (spec §36)', () => {
+    it('switches between URL and cURL modes', async () => {
+      renderModal()
+      expect(screen.getByLabelText(/file url/i)).toBeInTheDocument()
+      expect(screen.queryByLabelText(/cURL command/i)).not.toBeInTheDocument()
+      const user = userEvent.setup()
+      await user.click(screen.getByRole('button', { name: 'cURL' }))
+      expect(screen.getByLabelText(/cURL command/i)).toBeInTheDocument()
+      expect(screen.queryByLabelText(/file url/i)).not.toBeInTheDocument()
+      await user.click(screen.getByRole('button', { name: 'URL' }))
+      expect(screen.getByLabelText(/file url/i)).toBeInTheDocument()
+    })
+
+    it('keeps Advanced Request Options collapsed by default; Cookie is a password input', async () => {
+      renderModal()
+      // Collapsed: the referer field is hidden (inside the collapsed region).
+      expect(screen.queryByLabelText(/referer/i)).not.toBeInTheDocument()
+      const user = userEvent.setup()
+      await user.click(screen.getByRole('button', { name: /advanced request options/i }))
+      expect(screen.getByLabelText(/referer/i)).toBeInTheDocument()
+      expect(screen.getByLabelText(/cookie/i)).toHaveAttribute('type', 'password')
+      expect(screen.getByLabelText(/cookie/i)).toHaveAttribute('autocomplete', 'off')
+    })
+
+    it('sends the request context with the probe and with the create request', async () => {
+      const probe = vi.spyOn(RemoteImports, 'probeRemoteUrl')
+      probe.mockResolvedValue({ data: makeProbeResult() })
+      const create = vi.spyOn(RemoteImports, 'createRemoteImport').mockResolvedValue({} as never)
+      renderModal()
+      const user = userEvent.setup()
+      await user.click(screen.getByRole('button', { name: /advanced request options/i }))
+      await user.type(screen.getByLabelText(/referer/i), 'https://site.example/watch/1')
+      await user.type(screen.getByLabelText(/cookie/i), 'session=valid')
+      await typeUrl('https://example.com/protected/file.bin')
+      await waitFor(() => expect(probe).toHaveBeenCalled())
+      // The probe carries the context as its 3rd argument.
+      expect(probe.mock.calls.at(-1)?.[2]).toEqual({ referer: 'https://site.example/watch/1', cookie: 'session=valid' })
+      await user.click(screen.getByRole('button', { name: /start import/i }))
+      await waitFor(() => expect(create).toHaveBeenCalled())
+      expect(create.mock.calls[0][0]).toMatchObject({
+        sourceMode: 'url',
+        url: 'https://example.com/protected/file.bin',
+        requestContext: { referer: 'https://site.example/watch/1', cookie: 'session=valid' },
+      })
+    })
+
+    it('omits requestContext from create when no advanced options were entered', async () => {
+      const probe = vi.spyOn(RemoteImports, 'probeRemoteUrl')
+      probe.mockResolvedValue({ data: makeProbeResult({ fileName: 'plain.bin' }) })
+      const create = vi.spyOn(RemoteImports, 'createRemoteImport').mockResolvedValue({} as never)
+      renderModal()
+      await typeUrl('https://example.com/plain.bin')
+      await waitFor(() => expect(screen.getByDisplayValue('plain.bin')).toBeInTheDocument())
+      await userEvent.click(screen.getByRole('button', { name: /start import/i }))
+      await waitFor(() => expect(create).toHaveBeenCalled())
+      expect(create.mock.calls[0][0].sourceMode).toBe('url')
+      expect(create.mock.calls[0][0].requestContext).toBeUndefined()
+    })
+
+    it('cURL mode: shows the parse summary chips from the backend parse', async () => {
+      const parse = vi.spyOn(RemoteImports, 'parseCurl')
+      parse.mockResolvedValue({
+        data: {
+          url: 'https://fixture.test/protected/master.m3u8?token=abc',
+          requestContext: { attached: true, referer: true, origin: true, userAgent: true, cookie: true },
+          unsupportedOptions: [],
+        },
+      })
+      renderModal()
+      const user = userEvent.setup()
+      await user.click(screen.getByRole('button', { name: 'cURL' }))
+      const textarea = screen.getByLabelText(/cURL command/i)
+      await user.type(
+        textarea,
+        "curl 'https://fixture.test/protected/master.m3u8?token=abc' -H 'Referer: https://site.example/watch/1' -H 'Origin: https://site.example' -H 'User-Agent: Mozilla/5.0 Test' -H 'Cookie: session=valid'",
+      )
+      expect(await screen.findByText(/command parsed/i)).toBeInTheDocument()
+      expect(screen.getByText('URL detected')).toBeInTheDocument()
+      expect(screen.getByText('Referer detected')).toBeInTheDocument()
+      expect(screen.getByText('Origin detected')).toBeInTheDocument()
+      expect(screen.getByText('User-Agent detected')).toBeInTheDocument()
+      expect(screen.getByText('Cookie detected')).toBeInTheDocument()
+      // The parsed values are NEVER echoed back — only labels. (The textarea
+      // legitimately holds the typed command, so match exact standalone text:
+      // an echoed value would be its own element.)
+      expect(screen.queryByText('session=valid', { exact: true })).not.toBeInTheDocument()
+      expect(screen.queryByText('token=abc', { exact: true })).not.toBeInTheDocument()
+    })
+
+    it('cURL mode: submit sends the raw command; the server re-parses (spec §19)', async () => {
+      const parse = vi.spyOn(RemoteImports, 'parseCurl')
+      parse.mockResolvedValue({
+        data: {
+          url: 'https://fixture.test/protected/master.m3u8',
+          requestContext: { attached: true, referer: true, origin: false, userAgent: false, cookie: true },
+          unsupportedOptions: [],
+        },
+      })
+      const create = vi.spyOn(RemoteImports, 'createRemoteImport').mockResolvedValue({} as never)
+      renderModal()
+      const user = userEvent.setup()
+      await user.click(screen.getByRole('button', { name: 'cURL' }))
+      const textarea = screen.getByLabelText(/cURL command/i)
+      await user.type(textarea, "curl 'https://fixture.test/protected/master.m3u8' -H 'Referer: https://site.example/watch/1' -H 'Cookie: session=valid'")
+      await waitFor(() => expect(screen.getByText(/command parsed/i)).toBeInTheDocument())
+      await user.click(screen.getByRole('button', { name: /start import/i }))
+      await waitFor(() => expect(create).toHaveBeenCalled())
+      expect(create.mock.calls[0][0]).toMatchObject({
+        sourceMode: 'curl',
+        curl: "curl 'https://fixture.test/protected/master.m3u8' -H 'Referer: https://site.example/watch/1' -H 'Cookie: session=valid'",
+      })
+      // The client never derives fields from the command — the server does.
+      expect(create.mock.calls[0][0].url).toBeUndefined()
+      expect(create.mock.calls[0][0].requestContext).toBeUndefined()
+    })
+
+    it('cURL mode: shows the parse error inline when the backend rejects the command', async () => {
+      const parse = vi.spyOn(RemoteImports, 'parseCurl')
+      const err = new Error('The pasted cURL command uses an option that is not supported.') as Error & { code?: string }
+      err.code = 'REMOTE_IMPORT_CURL_UNSAFE_OPTION'
+      parse.mockRejectedValueOnce(err)
+      renderModal()
+      const user = userEvent.setup()
+      await user.click(screen.getByRole('button', { name: 'cURL' }))
+      await user.type(screen.getByLabelText(/cURL command/i), "curl 'https://example.com/f' -x http://proxy:8080")
+      expect(await screen.findByText(/uses an option that is not supported/i)).toBeInTheDocument()
+    })
+
+    it('cURL mode: a re-typed command re-parses (latest wins)', async () => {
+      const parse = vi.spyOn(RemoteImports, 'parseCurl')
+      parse.mockResolvedValueOnce({
+        data: { url: 'https://example.com/a', requestContext: { attached: false, referer: false, origin: false, userAgent: false, cookie: false }, unsupportedOptions: [] },
+      })
+      parse.mockResolvedValueOnce({
+        data: { url: 'https://example.com/b', requestContext: { attached: true, referer: true, origin: false, userAgent: false, cookie: false }, unsupportedOptions: [] },
+      })
+      renderModal()
+      const user = userEvent.setup()
+      await user.click(screen.getByRole('button', { name: 'cURL' }))
+      const textarea = screen.getByLabelText(/cURL command/i)
+      await user.type(textarea, "curl 'https://example.com/a'")
+      await waitFor(() => expect(screen.getByText(/command parsed/i)).toBeInTheDocument())
+      expect(screen.queryByText('Referer detected')).not.toBeInTheDocument()
+      await user.clear(textarea)
+      await user.type(textarea, "curl 'https://example.com/b' -H 'Referer: https://example.com/x'")
+      await waitFor(() => expect(screen.getByText('Referer detected')).toBeInTheDocument())
+    })
+
+    it('maps an expired-context probe failure to the safe spec message', async () => {
+      const probe = vi.spyOn(RemoteImports, 'probeRemoteUrl')
+      const err = new Error('The source URL or request context may have expired. Capture a fresh media request and try again.') as Error & { code?: string }
+      err.code = 'REMOTE_SOURCE_ACCESS_EXPIRED'
+      probe.mockRejectedValueOnce(err)
+      renderModal()
+      await typeUrl('https://example.com/expired.m3u8')
+      await waitFor(() => expect(screen.getByText(/capture a fresh media request/i)).toBeInTheDocument())
     })
   })
 })

@@ -57,10 +57,15 @@ export type RemoteImportItem = {
   remuxProgress?: number | null
   outputDurationSeconds?: number | null
   outputCodecSummary?: string | null
+  /** Boolean-only summary of an attached request context (never the values). */
+  requestContext?: RequestContextSummary
 }
 
 export type CreateRemoteImportInput = {
-  url: string
+  sourceMode?: 'url' | 'curl'
+  url?: string
+  /** Paste-as-cURL mode: raw command text (the backend parses it). */
+  curl?: string
   folderId?: string | null
   connectedAccountId?: string | null
   /** User-entered filename (wins over any detection). */
@@ -70,6 +75,39 @@ export type CreateRemoteImportInput = {
   mimeType?: string | null
   /** HLS import options; present only for HLS sources (from the probe). */
   hls?: HlsImportOptions
+  /**
+   * Optional access headers (Referer/Origin/User-Agent/Cookie) sent to the
+   * source host for protected media. Values are never echoed back by any API —
+   * the wire only ever carries `attached` booleans.
+   */
+  requestContext?: RequestContextInput
+}
+
+/** User-supplied access headers for a protected source (spec §6). */
+export type RequestContextInput = {
+  referer?: string
+  origin?: string
+  userAgent?: string
+  cookie?: string
+}
+
+/**
+ * Boolean-only summary of an attached request context (spec §19, §36). Values
+ * are never serialized — only which fields are attached.
+ */
+export type RequestContextSummary = {
+  attached: boolean
+  referer: boolean
+  origin: boolean
+  userAgent: boolean
+  cookie: boolean
+}
+
+/** Result of the backend-authoritative cURL parse (booleans only, §19). */
+export type ParsedCurlResult = {
+  url: string
+  requestContext: RequestContextSummary
+  unsupportedOptions: string[]
 }
 
 export type HlsImportOptions = {
@@ -133,13 +171,26 @@ export type ProbeResult = {
  * Ask the backend to inspect a remote URL (server-side only — the browser
  * never contacts the remote host). `signal` lets the caller cancel a
  * superseded probe; an aborted fetch rejects with an AbortError which the
- * modal ignores.
+ * modal ignores. `requestContext` carries the access headers a protected
+ * source needs; they never leave the backend.
  */
-export function probeRemoteUrl(url: string, signal?: AbortSignal) {
+export function probeRemoteUrl(url: string, signal?: AbortSignal, requestContext?: RequestContextInput) {
   return apiFetch<{ data: ProbeResult }>('/remote-imports/probe', {
     method: 'POST',
-    body: JSON.stringify({ url }),
+    body: JSON.stringify({ url, ...(requestContext ? { requestContext } : {}) }),
     signal,
+  })
+}
+
+/**
+ * Ask the backend to parse a pasted cURL command (server-side, authoritative —
+ * spec §19). Returns the extracted URL + boolean context summary; values are
+ * never echoed back. The backend never executes anything.
+ */
+export function parseCurl(input: string) {
+  return apiFetch<{ data: ParsedCurlResult }>('/remote-imports/parse-curl', {
+    method: 'POST',
+    body: JSON.stringify({ input }),
   })
 }
 

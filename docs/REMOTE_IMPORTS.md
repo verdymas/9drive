@@ -185,11 +185,71 @@ goes through the same gate:
   (scheme, credentials, DNS) before their socket opens; the redirect chain is
   capped by `REMOTE_IMPORT_MAX_REDIRECTS`.
 - **No credential forwarding**: `Authorization`/`Cookie` are never forwarded
-  across hops.
+  across hops. The only exception is the user-supplied request context
+  (Referer/Origin/User-Agent/Cookie — see below): those allowlisted headers are
+  recomputed per hop, and the Cookie is dropped the moment the target host
+  changes.
 - **Connect timeout** (`REMOTE_IMPORT_CONNECT_TIMEOUT_SECONDS`) and **idle
   timeout** (`REMOTE_IMPORT_IDLE_TIMEOUT_SECONDS`) bound each connection.
 - **Max size enforced while streaming**: even without `Content-Length`, the
   stream is counted and aborted at `REMOTE_IMPORT_MAX_BYTES`.
+
+## Request context (Referer / Origin / User-Agent / Cookie)
+
+Some protected sources (HLS streams, signed downloads) reject 9Drive's plain
+fetcher with `HLS_MANIFEST_FORBIDDEN` / 401 / 403 even though a browser can open
+them, because 9Drive deliberately sends no Referer/Origin/User-Agent/Cookie.
+The **Advanced Request Options** panel (Remote Import modal) lets the user
+supply those four values for a source; the same values can be pasted as a
+**cURL command** instead of a bare URL.
+
+### What is forwarded, and where
+
+- The context is applied through the **entire fetch graph**: master manifest,
+  child playlists, segments, `EXT-X-MAP`, AES-128 `EXT-X-KEY`, live-playlist
+  refresh, and direct files — everything funnels through the one shared secure
+  fetcher, which recomputes the headers for **every redirect hop**.
+- `User-Agent`, `Referer` and `Origin` are forwarded to every host.
+- `Cookie` is forwarded **only to the exact source origin** (scheme + host +
+  effective port). The moment a redirect or an HLS child points at any other
+  host, the cookie is dropped. A cross-origin HLS child with a source cookie set
+  is refused up front with `HLS_CHILD_AUTHENTICATION_REQUIRED` — 9Drive never
+  leaks the source cookie to another host to make a request work.
+- The cookie scope is anchored to the **original import URL**, never
+  re-anchored to a child or redirect URL.
+
+### Paste as cURL
+
+The backend parses the pasted command with a **pure tokenizer — nothing is ever
+executed** (no shell, no curl, no eval). It extracts exactly the URL and the
+four supported headers (`-H/--header`, `-A/--user-agent`, `-b/--cookie`), and
+rejects transport/tunnel options (`--proxy`, `--resolve`, `--connect-to`,
+`--interface`, `--unix-socket`, …), upload/data/form options (`--upload-file`,
+`--form`, `--data`, …), auth options (`-u`, `--oauth2-bearer`, `--basic`, `-k`,
+…), non-GET methods, multiple URLs, non-http(s) schemes, shell composition in
+unquoted tokens, and `Authorization:` headers (with a clear "not supported"
+message). The frontend only previews parse results; the server re-parses on
+create, so the server's parse is always authoritative.
+
+### Storage and secrecy
+
+- Values are validated (CR/LF injection rejected, per-field caps: Referer
+  ≤ 4096, Origin ≤ 2048, User-Agent ≤ 2048, Cookie ≤ 16384 bytes) and stored
+  **encrypted at rest** on the import row (`AES-256-GCM`,
+  `TOKEN_ENCRYPTION_KEY`).
+- Values are **never returned by any API** — responses carry only the boolean
+  summary `{ attached, referer, origin, userAgent, cookie }`, and the list UI
+  shows only a "Request context attached" badge.
+- Logs never include cookies, Authorization, signed query values, session ids
+  or tokens.
+- Retries keep the context automatically: the worker loads + decrypts it from
+  the DB row, never from the job payload — no repaste.
+- A context-bearing 401/403 maps to `REMOTE_SOURCE_ACCESS_EXPIRED` ("The source
+  URL or request context may have expired…") in both the probe and the worker,
+  so the user sees one consistent answer.
+- Non-goals (by design): no DRM bypass, no CAPTCHA/anti-bot bypass, no browser
+  automation, no automatic cookie extraction, no paywall bypass, no arbitrary
+  header injection, no shell execution.
 
 ## Secrets handling
 
@@ -218,6 +278,11 @@ All optional — defaults are shown. `REMOTE_IMPORT_ENABLED` defaults to `true`.
 | `REMOTE_IMPORT_TEMP_RETENTION_HOURS` | `24` | Stale temp-file sweep cutoff |
 | `REMOTE_IMPORT_PROGRESS_UPDATE_INTERVAL_MS` | `1000` | Progress write throttle |
 | `REMOTE_IMPORT_TEMP_DIR` | `./data/remote-import-tmp` | Temp staging directory |
+| `REMOTE_IMPORT_REQUEST_CONTEXT_ENABLED` | `true` | Request-context feature; context-bearing probe/create requests are rejected with `403` when off (never silently dropped) |
+| `REMOTE_IMPORT_CURL_INPUT_ENABLED` | `true` | Paste-as-cURL mode; cURL-mode requests are rejected with `403` when off |
+| `REMOTE_IMPORT_REQUEST_CONTEXT_MAX_CURL_BYTES` | `65536` | Byte cap for a pasted cURL command |
+| `REMOTE_IMPORT_REQUEST_CONTEXT_MAX_COOKIE_BYTES` | `16384` | Byte cap for a Cookie value |
+| `REMOTE_IMPORT_REQUEST_CONTEXT_COOKIE_SCOPE` | `source-host` | Cookie scope — only `source-host` (exact scheme+host+port) is supported |
 
 ## Docker
 

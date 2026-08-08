@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { CloudDownload, Loader2, Pause, RefreshCw, Trash2, Wand2 } from 'lucide-react'
+import { CloudDownload, Loader2, Lock, Pause, RefreshCw, Trash2, Wand2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { PageHeader } from '@/components/drive/PageHeader'
@@ -340,6 +340,12 @@ export function RemoteImportsPage() {
                         {item.completedAt ? ` · Completed ${formatDate(item.completedAt)}` : ''}
                         {item.attempt > 1 ? ` · Attempt ${item.attempt}` : ''}
                       </p>
+                      {item.requestContext?.attached ? (
+                        <p className="mt-0.5 inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500">
+                          <Lock className="h-3.5 w-3.5 text-slate-400" />
+                          Request context attached
+                        </p>
+                      ) : null}
                     </div>
 
                     {/* Actions column: shrink-0, stays inside the card */}

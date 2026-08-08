@@ -23,6 +23,7 @@ vi.mock('./ssrf.js', async (importOriginal) => {
 })
 
 import { followRemoteUrl } from './url-downloader.js'
+import { hopHeaderResolver } from './request-context.js'
 import { AppError } from '../../utils/app-error.js'
 
 const BODY = 'chunk-one;chunk-two;chunk-three'
@@ -31,12 +32,15 @@ const MIME = 'application/octet-stream'
 let server: http.Server
 let baseUrl: string
 const hits: number[] = []
+/** Headers received by the fixture server, one entry per request. */
+const receivedHeaders: Array<Record<string, string>> = []
 let redirectTarget = ''
 
 beforeAll(async () => {
   server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://x')
     hits.push(1)
+    receivedHeaders.push(Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, String(v)])))
     if (url.pathname === '/chunked') {
       res.writeHead(200, { 'Content-Type': MIME, 'Transfer-Encoding': 'chunked' })
       res.write(BODY.slice(0, 10))
@@ -85,6 +89,7 @@ beforeEach(() => {
   validationSpy.validateRemoteUrl.mockImplementation(async (raw: string) => new URL(raw))
   validationSpy.resolveAndValidateHost.mockImplementation(async (host: string) => host)
   hits.length = 0
+  receivedHeaders.length = 0
   redirectTarget = `${baseUrl}/final`
 })
 
@@ -145,5 +150,81 @@ describe('followRemoteUrl', () => {
     await expect(
       followRemoteUrl(`${baseUrl}/final`, { onResponse: async () => 0 }),
     ).rejects.toMatchObject({ code: 'SSRF_BLOCKED_ADDRESS' })
+  })
+})
+
+describe('followRemoteUrl with getHopHeaders (request-context forwarding)', () => {
+  const CONTEXT = { referer: 'https://site.example/watch/1', userAgent: 'Mozilla/5.0 Test', cookie: 'session=secret' }
+
+  /** Second fixture server on a DIFFERENT port — a different origin. */
+  let otherServer: http.Server
+  let otherBaseUrl: string
+  const otherHeaders: Array<Record<string, string>> = []
+
+  beforeAll(async () => {
+    otherServer = http.createServer((req, res) => {
+      otherHeaders.push(Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, String(v)])))
+      res.writeHead(200, { 'Content-Type': MIME })
+      res.end(Buffer.from(BODY))
+    })
+    await new Promise<void>((resolve) => otherServer.listen(0, '127.0.0.1', resolve))
+    const { port } = otherServer.address() as AddressInfo
+    otherBaseUrl = `http://127.0.0.1:${port}`
+  })
+
+  afterAll(async () => {
+    otherServer?.close()
+  })
+
+  beforeEach(() => {
+    otherHeaders.length = 0
+  })
+
+  it('merges the context headers per hop; same-host hop keeps the Cookie', async () => {
+    const resolver = hopHeaderResolver(`${baseUrl}/redirect`, CONTEXT)
+    await followRemoteUrl(`${baseUrl}/redirect`, {
+      getHopHeaders: resolver,
+      onResponse: async ({ body }) => {
+        for await (const _c of body) { /* consume */ }
+        return 0
+      },
+    })
+    // Two requests: the initial /redirect + the redirected /final, both on the
+    // same fixture host (127.0.0.1:port) => Cookie must be on BOTH.
+    expect(receivedHeaders.length).toBeGreaterThanOrEqual(2)
+    for (const headers of receivedHeaders) {
+      expect(headers['cookie']).toBe('session=secret')
+      expect(headers['referer']).toBe('https://site.example/watch/1')
+      expect(headers['user-agent']).toBe('Mozilla/5.0 Test')
+    }
+  })
+
+  it('drops the Cookie when a redirect crosses to a different port (spec §13)', async () => {
+    const resolver = hopHeaderResolver(`${baseUrl}/redirect`, CONTEXT)
+    redirectTarget = `${otherBaseUrl}/final` // different port => different origin key
+    await followRemoteUrl(`${baseUrl}/redirect`, {
+      getHopHeaders: resolver,
+      onResponse: async ({ body }) => {
+        for await (const _c of body) { /* consume */ }
+        return 0
+      },
+    })
+    // The source-host hop carried the Cookie...
+    expect(receivedHeaders[0]['cookie']).toBe('session=secret')
+    // ...but the cross-port hop did NOT (headers were recomputed per hop).
+    expect(otherHeaders[0]['cookie']).toBeUndefined()
+    // UA/Referer still forwarded cross-origin (spec §10/§11).
+    expect(otherHeaders[0]['referer']).toBe('https://site.example/watch/1')
+    expect(otherHeaders[0]['user-agent']).toBe('Mozilla/5.0 Test')
+  })
+
+  it('no-op when the resolver is undefined (existing callers unchanged)', async () => {
+    await followRemoteUrl(`${baseUrl}/final`, {
+      onResponse: async ({ body }) => {
+        for await (const _c of body) { /* consume */ }
+        return 0
+      },
+    })
+    expect(receivedHeaders[0]['cookie']).toBeUndefined()
   })
 })

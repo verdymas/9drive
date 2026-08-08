@@ -6,6 +6,7 @@ import { prisma } from '../../config/prisma.js'
 import { AppError } from '../../utils/app-error.js'
 import { createAuditLog } from '../../utils/audit.js'
 import { decryptText, encryptText } from '../../utils/crypto.js'
+import { decryptRequestContext, hopHeaderResolver, type RemoteImportRequestContext } from './request-context.js'
 import { ensureGoogleAppFolder, getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
 import { buildS3ObjectKey, getS3ConfigForAccount, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
 import { resolveUploadPlacement } from '../storage/upload-placement.service.js'
@@ -101,7 +102,12 @@ function logProgress(importId: string, stage: Stage, message: string) {
 }
 
 /** Fetch + stream a remote URL to a temp part file with byte cap and idle timeout. */
-async function downloadToTemp(importId: string, startUrl: string, maxBytes: bigint): Promise<{ finalUrl: string; tempPartPath: string; contentLength: bigint | null; supportsRange: boolean }> {
+async function downloadToTemp(
+  importId: string,
+  startUrl: string,
+  maxBytes: bigint,
+  requestContext?: RemoteImportRequestContext,
+): Promise<{ finalUrl: string; tempPartPath: string; contentLength: bigint | null; supportsRange: boolean }> {
   const partPath = await createTempPartFile(importId)
   let supportsRange = false
   let contentLength: bigint | null = null
@@ -109,6 +115,7 @@ async function downloadToTemp(importId: string, startUrl: string, maxBytes: bigi
   let totalBytes = 0n
 
   await followRemoteUrl(startUrl, {
+    getHopHeaders: hopHeaderResolver(startUrl, requestContext),
     onResponse: async (res) => {
       const rawLength = res.headers['content-length']
       if (rawLength) contentLength = BigInt(rawLength)
@@ -276,6 +283,7 @@ async function processHlsImport(
     hlsIsLive: boolean | null
     hlsRecordingDurationSeconds: number | null
     sourceUrlEncrypted: string
+    requestContextEncrypted: string | null
     fileId: string | null
     retryFromStage?: string | null
   },
@@ -284,6 +292,9 @@ async function processHlsImport(
   const userId = record.userId
   const folderId = record.folderId
   const sourceUrl = decryptText(record.sourceUrlEncrypted)
+  // The worker loads + decrypts the request context from the DB row (never the
+  // job payload), so a retry reuses it without the user repasting (spec §22).
+  const requestContext = decryptRequestContext(record.requestContextEncrypted) ?? undefined
 
   if (!env.REMOTE_IMPORT_HLS_ENABLED) {
     await markFailed(importId, 'HLS_DISABLED', 'HLS imports are disabled.')
@@ -393,6 +404,7 @@ async function processHlsImport(
       const pipeline = await runHlsPipeline({
         jobDir,
         sourceUrl,
+        requestContext,
         isLive: Boolean(record.hlsIsLive),
         recordingDurationSeconds: record.hlsRecordingDurationSeconds ?? undefined,
         selection: {
@@ -537,6 +549,7 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
   const fileName = sanitizeFileName(record.fileName)
   const mimeType = record.mimeType ?? 'application/octet-stream'
   const sourceUrl = decryptText(record.sourceUrlEncrypted)
+  const requestContext = decryptRequestContext(record.requestContextEncrypted) ?? undefined
   const maxBytes = BigInt(env.REMOTE_IMPORT_MAX_BYTES)
   const startedAt = Date.now()
   const jobTimeoutMs = env.REMOTE_IMPORT_JOB_TIMEOUT_HOURS * 60 * 60 * 1000
@@ -576,6 +589,7 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
     try {
       const probe = await followRemoteUrl(sourceUrl, {
         headers: { Range: 'bytes=0-0' },
+        getHopHeaders: hopHeaderResolver(sourceUrl, requestContext),
         onResponse: async (res) => {
           const length = res.headers['content-length']
           const supportsRange = res.headers['accept-ranges'] === 'bytes' || res.statusCode === 206
@@ -605,7 +619,7 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
       throw error
     }
 
-    const downloaded = await downloadToTemp(importId, finalUrl, maxBytes)
+    const downloaded = await downloadToTemp(importId, finalUrl, maxBytes, requestContext)
     finalUrl = downloaded.finalUrl
 
     assertWithinTimeout()
