@@ -37,7 +37,9 @@ export async function apiFetch<T>(path: string, options: ApiOptions = {}): Promi
   if (!response.ok) {
     const error = await response.json().catch(() => ({ message: response.statusText }))
     if (response.status === 401) clearAuthSession()
-    throw new Error(error.message ?? 'Request failed')
+    const err = new Error(error.message ?? 'Request failed') as Error & { code?: string }
+    if (typeof error.code === 'string') err.code = error.code
+    throw err
   }
 
   // 204 No Content (e.g. DELETE responses) has no body — don't try to parse it.

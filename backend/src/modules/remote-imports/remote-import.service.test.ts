@@ -74,7 +74,7 @@ vi.mock('../../config/prisma.js', () => ({ prisma: h.prismaMock }))
 vi.mock('./queue.js', () => ({
   enqueueRemoteImport: (...args: unknown[]) => h.enqueueSpy(...args),
   removeRemoteImportJob: vi.fn(async () => undefined),
-  remoteImportJobId: (importId: string, attempt: number) => `${importId}:${attempt}`,
+  remoteImportJobId: (importId: string, attempt: number) => `${importId}~${attempt}`,
 }))
 
 vi.mock('../../utils/audit.js', () => ({ createAuditLog: (...args: unknown[]) => h.auditSpy(...args) }))
@@ -128,7 +128,7 @@ import { retryRemoteConvert, retryRemoteImport } from './remote-import.service.j
  *  clear and replay into the next test. */
 function resetMocks() {
   vi.resetAllMocks()
-  ;(h.enqueueSpy as ReturnType<typeof vi.fn>).mockResolvedValue('import-1:2')
+  ;(h.enqueueSpy as ReturnType<typeof vi.fn>).mockResolvedValue('import-1~2')
   ;(h.prismaMock.remoteImport.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 })
   ;(h.prismaMock.remoteImport.update as ReturnType<typeof vi.fn>).mockImplementation(async ({ data }: { data: any }) => ({ ...h.baseRow, ...data }))
   ;(h.prismaMock.remoteImport.create as ReturnType<typeof vi.fn>).mockImplementation(async ({ data }: { data: any }) => ({ ...h.baseRow, ...data }))
@@ -283,7 +283,7 @@ describe('retryRemoteConvert', () => {
     const enqueue = h.enqueueSpy as ReturnType<typeof vi.fn>
     enqueue.mockImplementation(async () => {
       enqueueOrder.push('enqueue')
-      return 'import-1:2'
+      return 'import-1~2'
     })
     const updateMany = h.prismaMock.remoteImport.updateMany as ReturnType<typeof vi.fn>
     updateMany.mockImplementation(async (args: any) => {

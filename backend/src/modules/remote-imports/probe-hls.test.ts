@@ -137,13 +137,13 @@ describe('probeRemoteUrl HLS detection', () => {
     expect(result.hls).toBeNull()
   })
 
-  it('stays direct_file for an MP3-type M3U (plain M3U, no HLS tags)', async () => {
-    // `audio/x-mpegurl` is an HLS content-type, but the body is an ordinary
-    // MP3 M3U — classification must come from the BODY, not the header.
+  it('treats an HLS content-type with a plain-M3U body as an invalid manifest', async () => {
+    // `audio/x-mpegurl` is an HLS content-type → probable-HLS → a bounded
+    // manifest GET runs and the body must validate as #EXTM3U + HLS tags.
+    // An ordinary MP3 M3U answers with the HLS-compatible MIME but is not a
+    // valid HLS playlist — a STRUCTURED error, never a silent direct_file.
     contentType = 'audio/x-mpegurl'
     serveBody = '#EXTM3U\n#EXTINF:300,\nfile.mp3'
-    const result = await probeRemoteUrl(`${baseUrl}/audio`, 'corr-hls-5')
-    expect(result.sourceType).toBe('direct_file')
-    expect(result.hls).toBeNull()
+    await expect(probeRemoteUrl(`${baseUrl}/audio`, 'corr-hls-5')).rejects.toMatchObject({ code: 'HLS_INVALID_MANIFEST' })
   })
 })

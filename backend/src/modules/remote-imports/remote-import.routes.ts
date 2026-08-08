@@ -2,7 +2,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
 import { AppError } from '../../utils/app-error.js'
-import { probeRemoteUrl } from './probe.js'
+import { probeRemoteUrl, probeResultForWire } from './probe.js'
 import {
   cancelRemoteImport,
   createRemoteImport,
@@ -29,7 +29,8 @@ remoteImportRouter.post('/probe', requireAuth, async (req: AuthRequest, res, nex
     }).parse(req.body)
 
     const result = await probeRemoteUrl(body.url, req.user!.id)
-    return res.json({ data: result })
+    // The internal signed fetch URL must never cross the API boundary.
+    return res.json({ data: probeResultForWire(result) })
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ code: 'INVALID_REQUEST', message: error.issues[0]?.message ?? 'Invalid request.' })
     if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
@@ -66,6 +67,7 @@ const hlsOptionsSchema = z
       })
     }
   })
+  .nullable()
   .optional()
 
 remoteImportRouter.post('/', requireAuth, async (req: AuthRequest, res, next) => {

@@ -144,6 +144,37 @@ describe('RemoteImportModal probe behaviour', () => {
     await waitFor(() => expect(create).toHaveBeenCalled())
   })
 
+  it('maps an HLS manifest 403 to a safe message (never the raw error)', async () => {
+    const probe = vi.spyOn(RemoteImports, 'probeRemoteUrl')
+    const err = new Error('The source server rejected access to the HLS manifest.') as Error & { code?: string }
+    err.code = 'HLS_MANIFEST_FORBIDDEN'
+    probe.mockRejectedValueOnce(err)
+    renderModal()
+    await typeUrl('https://example.com/stream.m3u8')
+    await waitFor(() => expect(screen.getByText(/rejected access to the hls manifest/i)).toBeInTheDocument())
+    expect(screen.queryByText(/expected object, received null/i)).not.toBeInTheDocument()
+  })
+
+  it('maps an HLS manifest fetch failure to a safe message', async () => {
+    const probe = vi.spyOn(RemoteImports, 'probeRemoteUrl')
+    const err = new Error('The HLS manifest could not be read.') as Error & { code?: string }
+    err.code = 'HLS_MANIFEST_FETCH_FAILED'
+    probe.mockRejectedValueOnce(err)
+    renderModal()
+    await typeUrl('https://example.com/stream.m3u8')
+    await waitFor(() => expect(screen.getByText(/hls manifest could not be read/i)).toBeInTheDocument())
+  })
+
+  it('shows the generic manual-entry hint for unknown probe errors', async () => {
+    const probe = vi.spyOn(RemoteImports, 'probeRemoteUrl')
+    probe.mockRejectedValueOnce(new Error('Invalid input: expected object, received null'))
+    renderModal()
+    await typeUrl('https://example.com/stream.m3u8')
+    await waitFor(() => expect(screen.getByText(/file name could not be detected/i)).toBeInTheDocument())
+    // The raw Zod fragment must never surface.
+    expect(screen.queryByText(/expected object, received null/i)).not.toBeInTheDocument()
+  })
+
   it('a cancelled response never replaces a newer probe', async () => {
     const { promise, resolve } = deferredProbe()
     const probe = vi.spyOn(RemoteImports, 'probeRemoteUrl')
@@ -172,6 +203,10 @@ describe('RemoteImportModal probe behaviour', () => {
     await userEvent.click(screen.getByRole('button', { name: /start import/i }))
     await waitFor(() => expect(create).toHaveBeenCalled())
     expect(create.mock.calls[0][0]).toMatchObject({ fileName: 'auto.bin', detectedFileName: 'auto.bin' })
+    // Direct files never carry `hls` as a value — the modal sends undefined
+    // (never `null`, which the backend Zod schema rejects), and the wire
+    // serialization in remoteImports.createRemoteImport drops the key.
+    expect(create.mock.calls[0][0].hls).toBeUndefined()
   })
 
   it('sends the custom name (never the detected) when the user edited', async () => {
@@ -188,6 +223,8 @@ describe('RemoteImportModal probe behaviour', () => {
     await user.click(screen.getByRole('button', { name: /start import/i }))
     await waitFor(() => expect(create).toHaveBeenCalled())
     expect(create.mock.calls[0][0]).toMatchObject({ fileName: 'custom.bin', detectedFileName: 'skip.bin' })
+    // Custom name likewise sends no `hls` value for a direct file.
+    expect(create.mock.calls[0][0].hls).toBeUndefined()
   })
 
   describe('HLS sources', () => {

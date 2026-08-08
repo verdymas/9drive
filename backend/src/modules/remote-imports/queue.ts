@@ -33,9 +33,14 @@ export type RemoteImportJobData = {
  * One job per (importId, attempt): a retry enqueues a new job with the next
  * attempt, so a stale failed job can never shadow a fresh execution (which the
  * old `jobId: importId` scheme did, leaving retries stuck in `queued`).
+ *
+ * The separator is `~`, NOT `:` — BullMQ v5 rejects custom job ids that
+ * contain a colon (only the legacy repeatable-jobs `a:b:c` form is allowed),
+ * so `${uuid}:${attempt}` made every enqueue throw "Custom Id cannot contain
+ * :". `~` is URL/key-safe and can never appear in a UUID.
  */
 export function remoteImportJobId(importId: string, attempt: number): string {
-  return `${importId}:${attempt}`
+  return `${importId}~${attempt}`
 }
 
 /**

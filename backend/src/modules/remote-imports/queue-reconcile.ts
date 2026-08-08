@@ -57,8 +57,9 @@ export async function reconcileQueuedRow(row: Row): Promise<'failed-missing' | '
   let job: Job | null | undefined
   try {
     // Resolve the execution job, tolerating legacy rows whose jobId is just
-    // the bare import id (pre-fix format) instead of `${id}:${attempt}`.
-    job = await getJobById(row.jobId ?? `${row.id}:${Math.max(row.attempt, 1)}`)
+    // the bare import id (pre-fix format) instead of `${id}~${attempt}`.
+    // (`~` — not `:` — since BullMQ v5 rejects custom job ids with a colon.)
+    job = await getJobById(row.jobId ?? `${row.id}~${Math.max(row.attempt, 1)}`)
   } catch {
     // Redis unreachable — can't verify anything; leave the row alone.
     return 'skipped'

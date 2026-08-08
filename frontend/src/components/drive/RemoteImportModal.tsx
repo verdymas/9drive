@@ -20,6 +20,28 @@ type ProbeState =
 
 const PROBE_DEBOUNCE_MS = 500
 
+/**
+ * Safe, human-readable probe messages keyed by the backend's stable error
+ * code. Raw Zod/schema text, stack traces, internal IPs or signed URLs must
+ * never reach the user.
+ */
+function probeErrorMessage(code: string | undefined): string | null {
+  switch (code) {
+    case 'HLS_MANIFEST_FORBIDDEN':
+      return 'The source server rejected access to the HLS manifest.'
+    case 'HLS_MANIFEST_NOT_FOUND':
+    case 'HLS_MANIFEST_TIMEOUT':
+    case 'HLS_MANIFEST_FETCH_FAILED':
+      return 'The HLS manifest could not be read.'
+    case 'REMOTE_SOURCE_AUTHENTICATION_REQUIRED':
+      return 'The HLS source requires authentication. Try another URL.'
+    case 'HLS_INVALID_MANIFEST':
+      return 'The source does not appear to be a valid HLS playlist.'
+    default:
+      return null
+  }
+}
+
 /** Human label for a detected filename's source. */
 function sourceLabel(source: ProbeResult['fileNameSource']): string {
   switch (source) {
@@ -278,7 +300,11 @@ export function RemoteImportModal({
     } catch (err) {
       if (token !== probeTokenRef.current) return
       if (err instanceof DOMException && err.name === 'AbortError') return
-      setProbe({ status: 'failed', message: 'File name could not be detected. Enter it manually.' })
+      const code = (err as Error & { code?: string }).code
+      setProbe({
+        status: 'failed',
+        message: probeErrorMessage(code) ?? 'File name could not be detected. Enter it manually.',
+      })
     }
   }
 
@@ -364,7 +390,9 @@ export function RemoteImportModal({
         connectedAccountId: accountId || null,
         fileName: fileName.trim() || null,
         detectedFileName: detectedFileName || null,
-        hls: hlsOptions,
+        // Direct files send no `hls` field at all (the backend schema accepts
+        // `null` too, but the wire must not carry it for non-HLS sources).
+        hls: hlsOptions ?? undefined,
       })
       onCreated()
       onClose()
@@ -416,7 +444,7 @@ export function RemoteImportModal({
         ) : null}
         {probeFailed ? (
           <p className="flex items-center gap-2 rounded-xl bg-amber-50 p-3 text-sm font-semibold text-amber-700">
-            <AlertTriangle className="h-4 w-4" /> File name could not be detected. Enter it manually.
+            <AlertTriangle className="h-4 w-4" /> {probe.status === 'failed' ? probe.message : 'File name could not be detected. Enter it manually.'}
           </p>
         ) : null}
         {error ? <p className="rounded-xl bg-red-50 p-3 text-sm font-semibold text-red-700">{error}</p> : null}

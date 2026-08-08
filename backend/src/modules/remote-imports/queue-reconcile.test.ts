@@ -31,14 +31,14 @@ vi.mock('../../config/env.js', () => ({
 
 /** A fake BullMQ job with a controllable `getState()`. */
 function fakeJob(state: string) {
-  return { id: 'import-1:1', getState: async () => state }
+  return { id: 'import-1~1', getState: async () => state }
 }
 
 const staleQueuedRow = {
   id: 'import-1',
   status: 'queued',
   stage: 'waiting',
-  jobId: 'import-1:1',
+  jobId: 'import-1~1',
   attempt: 1,
   queuedAt: new Date(2_000_000_000_000 - 400_000), // 400s ago (> 300s timeout)
   heartbeatAt: null,

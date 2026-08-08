@@ -69,7 +69,7 @@ export type CreateRemoteImportInput = {
   detectedFileName?: string | null
   mimeType?: string | null
   /** HLS import options; present only for HLS sources (from the probe). */
-  hls?: HlsImportOptions | null
+  hls?: HlsImportOptions
 }
 
 export type HlsImportOptions = {
@@ -144,9 +144,11 @@ export function probeRemoteUrl(url: string, signal?: AbortSignal) {
 }
 
 export function createRemoteImport(input: CreateRemoteImportInput) {
+  // `hls` is omitted from the wire for direct files (JSON.stringify drops
+  // undefined); the backend schema also tolerates `null` from legacy clients.
   return apiFetch<RemoteImportItem>('/remote-imports', {
     method: 'POST',
-    body: JSON.stringify(input),
+    body: JSON.stringify({ ...input, hls: input.hls ?? undefined }),
   })
 }
 

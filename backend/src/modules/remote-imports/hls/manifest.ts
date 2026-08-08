@@ -159,6 +159,87 @@ function parseCodecs(codecAttr: string | undefined): string[] {
 }
 
 /**
+ * Request profile for probing and fetching HLS manifests. 9Drive never sends
+ * browser cookies, Authorization, Origin or Referer — an authenticated source
+ * is answered with a clear unsupported-auth error instead of guessing.
+ */
+export const HLS_MANIFEST_PROFILE_HEADERS: Record<string, string> = {
+  Accept: 'application/vnd.apple.mpegurl, application/x-mpegurl, audio/mpegurl, */*',
+  'Accept-Encoding': 'identity',
+}
+
+/**
+ * Typed bounded manifest GET for the PROBE path (secure fetcher; never the
+ * redacted URL). Unlike the worker's `fetchManifest`, HTTP failure status codes
+ * are translated into stable, distinct AppError codes instead of a single
+ * DOWNLOAD_HTTP_ERROR — HEAD-403 vs manifest-GET-403 no longer collapse.
+ *
+ * Returns the final post-redirect URL (relative children resolve against it,
+ * signed query parameters and all).
+ */
+export async function fetchManifestForProbe(
+  url: string,
+  opts: { maxBytes?: number; signal?: AbortSignal } = {},
+): Promise<{ body: string; finalUrl: string }> {
+  const maxBytes = opts.maxBytes ?? env.REMOTE_IMPORT_HLS_MAX_MANIFEST_BYTES
+  let collected = 0
+  let body = ''
+  try {
+    const result = await followRemoteUrl(url, {
+      headers: HLS_MANIFEST_PROFILE_HEADERS,
+      onResponse: async (res, finalURL) => {
+        if (res.statusCode >= 400) {
+          switch (res.statusCode) {
+            case 401: throw new AppError(HLS_ERROR_CODES.REMOTE_SOURCE_AUTHENTICATION_REQUIRED, HLS_ERROR_MESSAGES.REMOTE_SOURCE_AUTHENTICATION_REQUIRED, 401)
+            case 403: throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_FORBIDDEN, HLS_ERROR_MESSAGES.HLS_MANIFEST_FORBIDDEN, 403)
+            case 404: throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_NOT_FOUND, HLS_ERROR_MESSAGES.HLS_MANIFEST_NOT_FOUND, 404)
+            default: throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_FETCH_FAILED, HLS_ERROR_MESSAGES.HLS_MANIFEST_FETCH_FAILED, 502)
+          }
+        }
+        if (typeof (res.body as { on?: unknown }).on === 'function') {
+          (res.body as unknown as { on: (event: 'error', listener: () => void) => void }).on('error', () => undefined)
+        }
+        for await (const chunk of res.body) {
+          if (opts.signal?.aborted) {
+            const err = new AppError('ABORTED', 'The import was cancelled.', 499)
+            err.name = 'AbortError'
+            throw err
+          }
+          collected += chunk.byteLength
+          if (collected > maxBytes || body.length > maxBytes) {
+            throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_TOO_LARGE, HLS_ERROR_MESSAGES.HLS_MANIFEST_TOO_LARGE, 413)
+          }
+          body += Buffer.from(chunk).toString('utf8')
+        }
+        return finalURL
+      },
+    })
+    return { body, finalUrl: result.finalUrl }
+  } catch (error) {
+    // An idle-timeout mid-stream (or a connect timeout) is a DISTINCT outcome
+    // from a plain network failure — map it to HLS_MANIFEST_TIMEOUT.
+    if (isManifestTimeoutError(error)) {
+      throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_TIMEOUT, HLS_ERROR_MESSAGES.HLS_MANIFEST_TIMEOUT, 504)
+    }
+    throw error
+  }
+}
+
+/** Distinguish the manifest timeout from other network failures. */
+function isManifestTimeoutError(error: unknown): boolean {
+  if (error instanceof AppError) return false
+  const name = error instanceof Error ? error.name : ''
+  return (
+    name.includes('HeadersTimeout') ||
+    name.includes('BodyTimeout') ||
+    name.includes('ConnectTimeout') ||
+    name.includes('Timeout') ||
+    name.includes('SocketError') ||
+    name.includes('UND_ERR')
+  )
+}
+
+/**
  * Fetch + parse a manifest through the SSRF-safe fetcher. `maxBytes` is the
  * configured manifest cap; a larger body throws HLS_MANIFEST_TOO_LARGE and the
  * response is aborted mid-stream — the full manifest never downloads.

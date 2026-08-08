@@ -34,7 +34,8 @@
 import { AppError } from '../../utils/app-error.js'
 import { detectFileName, type FileNameSource } from './filename-detection.js'
 import {
-  fetchManifest,
+  fetchManifestForProbe,
+  HLS_MANIFEST_PROFILE_HEADERS,
   isHlsContentType,
   looksLikeM3u8Url,
   m3u8PrefixIsHls,
@@ -46,6 +47,7 @@ import {
 } from './hls/manifest.js'
 import { validateRemoteUrl } from './ssrf.js'
 import { followRemoteUrl } from './url-downloader.js'
+import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './hls/errors.js'
 
 export type HlsProbeSummary = {
   sourceType: 'hls_master' | 'hls_media'
@@ -69,6 +71,19 @@ export type ProbeResult = {
   sourceType: 'direct_file' | 'hls_master' | 'hls_media'
   /** HLS details (null for direct files) — child URLs never serialized. */
   hls: HlsProbeSummary | null
+  /**
+   * Internal ONLY: the final post-redirect URL including any signed query
+   * parameters. Never serialized to the frontend; the only URL the HLS
+   * manifest fetch is allowed to use (a redacted display URL must never be
+   * fetched).
+   */
+  sourceUrlForFetch: string
+}
+
+/** Strip the internal-only fetch URL before the result crosses the API. */
+export function probeResultForWire(result: ProbeResult): Omit<ProbeResult, 'sourceUrlForFetch'> {
+  const { sourceUrlForFetch: _omit, ...rest } = result
+  return rest
 }
 
 const QUERY_REDACTED = '<redacted>'
@@ -100,6 +115,31 @@ function shortId(): string {
 }
 
 /**
+ * Probable-HLS detection for the probe: a source is treated as HLS when the
+ * final content-type is an HLS MIME type, the final URL (or the original URL)
+ * looks like `.m3u8`, or the sampled body prefix opens like an HLS manifest.
+ */
+function hlsHint(base: Pick<ProbeResult, 'mimeType' | 'finalUrl' | 'originalUrl'>, sampledPrefix: string | null): boolean {
+  return (
+    isHlsContentType(base.mimeType) ||
+    looksLikeM3u8Url(new URL(base.finalUrl)) ||
+    looksLikeM3u8Url(new URL(base.originalUrl)) ||
+    (sampledPrefix ? m3u8PrefixIsHls(sampledPrefix) : false)
+  )
+}
+
+/**
+ * Request profile for probing HLS-looking sources (manifest GET) and for the
+ * direct-file probe (HEAD / ranged GET). 9Drive never sends browser cookies,
+ * Authorization, Origin or Referer — a source that requires them is answered
+ * with a clear unsupported/authentication error instead of guessing.
+ */
+const PROBE_MANIFEST_HEADERS: Record<string, string> = {
+  ...HLS_MANIFEST_PROFILE_HEADERS,
+  'User-Agent': '9Drive-Remote-Import/1.0',
+}
+
+/**
  * Probe a remote URL without downloading the file. Returns the detected
  * filename (always sanitized), its source, response metadata, and an HLS
  * classification. Throws `AppError` for validation / SSRF / network failures.
@@ -114,43 +154,65 @@ export async function probeRemoteUrl(rawUrl: string, correlationId: string): Pro
   }
 
   // ── Phase 1: HEAD (cheap; most servers answer it). ──────────────────────
+  // Only a 2xx response counts as a successful metadata probe; 403/405/501
+  // fall back to GET instead of failing the entire Remote Import.
   let headStatus = 0
+  let headRedirects = 0
   let headResult: ProbeResult | null = null
   try {
     const head = await followRemoteUrl(originalUrlHref, {
       method: 'HEAD',
       onResponse: async (res, finalUrl) => {
         headStatus = res.statusCode
-        const base = buildBaseResult(originalUrlHref, finalUrl, res)
-        return base
+        return buildProbeResult(originalUrlHref, finalUrl, res, null)
       },
     })
-    log('HEAD ok', { status: headStatus, redirects: head.redirectCount })
+    headRedirects = head.redirectCount
     headResult = head.result
-    const headRejected = headStatus < 200 || headStatus >= 300
-    const headHasCdFilename =
-      head.result.fileNameSource === 'content-disposition-filename' ||
-      head.result.fileNameSource === 'content-disposition-filename-star'
-    if (headRejected || !headHasCdFilename) {
-      // Fall back to a ranged GET (may yield a body that reveals HLS).
-      return await rangedGetProbe(originalUrlHref, log, headResult ?? null)
-    }
-    return await finalizeProbe(originalUrlHref, headResult, null, log)
   } catch (headError) {
-    log('HEAD rejected', { code: headError instanceof AppError ? headError.code : 'network' })
-    return await rangedGetProbe(originalUrlHref, log, null)
+    log('head_failed', { code: headError instanceof AppError ? headError.code : 'network' })
+    headResult = null
+  }
+
+  if (headResult && headStatus >= 200 && headStatus < 300) {
+    log('head_success', { status: headStatus, redirects: headRedirects, host: hostOf(headResult.finalUrl) })
+    const headHasCdFilename =
+      headResult.fileNameSource === 'content-disposition-filename' ||
+      headResult.fileNameSource === 'content-disposition-filename-star'
+    // A successful HEAD with a server-supplied filename and no HLS hint is a
+    // complete probe — no body fetch is needed.
+    if (headHasCdFilename && !hlsHint(headResult, null)) {
+      return finalizeProbe(headResult, null, log)
+    }
+  } else {
+    log('head_rejected', { status: headStatus, redirects: headRedirects, host: headResult ? hostOf(headResult.finalUrl) : '' })
+  }
+
+  // ── Phase 2: probable HLS? → one bounded manifest GET; else ranged GET. ──
+  if (headResult && hlsHint(headResult, null)) {
+    return finalizeProbe(headResult, null, log)
+  }
+  return getProbe(originalUrlHref, log)
+}
+
+/** Hostname of a (redacted) URL — the only URL data ever logged. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname
+  } catch {
+    return ''
   }
 }
 
 /**
- * Ranged GET fallback. In addition to filename detection, a small prefix of the
- * body is sampled (up to 8 KiB) so HLS detection can see whether the source
- * body opens like an M3U playlist — even when the URL has no `.m3u8` extension.
+ * Phase 2 of the probe (non-HLS hinted HEAD, or no usable HEAD): a ranged GET
+ * samples a small prefix (≤ 8 KiB) so the body can reveal HLS even when the
+ * URL/content-type carry no hint. Servers that ignore the Range and stream a
+ * 200 are aborted after the first chunk — the full file is never downloaded.
  */
-async function rangedGetProbe(
+async function getProbe(
   originalUrlHref: string,
   log: (message: string, extra?: Record<string, string | number | boolean>) => void,
-  headResult: ProbeResult | null,
 ): Promise<ProbeResult> {
   let sampledPrefix = ''
   try {
@@ -170,25 +232,24 @@ async function rangedGetProbe(
           sampledPrefix = Buffer.from(first.value).toString('utf8').slice(0, 8192)
         }
         await reader.return?.().catch(() => undefined)
-        return buildBaseResult(originalUrlHref, finalUrl, res)
+        return buildProbeResult(originalUrlHref, finalUrl, res, sampledPrefix)
       },
     })
     log('ranged GET ok', { redirects: ranged.redirectCount })
-    return await finalizeProbe(originalUrlHref, ranged.result, sampledPrefix, log)
+    return await finalizeProbe(ranged.result, sampledPrefix, log)
   } catch (getError) {
     log('ranged GET rejected', { code: getError instanceof AppError ? getError.code : 'network' })
-    // If we have no body sampling but a HEAD result exists, use it as-is.
-    if (headResult) return finalizeProbe(originalUrlHref, headResult, null, log)
     if (getError instanceof AppError) throw getError
     throw new AppError('PROBE_FAILED', 'The remote URL could not be inspected.', 502)
   }
 }
 
 /** Build the base probe fields (filename, mime, length, range support). */
-function buildBaseResult(
+function buildProbeResult(
   startUrl: string,
   finalUrl: string,
   res: { statusCode: number; headers: Record<string, string> },
+  sampledPrefix: string | null,
 ): ProbeResult {
   const original = new URL(startUrl)
   const final = new URL(finalUrl)
@@ -203,6 +264,7 @@ function buildBaseResult(
   const rawLength = res.headers['content-length']
   const contentLength = rawLength && /^\d+$/.test(rawLength) ? Number(rawLength) : null
   const supportsRange = res.headers['accept-ranges'] === 'bytes' || res.statusCode === 206
+  const sample = sampledPrefix && sampledPrefix.length > 0 ? sampledPrefix : null
 
   return {
     originalUrl: redactUrl(original.href),
@@ -214,55 +276,75 @@ function buildBaseResult(
     supportsRange,
     sourceType: 'direct_file',
     hls: null,
+    // The ONLY URL the HLS manifest fetch may use: the final post-redirect
+    // URL with the full signed query string intact (never redacted).
+    sourceUrlForFetch: final.href,
   }
 }
 
 /**
- * Add the HLS classification to a base probe result. When any hint (MIME type,
- * `.m3u8`-look URL, or body prefix) suggests HLS, a single bounded body fetch
- * is performed and the manifest parsed. A failure to detect = direct file.
+ * Add the HLS classification to a probe result. When ANY hint (MIME type,
+ * `.m3u8`-looking URL, or sampled body prefix) suggests HLS, exactly ONE
+ * bounded manifest GET runs (on the FINAL post-redirect URL — signed query
+ * params intact — never on a redacted URL) and its body is parsed. A manifest
+ * fetch failure or an invalid body is a STRUCTURED ERROR, never a silent
+ * downgrade to `direct_file`: `hls: null` on success now means "really a
+ * direct file", not "the manifest failed to load".
  */
 async function finalizeProbe(
-  originalUrlHref: string,
   base: ProbeResult,
   sampledPrefix: string | null,
   log: (message: string, extra?: Record<string, string | number | boolean>) => void,
 ): Promise<ProbeResult> {
-  const hint =
-    isHlsContentType(base.mimeType) ||
-    looksLikeM3u8Url(new URL(base.finalUrl)) ||
-    looksLikeM3u8Url(new URL(base.originalUrl)) ||
-    (sampledPrefix ? m3u8PrefixIsHls(sampledPrefix) : false)
-
+  const hint = hlsHint(base, sampledPrefix)
   if (!hint) return base
 
-  // One bounded manifest fetch: bare `.m3u8` links, signed URLs and extension-less
-  // HLS endpoints alike reach a full parse here — but never a full binary body.
+  // One bounded manifest fetch: bare `.m3u8` links, signed URLs and
+  // extension-less HLS endpoints alike reach a full parse here — but never a
+  // full binary body. Errors propagate as typed AppError (HLS_MANIFEST_*),
+  // so the probe route returns the normal structured error envelope.
+  let fetch: { body: string; finalUrl: string }
   try {
-    const { body, finalUrl } = await fetchManifest(originalUrlHref)
-    let hls: HlsManifestInfo
-    try {
-      hls = parseManifest(body, finalUrl)
-    } catch (parseError) {
-      log('HLS parse rejected', { code: parseError instanceof AppError ? parseError.code : 'unknown' })
-      return base
+    fetch = await fetchManifestForProbe(base.sourceUrlForFetch)
+  } catch (manifestError) {
+    if (manifestError instanceof AppError) {
+      log('manifest GET rejected', { code: manifestError.code, host: hostOf(base.finalUrl) })
+      throw manifestError
     }
-    log('HLS detected', { sourceType: hls.sourceType, playlistType: hls.playlistType })
-    return {
-      ...base,
+    // Only a non-SSRF/non-HTTP error (e.g. idle timeout) survives here.
+    log('manifest GET rejected', { code: 'network', host: hostOf(base.finalUrl) })
+    throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_FETCH_FAILED, HLS_ERROR_MESSAGES.HLS_MANIFEST_FETCH_FAILED, 502)
+  }
+
+  // Strict content validation BEFORE parse — a server that answers `.m3u8`
+  // with HTML or a JSON error must not be reported as a direct file.
+  if (!m3u8PrefixIsHls(fetch.body.slice(0, 4096))) {
+    log('manifest body rejected', { code: HLS_ERROR_CODES.HLS_INVALID_MANIFEST, host: hostOf(base.finalUrl) })
+    throw new AppError(HLS_ERROR_CODES.HLS_INVALID_MANIFEST, HLS_ERROR_MESSAGES.HLS_INVALID_MANIFEST, 400)
+  }
+
+  let hls: HlsManifestInfo
+  try {
+    hls = parseManifest(fetch.body, fetch.finalUrl)
+  } catch (parseError) {
+    const code = parseError instanceof AppError ? parseError.code : HLS_ERROR_CODES.HLS_INVALID_MANIFEST
+    log('HLS parse rejected', { code, host: hostOf(base.finalUrl) })
+    if (parseError instanceof AppError) throw parseError
+    throw new AppError(HLS_ERROR_CODES.HLS_INVALID_MANIFEST, HLS_ERROR_MESSAGES.HLS_INVALID_MANIFEST, 400)
+  }
+
+  log('HLS parsed', { type: hls.sourceType, playlistType: hls.playlistType, variants: hls.variants.length, host: hostOf(base.finalUrl) })
+  return {
+    ...base,
+    sourceType: hls.sourceType === 'master' ? 'hls_master' : 'hls_media',
+    hls: {
       sourceType: hls.sourceType === 'master' ? 'hls_master' : 'hls_media',
-      hls: {
-        sourceType: hls.sourceType === 'master' ? 'hls_master' : 'hls_media',
-        playlistType: hls.playlistType,
-        isFinite: hls.isFinite,
-        variants: hls.variants.map(({ childPlaylistUrl: _c, ...rest }) => rest),
-        audioTracks: hls.audioTracks,
-        durationSeconds: hls.durationSeconds,
-        detectedInBody: Boolean(sampledPrefix && m3u8PrefixIsHls(sampledPrefix)),
-      },
-    }
-  } catch (error) {
-    log('HLS fetch rejected', { code: error instanceof AppError ? error.code : 'network' })
-    return base
+      playlistType: hls.playlistType,
+      isFinite: hls.isFinite,
+      variants: hls.variants.map(({ childPlaylistUrl: _c, ...rest }) => rest),
+      audioTracks: hls.audioTracks,
+      durationSeconds: hls.durationSeconds,
+      detectedInBody: Boolean(sampledPrefix && m3u8PrefixIsHls(sampledPrefix)),
+    },
   }
 }
