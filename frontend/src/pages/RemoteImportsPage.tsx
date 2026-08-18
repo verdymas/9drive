@@ -20,7 +20,7 @@ import {
   type RemoteImportItem,
 } from '@/lib/remoteImports'
 
-type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string }
+type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string; autoAllocationEnabled: boolean }
 type FolderOption = { id: string; name: string }
 
 const POLL_INTERVAL_MS = 3_000

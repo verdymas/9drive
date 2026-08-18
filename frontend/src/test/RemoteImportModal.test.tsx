@@ -22,7 +22,7 @@ import * as RemoteImports from '@/lib/remoteImports'
  *      server name).
  */
 
-const ACCOUNTS = [{ id: 'acc-1', provider: 's3', email: 'a@b.c', status: 'connected' }]
+const ACCOUNTS = [{ id: 'acc-1', provider: 's3', email: 'a@b.c', status: 'connected', autoAllocationEnabled: true }]
 const FOLDERS = [{ id: 'root', name: 'My Drive' }]
 
 /** A complete, valid probe payload with only the fields we care about set. */

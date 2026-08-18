@@ -19,7 +19,7 @@ import {
 const RECORDING_MIN_SECONDS = 60
 const RECORDING_MAX_SECONDS = 21600
 
-type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string }
+type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string; autoAllocationEnabled: boolean }
 type FolderOption = { id: string; name: string }
 
 type ProbeState =
@@ -719,6 +719,9 @@ export function RemoteImportModal({
             ))}
           </select>
         </label>
+        {accountId && accounts.find((account) => account.id === accountId)?.autoAllocationEnabled === false ? (
+          <p className="rounded-xl bg-amber-50 p-3 text-sm text-amber-800">Automatic allocation is disabled for this account. You selected this account manually, so the file can still be stored here.</p>
+        ) : null}
         <div className="grid gap-3 pt-2 sm:flex sm:justify-end">
           <Button type="button" variant="outline" onClick={onClose}>Cancel</Button>
           <Button type="submit" disabled={submitting || (mode === 'url' ? !url.trim() : !curlInput.trim())}>

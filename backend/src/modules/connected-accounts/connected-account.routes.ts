@@ -4,8 +4,10 @@ import { z } from 'zod'
 import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
+import { AppError } from '../../utils/app-error.js'
 import { decryptText, encryptText, hashToken, randomToken } from '../../utils/crypto.js'
 import { hashPassword } from '../../utils/password.js'
+import { createAuditLog } from '../../utils/audit.js'
 import { createOAuthClient, syncGoogleQuota } from '../google/google.service.js'
 import { syncS3Quota, testS3Connection } from '../s3/s3.service.js'
 
@@ -295,6 +297,57 @@ connectedAccountRouter.post('/:id/sync-quota', requireAuth, async (req: AuthRequ
       },
     })
   } catch (error) {
+    return next(error)
+  }
+})
+
+const updateAccountSchema = z.object({
+  autoAllocationEnabled: z.boolean(),
+})
+
+/**
+ * Update connected-account settings. Currently supports the Auto Allocation
+ * placement policy only: `autoAllocationEnabled: false` excludes the account
+ * from Automatic new-file routing while manual selection, Sync, quota refresh
+ * and existing reads stay unaffected. Ownership is enforced server-side; the
+ * returned account is the same safe shape as GET / (no provider credentials).
+ */
+connectedAccountRouter.patch('/:id', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const body = updateAccountSchema.parse(req.body)
+    const accountId = String(req.params.id)
+    const existing = await prisma.connectedAccount.findFirst({ where: { id: accountId, userId: req.user!.id } })
+    if (!existing) throw new AppError('STORAGE_ACCOUNT_NOT_FOUND', 'The storage account does not exist.', 404)
+    const previousValue = existing.autoAllocationEnabled
+
+    const updated = await prisma.connectedAccount.update({
+      where: { id: accountId },
+      data: { autoAllocationEnabled: body.autoAllocationEnabled },
+      include: { storageAccount: true },
+    })
+    await createAuditLog(req.user!.id, body.autoAllocationEnabled ? 'storage.auto_allocation.enabled' : 'storage.auto_allocation.disabled', 'connected_account', accountId, {
+      connectedAccountId: accountId,
+      provider: existing.provider,
+      previousValue,
+      newValue: body.autoAllocationEnabled,
+    })
+
+    const { accessTokenEncrypted: _a, refreshTokenEncrypted: _r, storageAccount, ...account } = updated
+    return res.json({
+      account: {
+        ...account,
+        storageAccount: storageAccount ? {
+          ...storageAccount,
+          totalBytes: storageAccount.totalBytes?.toString() ?? null,
+          usedBytes: storageAccount.usedBytes.toString(),
+          availableBytes: storageAccount.availableBytes?.toString() ?? null,
+          trashBytes: storageAccount.trashBytes?.toString() ?? null,
+        } : null,
+      },
+    })
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ code: 'INVALID_REQUEST', message: error.issues[0]?.message ?? 'Invalid request.' })
+    if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
     return next(error)
   }
 })

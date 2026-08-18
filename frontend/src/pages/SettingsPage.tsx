@@ -8,7 +8,7 @@ import { apiFetch, formatBytes, API_URL } from '@/lib/api'
 import { getGravatarUrl } from '@/lib/gravatar'
 import { getStoredUser, getAccessToken, clearAuthSession } from '@/lib/auth'
 
-type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string; storageAccount?: { totalBytes: string | null; usedBytes: string; availableBytes: string | null; lastSyncedAt: string | null } | null }
+type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string; autoAllocationEnabled: boolean; storageAccount?: { totalBytes: string | null; usedBytes: string; availableBytes: string | null; lastSyncedAt: string | null } | null }
 
 function providerLabel(provider: string) {
   if (provider === 's3') return 'S3 Storage'
@@ -403,7 +403,10 @@ export function SettingsPage() {
                 {selectedAccount ? <div className="rounded-xl bg-slate-50 p-3 dark:bg-slate-900/60 border border-slate-100 dark:border-slate-800">
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <div className="min-w-0"><p className="break-all font-semibold text-sm">{selectedAccount.displayName || selectedAccount.email}</p><p className="text-xs text-slate-500 mt-0.5">{providerLabel(selectedAccount.provider)} · {selectedAccount.status}</p></div>
-                    <div className="grid grid-cols-2 gap-2 sm:flex"><Button className="w-full" size="sm" variant="outline" onClick={() => sync(selectedAccount.id)} disabled={syncingAccountId === selectedAccount.id}><RefreshCw className={syncingAccountId === selectedAccount.id ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{syncingAccountId === selectedAccount.id ? 'Syncing...' : 'Sync'}</Button><Button className="w-full" size="sm" variant="danger" onClick={() => setAccountToDisconnect(selectedAccount)}><Trash2 className="h-4 w-4" />Disconnect</Button></div>
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                      {!selectedAccount.autoAllocationEnabled ? <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500" title="Excluded from Automatic storage allocation. Existing files and Sync are not affected.">Allocation Disabled</span> : null}
+                      <div className="grid grid-cols-2 gap-2 sm:flex"><Button className="w-full" size="sm" variant="outline" onClick={() => sync(selectedAccount.id)} disabled={syncingAccountId === selectedAccount.id}><RefreshCw className={syncingAccountId === selectedAccount.id ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{syncingAccountId === selectedAccount.id ? 'Syncing...' : 'Sync'}</Button><Button className="w-full" size="sm" variant="danger" onClick={() => setAccountToDisconnect(selectedAccount)}><Trash2 className="h-4 w-4" />Disconnect</Button></div>
+                    </div>
                   </div>
                   <div className="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
                     <div className="rounded-xl bg-white dark:bg-slate-950 p-2 border border-slate-100 dark:border-slate-800"><p className="font-extrabold text-slate-950">{formatBytes(selectedAccount.storageAccount?.usedBytes)}</p><p className="mt-0.5 text-[10px] text-slate-500">Used</p></div>

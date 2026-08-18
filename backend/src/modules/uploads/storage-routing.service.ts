@@ -71,7 +71,7 @@ export async function selectAccount(
   preferredAccountIds: string[] = [],
 ) {
   const accounts = await prisma.connectedAccount.findMany({
-    where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected', ...(targetAccountId ? { id: targetAccountId } : {}) },
+    where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected', autoAllocationEnabled: true, ...(targetAccountId ? { id: targetAccountId } : {}) },
     include: { storageAccount: true },
   })
 
@@ -90,7 +90,7 @@ export async function selectAccount(
   }))
 
   const fresh = await prisma.connectedAccount.findMany({
-    where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected' },
+    where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected', autoAllocationEnabled: true },
     include: { storageAccount: true },
   })
 
@@ -237,7 +237,14 @@ export async function planBatchUploads(
     include: { storageAccount: true },
   })
 
-  if (fresh.length === 0) {
+  // Auto Allocation OFF is a pre-routing exclusion: accounts opted out of
+  // automatic placement are dropped from the pool before any strategy applies,
+  // UNLESS the user explicitly pinned one (a manual pin stays authoritative).
+  const planningPool = targetAccountId
+    ? fresh.filter((account) => account.id === targetAccountId || account.autoAllocationEnabled)
+    : fresh.filter((account) => account.autoAllocationEnabled)
+
+  if (planningPool.length === 0) {
     for (const file of files) {
       plans.push({
         fileName: file.fileName,
@@ -249,7 +256,7 @@ export async function planBatchUploads(
     return { plans, totalBytes, totalRoutedBytes, unroutedBytes: totalBytes }
   }
 
-  const available = fresh.map((account) => ({
+  const available = planningPool.map((account) => ({
     account,
     availableBytes:
       account.storageAccount?.availableBytes === null || account.storageAccount?.availableBytes === undefined

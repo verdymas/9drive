@@ -25,7 +25,7 @@ import { useDriveLayoutActions } from '@/layouts/DriveLayout'
 
 type BackendFile = { id: string; name: string; mimeType: string; sizeBytes: string; createdAt: string; folderId?: string | null; connectedAccount?: { email: string; provider: string }; folder?: { id: string; name: string } | null }
 type BackendFolder = { id: string; name: string; color: string; iconUrl?: string | null; parentId?: string | null; providerFolderId?: string | null; storageLocationCount?: number; primaryLocation?: { connectedAccountId: string; provider: string; providerFolderId: string } | null; updatedAt: string }
-type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string }
+type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string; autoAllocationEnabled: boolean }
 
 const sizeActiveClasses: Record<FolderSizeScale, string> = {
   xs: 'bg-white text-slate-800 dark:bg-red-500/20 dark:text-red-300 dark:border-red-500/30 shadow-sm dark:shadow-none',
@@ -787,6 +787,9 @@ export function AllFilesPage() {
               ))}
             </select>
           </label>
+          {selectedTargetAccountId && connectedAccounts.find((account) => account.id === selectedTargetAccountId)?.autoAllocationEnabled === false ? (
+            <p className="rounded-xl bg-amber-50 p-3 text-sm text-amber-800">Automatic allocation is disabled for this account. You selected this account manually, so the file can still be stored here.</p>
+          ) : null}
           {activeFolder ? <p className="rounded-xl bg-slate-50 p-3 text-sm text-slate-600">Uploading to: <b>{activeFolder.name}</b></p> : <label className="grid gap-2 text-sm font-semibold">Virtual Folder<select className="h-11 rounded-xl border border-slate-200 px-3 text-sm bg-white" value={selectedFolderId} onChange={(event) => setSelectedFolderId(event.target.value)}><option value="">No folder</option>{allFolders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}</select></label>}
           {preflightError ? <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800"><p className="font-bold">{preflightError.message}</p><p className="mt-1 text-xs">No space on any connected account for: <span className="font-semibold">{preflightError.unroutedFiles.join(', ')}</span></p></div> : null}
           {selectedFiles.length > 0 ? <div className="grid max-h-56 gap-2 overflow-y-auto rounded-xl bg-slate-50 p-3 text-sm text-slate-600"><div className="flex items-center justify-between gap-3"><span className="font-bold text-slate-950">{selectedFiles.length} selected</span><span className="shrink-0">{formatBytes(selectedFiles.reduce((total, file) => total + file.size, 0))}</span></div>{selectedFiles.map((file, index) => <div key={`${file.name}-${file.size}-${index}`} className="flex min-w-0 items-center justify-between gap-3 rounded-lg bg-white px-3 py-2"><span className="min-w-0 flex-1 truncate" title={file.name}>{file.name}</span><span className="shrink-0 text-xs text-slate-500">{formatBytes(file.size)}</span><button type="button" className="shrink-0 text-slate-500 hover:text-red-600" onClick={() => removeUploadFile(index)} aria-label={`Remove ${file.name}`}><X className="h-4 w-4" /></button></div>)}</div> : null}

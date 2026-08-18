@@ -8,7 +8,7 @@ import { resolveUploadPlacement, rerouteOrFail } from './upload-placement.servic
 // materialization is mocked to return a canned location.
 const h = vi.hoisted(() => {
   const now = new Date('2026-08-07T00:00:00.000Z')
-  const account = (id: string, provider: string, availableBytes: bigint | null) => ({
+  const account = (id: string, provider: string, availableBytes: bigint | null, autoAllocationEnabled = true) => ({
     id,
     userId: 'user-1',
     providerConfigId: null,
@@ -22,6 +22,7 @@ const h = vi.hoisted(() => {
     tokenExpiresAt: null,
     scopes: [],
     status: 'connected',
+    autoAllocationEnabled,
     lastError: null,
     createdAt: now,
     updatedAt: now,
@@ -44,10 +45,16 @@ const h = vi.hoisted(() => {
   const prismaMock = {
     connectedAccount: {
       findFirst: vi.fn(async ({ where, include }: { where: any; include?: { storageAccount?: boolean } }) => {
-        const match = accounts.find((a) => a.id === where.id)
+        // The allocation pre-check queries findFirst without id (by userId +
+        // status + autoAllocationEnabled); the manual pin queries it by id.
+        const match = accounts.find((a) => {
+          if (where.id !== undefined) return a.id === where.id
+          if (where.userId && a.userId !== where.userId) return false
+          if (where.status && a.status !== where.status) return false
+          if (where.autoAllocationEnabled !== undefined && a.autoAllocationEnabled !== where.autoAllocationEnabled) return false
+          return true
+        })
         if (!match) return null
-        if (where.userId && match.userId !== where.userId) return null
-        if (where.status && match.status !== where.status) return null
         return include?.storageAccount ? { ...match, storageAccount: match.storageAccount ?? null } : match
       }),
     },
@@ -66,9 +73,11 @@ vi.mock('../../config/prisma.js', () => ({ prisma: h.prismaMock }))
 // selectAccount mocked: returns the eligible account with the most space.
 vi.mock('../uploads/storage-routing.service.js', () => ({
   selectAccount: vi.fn(async (_userId: string, sizeBytes: bigint) => {
-    // Mirrors the real eligibility filter: null quota = eligible, and the
-    // account must hold `sizeBytes` (minus nothing — no reservations here).
+    // Mirrors the real eligibility filter: autoAllocationEnabled must be true
+    // (pre-routing exclusion), null quota = eligible, and the account must hold
+    // `sizeBytes` (minus nothing — no reservations here).
     const eligible = h.accounts.filter((a) => {
+      if (a.autoAllocationEnabled === false) return false
       const available = a.storageAccount?.availableBytes
       return available === null || available === undefined || available >= sizeBytes
     })
@@ -110,16 +119,21 @@ function reset() {
   // The "rejects a manual pin" test overrides the shared findFirst; restore
   // its real implementation so it cannot leak into later tests.
   ;(h.prismaMock.connectedAccount.findFirst as ReturnType<typeof vi.fn>).mockImplementation(async ({ where, include }: { where: any; include?: { storageAccount?: boolean } }) => {
-    const match = h.accounts.find((a) => a.id === where.id)
+    const match = h.accounts.find((a) => {
+      if (where.id !== undefined) return a.id === where.id
+      if (where.userId && a.userId !== where.userId) return false
+      if (where.status && a.status !== where.status) return false
+      if (where.autoAllocationEnabled !== undefined && a.autoAllocationEnabled !== where.autoAllocationEnabled) return false
+      return true
+    })
     if (!match) return null
-    if (where.userId && match.userId !== where.userId) return null
-    if (where.status && match.status !== where.status) return null
     return include?.storageAccount ? { ...match, storageAccount: match.storageAccount ?? null } : match
   })
   // The "upload-1/upload-2" test queues mockResolvedValueOnce on selectAccount;
   // restore the default implementation (most-space eligible).
   selectAccountMock.mockImplementation(async (_userId: string, sizeBytes: bigint) => {
     const eligible = h.accounts.filter((a) => {
+      if (a.autoAllocationEnabled === false) return false
       const available = a.storageAccount?.availableBytes
       return available === null || available === undefined || available >= sizeBytes
     })
@@ -174,6 +188,27 @@ describe('resolveUploadPlacement — Automatic', () => {
     expect(placement.folderStorageLocation.providerFolderId).toBe('ROOT')
     expect(ensureFolderStorageLocation).not.toHaveBeenCalled()
   })
+
+  it('mandatory scenario: folder mapping on OFF Drive A cannot win over ON Drive B (B materialized lazily)', async () => {
+    // Drive A: 500 free, Movies mapping exists, Auto Allocation OFF.
+    // Drive B: 200 free, no Movies mapping, Auto Allocation ON.
+    h.accounts.push(h.account('acc-a', 'google_drive', 500n, false), h.account('acc-b', 'google_drive', 200n, true))
+    addLocation('movies', 'acc-a')
+    const placement = await resolveUploadPlacement('user-1', 'movies', undefined, 10n, undefined, 'multipart')
+    expect(placement.connectedAccount.id).toBe('acc-b')
+    expect(ensureFolderStorageLocation).toHaveBeenCalledWith('user-1', 'movies', 'acc-b')
+  })
+
+  it('all allocation-disabled accounts → AUTOMATIC_STORAGE_NO_ALLOCATION_ENABLED_ACCOUNT (no fallback to a disabled account)', async () => {
+    h.accounts.push(h.account('acc-a', 'google_drive', 500n, false), h.account('acc-b', 'google_drive', 200n, false))
+    await expect(resolveUploadPlacement('user-1', 'movies', undefined, 10n, undefined, 'multipart')).rejects.toMatchObject({ code: 'AUTOMATIC_STORAGE_NO_ALLOCATION_ENABLED_ACCOUNT' })
+    expect(ensureFolderStorageLocation).not.toHaveBeenCalled()
+  })
+
+  it('allocation-enabled accounts that are full still yield the quota error, not the allocation error', async () => {
+    h.accounts.push(h.account('acc-a', 'google_drive', 1n, true), h.account('acc-b', 'google_drive', 1n, true))
+    await expect(resolveUploadPlacement('user-1', 'movies', undefined, 10n, undefined, 'multipart')).rejects.toMatchObject({ code: 'AUTOMATIC_STORAGE_NO_ELIGIBLE_ACCOUNT' })
+  })
 })
 
 describe('resolveUploadPlacement — Manual (authoritative)', () => {
@@ -201,6 +236,19 @@ describe('resolveUploadPlacement — Manual (authoritative)', () => {
   it('reservations count against the manual pin\'s quota check', async () => {
     h.accounts.push(h.account('acc-a', 'google_drive', 10n))
     await expect(resolveUploadPlacement('user-1', 'movies', 'acc-a', 6n, new Map([['acc-a', 5n]]), 'multipart')).rejects.toMatchObject({ code: 'STORAGE_ACCOUNT_INSUFFICIENT_QUOTA' })
+  })
+
+  it('manual pin on an autoAllocationEnabled:false account is accepted when quota permits (flag ignored)', async () => {
+    h.accounts.push(h.account('acc-a', 'google_drive', 500n, false), h.account('acc-b', 'google_drive', 200n, true))
+    const placement = await resolveUploadPlacement('user-1', 'movies', 'acc-a', 10n, undefined, 'multipart')
+    expect(placement.connectedAccount.id).toBe('acc-a')
+    expect(ensureFolderStorageLocation).toHaveBeenCalledWith('user-1', 'movies', 'acc-a')
+  })
+
+  it('manual pin on an autoAllocationEnabled:false account with insufficient quota → quota error, no silent switch', async () => {
+    h.accounts.push(h.account('acc-a', 'google_drive', 1n, false), h.account('acc-b', 'google_drive', 100n, true))
+    await expect(resolveUploadPlacement('user-1', 'movies', 'acc-a', 10n, undefined, 'multipart')).rejects.toMatchObject({ code: 'STORAGE_ACCOUNT_INSUFFICIENT_QUOTA' })
+    expect(ensureFolderStorageLocation).not.toHaveBeenCalled()
   })
 })
 

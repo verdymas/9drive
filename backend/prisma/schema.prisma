@@ -150,6 +150,10 @@ model ConnectedAccount {
   tokenExpiresAt        DateTime?               @map("token_expires_at")
   scopes                Json
   status                String                  @default("connected") @db.VarChar(32)
+  // Placement policy, separate from connection state: when false the account
+  // is excluded from Automatic new-file routing, but manual selection, Sync,
+  // quota refresh and existing reads are unaffected.
+  autoAllocationEnabled Boolean                 @default(true) @map("auto_allocation_enabled")
   lastError             String?                 @map("last_error") @db.Text
   createdAt             DateTime                @default(now()) @map("created_at")
   updatedAt             DateTime                @updatedAt @map("updated_at")

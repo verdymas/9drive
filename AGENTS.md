@@ -190,6 +190,7 @@ Google connected accounts:
 - `GET /connected-accounts/google/callback`
 - `GET /connected-accounts`
 - `POST /connected-accounts/:id/sync-quota`
+- `PATCH /connected-accounts/:id` — update account settings. Body: `{ autoAllocationEnabled: boolean }`. When `false`, the account is excluded from Automatic storage placement only (normal upload routing, batch preflight, Remote Import, HLS import). Manual storage selection ignores the flag (still quota-checked strictly); Sync, quota refresh, existing reads and existing physical folder mappings are unaffected. Returns the updated account (tokens stripped, bigints stringified).
 - `DELETE /connected-accounts/:id`
 
 Storage:

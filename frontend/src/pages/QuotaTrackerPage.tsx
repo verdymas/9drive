@@ -2,12 +2,13 @@ import { useEffect, useState } from 'react'
 import { CheckCircle, Cloud, Database, Filter, Gauge, Link2, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/drive/PageHeader'
 import { apiFetch, formatBytes } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
 type StorageSummary = { totalBytes: string; usedBytes: string; availableBytes: string }
-type ConnectedAccount = { id: string; email: string; displayName?: string | null; provider: string; status: string; storageAccount?: { totalBytes: string | null; usedBytes: string; availableBytes: string | null; lastSyncedAt: string | null } | null }
+type ConnectedAccount = { id: string; email: string; displayName?: string | null; provider: string; status: string; autoAllocationEnabled: boolean; storageAccount?: { totalBytes: string | null; usedBytes: string; availableBytes: string | null; lastSyncedAt: string | null } | null }
 type RoutingMode = 'most_available' | 'round_robin' | 'priority'
 type RoutingPolicy = { mode: RoutingMode; priorityAccountIds: string[]; roundRobinCursor: number }
 
@@ -51,6 +52,7 @@ export function QuotaTrackerPage() {
   const [autoRefresh, setAutoRefresh] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [syncingAccountId, setSyncingAccountId] = useState<string | null>(null)
+  const [updatingAllocationId, setUpdatingAllocationId] = useState<string | null>(null)
 
   async function load() {
     const [summaryData, accountData, policyData] = await Promise.all([
@@ -127,6 +129,24 @@ export function QuotaTrackerPage() {
     setMessage('Upload routing policy updated.')
   }
 
+  async function toggleAutoAllocation(accountId: string, enabled: boolean) {
+    if (updatingAllocationId) return
+    const prev = accounts
+    // Optimistic flip; reverted on failure so UI never diverges from the server.
+    setAccounts((current) => current.map((account) => (account.id === accountId ? { ...account, autoAllocationEnabled: enabled } : account)))
+    setUpdatingAllocationId(accountId)
+    try {
+      const data = await apiFetch<{ account: ConnectedAccount }>(`/connected-accounts/${accountId}`, { method: 'PATCH', body: JSON.stringify({ autoAllocationEnabled: enabled }) })
+      setAccounts((current) => current.map((account) => (account.id === accountId && data.account ? { ...account, autoAllocationEnabled: data.account.autoAllocationEnabled } : account)))
+      setMessage(enabled ? 'Auto Allocation enabled for this account.' : 'Auto Allocation disabled for this account.')
+    } catch (error) {
+      setAccounts(prev)
+      setMessage(error instanceof Error ? error.message : 'Failed to update Auto Allocation setting.')
+    } finally {
+      setUpdatingAllocationId(null)
+    }
+  }
+
   function orderedAccounts() {
     const byId = new Map(accounts.map((account) => [account.id, account]))
     const ordered = routingPolicy.priorityAccountIds.map((id) => byId.get(id)).filter((account): account is ConnectedAccount => Boolean(account))
@@ -201,15 +221,30 @@ export function QuotaTrackerPage() {
                   <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-600 text-white"><ProviderIcon provider={account.provider} /></div>
                   <div><h2 className="font-extrabold">{providerLabel(account.provider)}</h2><p className="text-sm text-slate-500">{account.email}</p></div>
                 </div>
-                <div className="flex gap-2"><Button variant="outline" size="icon" onClick={() => sync(account.id)} disabled={syncingAccountId === account.id}><RefreshCw className={syncingAccountId === account.id ? 'h-5 w-5 animate-spin' : 'h-5 w-5'} /></Button></div>
+                <div className="flex items-center gap-2">
+                  {!account.autoAllocationEnabled ? <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500" title="Excluded from Automatic storage allocation. Existing files and Sync are not affected.">Allocation Disabled</span> : null}
+                  <Button variant="outline" size="icon" onClick={() => sync(account.id)} disabled={syncingAccountId === account.id}><RefreshCw className={syncingAccountId === account.id ? 'h-5 w-5 animate-spin' : 'h-5 w-5'} /></Button>
+                </div>
               </div>
-              <div className="mt-6">
-                <div className="mb-2 flex items-center justify-between text-sm">
+              <div className="mt-4 grid gap-3">
+                <div className="mb-1 flex items-center justify-between text-sm">
                   <span className="flex items-center gap-2 font-semibold"><span className={cn('h-3 w-3 rounded-full', color.split(' ')[0])} />storage</span>
                   <span className="font-bold">{percent}%</span>
                 </div>
                 <div className="h-2 rounded-full bg-slate-100"><div className={cn('h-full rounded-full', color.split(' ')[0])} style={{ width: `${percent}%` }} /></div>
-                <div className="mt-3 flex items-center justify-between text-sm text-slate-500"><span>{formatBytes(account.storageAccount?.usedBytes)} / {storageLimitLabel(account)}</span><span>Available {availableLabel(account)}</span></div>
+                <div className="flex items-center justify-between text-sm text-slate-500"><span>{formatBytes(account.storageAccount?.usedBytes)} / {storageLimitLabel(account)}</span><span>Available {availableLabel(account)}</span></div>
+                <div className="flex items-center justify-between gap-3 border-t border-slate-100 pt-3">
+                  <div className="min-w-0">
+                    <p className="flex items-center gap-2 text-sm font-semibold">Auto Allocation <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500">{account.autoAllocationEnabled ? 'ON' : 'OFF'}</span></p>
+                    <p className="mt-0.5 text-xs text-slate-500">{account.autoAllocationEnabled ? 'Eligible for Automatic storage allocation.' : 'Excluded from Automatic storage allocation. Existing files and Sync are not affected.'}</p>
+                  </div>
+                  <Switch
+                    checked={account.autoAllocationEnabled}
+                    onChange={(next) => toggleAutoAllocation(account.id, next)}
+                    disabled={updatingAllocationId === account.id}
+                    aria-label={`${account.autoAllocationEnabled ? 'Disable' : 'Enable'} automatic allocation for ${account.email}`}
+                  />
+                </div>
               </div>
             </Card>
           )

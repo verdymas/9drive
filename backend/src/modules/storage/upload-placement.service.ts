@@ -70,6 +70,19 @@ export async function resolveUploadPlacement(
   }
 
   // ── Automatic: route among all eligible accounts. ───────────────────────
+  // Auto Allocation OFF is a pre-routing exclusion, BEFORE any routing strategy
+  // or existing-folder-location preference applies. Zero allocation-enabled
+  // accounts (regardless of quota) is a distinct failure from "enabled but all
+  // full" — the latter still surfaces as AUTOMATIC_STORAGE_NO_ELIGIBLE_ACCOUNT
+  // from `selectAccount` below.
+  const anyAllocationEnabled = await prisma.connectedAccount.findFirst({
+    where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected', autoAllocationEnabled: true },
+    select: { id: true },
+  })
+  if (!anyAllocationEnabled) {
+    throw new AppError('AUTOMATIC_STORAGE_NO_ALLOCATION_ENABLED_ACCOUNT', 'No storage account is enabled for Automatic allocation. Enable Auto Allocation for at least one account in Quota Tracker, or select a storage account manually.', 400)
+  }
+
   const preferredAccountIds = await preferredLocationAccountIds(userId, virtualFolderId)
   const account = await selectAccount(userId, sizeBytes, reservedBytesByAccount, undefined, true, preferredAccountIds.filter((id) => !excludeAccountIds.includes(id)))
   if (!account) {

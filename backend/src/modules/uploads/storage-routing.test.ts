@@ -1,12 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { planBatchUploads } from './storage-routing.service.js'
+import { planBatchUploads, selectAccount } from './storage-routing.service.js'
 
 // ── Mocks: isolate the planner from prisma + quota sync ──────────────────────
 // vi.mock factories are hoisted above the imports, so any spy/object they
 // close over must come from vi.hoisted (see remote-import.service.test.ts).
 const h = vi.hoisted(() => {
   const now = new Date('2026-08-07T00:00:00.000Z')
-  const account = (id: string, provider: string, availableBytes: bigint | null, stale = false) => ({
+  const account = (id: string, provider: string, availableBytes: bigint | null, stale = false, autoAllocationEnabled = true) => ({
     id,
     userId: 'user-1',
     providerConfigId: null,
@@ -20,6 +20,7 @@ const h = vi.hoisted(() => {
     tokenExpiresAt: null,
     scopes: [],
     status: 'connected',
+    autoAllocationEnabled,
     lastError: null,
     createdAt: now,
     updatedAt: now,
@@ -46,8 +47,12 @@ const h = vi.hoisted(() => {
         return all.filter((a) => {
           if (where?.userId && a.userId !== where.userId) return false
           if (where?.status && a.status !== where.status) return false
-          if (where?.provider && a.provider !== where.provider) return false
+          if (where?.provider) {
+            const wanted = typeof where.provider === 'object' && 'in' in where.provider ? where.provider.in : [where.provider]
+            if (!wanted.includes(a.provider)) return false
+          }
           if (where?.id && a.id !== where.id) return false
+          if (where?.autoAllocationEnabled !== undefined && a.autoAllocationEnabled !== where.autoAllocationEnabled) return false
           return true
         })
       }),
@@ -262,5 +267,92 @@ describe('planBatchUploads', () => {
     setupAccounts([h.account('acc-a', 'google_drive', 100n)])
     const result = await planBatchUploads('user-1', [])
     expect(result).toEqual({ plans: [], totalBytes: 0n, totalRoutedBytes: 0n, unroutedBytes: 0n })
+  })
+
+  it('excludes autoAllocationEnabled:false accounts from planning (all-OFF → all files unroutable)', async () => {
+    setupAccounts([h.account('acc-a', 'google_drive', 500n, false, false), h.account('acc-b', 'google_drive', 200n, false, false)])
+    const result = await planBatchUploads('user-1', [{ fileName: 'a.bin', mimeType: 'application/octet-stream', sizeBytes: 10n }])
+    expect(result.plans).toEqual([{ fileName: 'a.bin', accountId: null, provider: null, reason: 'no_accounts' }])
+    expect(result.unroutedBytes).toBe(10n)
+  })
+
+  it('excludes autoAllocationEnabled:false accounts even when they have the most space', async () => {
+    setupAccounts([h.account('acc-a', 'google_drive', 500n, false, false), h.account('acc-b', 'google_drive', 50n, false, true)])
+    const result = await planBatchUploads('user-1', [{ fileName: 'a.bin', mimeType: 'application/octet-stream', sizeBytes: 30n }])
+    expect(result.plans).toEqual([{ fileName: 'a.bin', accountId: 'acc-b', provider: 'google_drive', reason: null }])
+  })
+
+  it('keeps a manual (soft) pin on an autoAllocationEnabled:false account authoritative', async () => {
+    setupAccounts([h.account('acc-a', 'google_drive', 500n, false, false), h.account('acc-b', 'google_drive', 200n, false, true)])
+    const result = await planBatchUploads('user-1', [{ fileName: 'a.bin', mimeType: 'application/octet-stream', sizeBytes: 30n }], 'acc-a')
+    expect(result.plans).toEqual([{ fileName: 'a.bin', accountId: 'acc-a', provider: 'google_drive', reason: null }])
+  })
+})
+
+describe('selectAccount — Auto Allocation eligibility', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    h.allAccounts.length = 0
+    ;(h.prismaMock.uploadRoutingPolicy.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'policy-1',
+      userId: 'user-1',
+      mode: 'most_available',
+      priorityAccountIds: [],
+      roundRobinCursor: 0,
+      createdAt: h.now,
+      updatedAt: h.now,
+    })
+  })
+
+  it('excludes autoAllocationEnabled:false accounts from most_available routing', async () => {
+    setupAccounts([h.account('acc-a', 'google_drive', 500n, false, false), h.account('acc-b', 'google_drive', 200n, false, true)])
+    const selected = await selectAccount('user-1', 30n)
+    expect(selected?.id).toBe('acc-b')
+  })
+
+  it('round-robin with B disabled rotates A,C,A,C — no cursor skip, no broken rotation', async () => {
+    const accounts = [
+      h.account('acc-a', 'google_drive', 100n, false, true),
+      h.account('acc-b', 'google_drive', 100n, false, false),
+      h.account('acc-c', 'google_drive', 100n, false, true),
+    ]
+    setupAccounts(accounts)
+    let cursor = 0
+    ;(h.prismaMock.uploadRoutingPolicy.upsert as ReturnType<typeof vi.fn>).mockImplementation(async () => ({
+      id: 'policy-1',
+      userId: 'user-1',
+      mode: 'round_robin',
+      priorityAccountIds: ['acc-a', 'acc-b', 'acc-c'],
+      roundRobinCursor: cursor,
+      createdAt: h.now,
+      updatedAt: h.now,
+    }))
+    ;(h.prismaMock.uploadRoutingPolicy.update as ReturnType<typeof vi.fn>).mockImplementation(async ({ data }: { data: { roundRobinCursor: number } }) => {
+      cursor = data.roundRobinCursor
+      return { id: 'policy-1' }
+    })
+    const seen: string[] = []
+    for (let i = 0; i < 4; i++) {
+      const selected = await selectAccount('user-1', 10n)
+      expect(selected).not.toBeNull()
+      seen.push(selected!.id)
+    }
+    // Disabled acc-b must never appear; rotation stays A,C,A,C.
+    expect(seen).toEqual(['acc-a', 'acc-c', 'acc-a', 'acc-c'])
+  })
+
+  it('priority mode ignores autoAllocationEnabled:false accounts', async () => {
+    setupAccounts([h.account('acc-a', 'google_drive', 100n, false, false), h.account('acc-b', 'google_drive', 200n, false, true)])
+    ;(h.prismaMock.uploadRoutingPolicy.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'policy-1',
+      userId: 'user-1',
+      mode: 'priority',
+      priorityAccountIds: ['acc-a'],
+      roundRobinCursor: 0,
+      createdAt: h.now,
+      updatedAt: h.now,
+    })
+    const selected = await selectAccount('user-1', 10n)
+    expect(selected?.id).toBe('acc-b')
   })
 })
