@@ -60,10 +60,15 @@ export async function resolveUploadPlacement(
       throw new AppError('AUTOMATIC_STORAGE_REROUTE_EXHAUSTED', 'The selected storage account was already tried and failed.', 409)
     }
     const account = await prisma.connectedAccount.findFirst({
-      where: { id: requestedAccountId, userId, status: 'connected' },
+      where: { id: requestedAccountId, userId, status: { in: ['connected', 'reauth_required'] } },
       include: { storageAccount: true },
     })
     if (!account) throw new AppError('STORAGE_ACCOUNT_NOT_ELIGIBLE', 'The selected storage account is not connected.', 400)
+    // A manual pin may bypass Auto Allocation OFF but never broken
+    // authentication — reauth accounts fail fast with a reconnect action.
+    if (account.status === 'reauth_required') {
+      throw new AppError('GOOGLE_REAUTH_REQUIRED', 'This Google Drive account needs to be reconnected before it can be used.', 401)
+    }
     await assertSufficientQuota(account, sizeBytes, reservedBytesByAccount)
     const placement = await materializeFor(userId, virtualFolderId, account, mode, 'manual')
     return placement
@@ -76,7 +81,7 @@ export async function resolveUploadPlacement(
   // full" — the latter still surfaces as AUTOMATIC_STORAGE_NO_ELIGIBLE_ACCOUNT
   // from `selectAccount` below.
   const anyAllocationEnabled = await prisma.connectedAccount.findFirst({
-    where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected', autoAllocationEnabled: true },
+    where: { userId, provider: { in: ['google_drive', 's3'] }, status: { in: ['connected', 'reauth_required'] }, autoAllocationEnabled: true },
     select: { id: true },
   })
   if (!anyAllocationEnabled) {

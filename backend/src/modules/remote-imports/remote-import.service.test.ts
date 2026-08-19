@@ -312,6 +312,15 @@ describe('retryRemoteConvert', () => {
     expect(h.removeJobDirSpy).toHaveBeenCalledTimes(1)
   })
 
+  it('auth-only failure (GOOGLE_REAUTH_REQUIRED) keeps the job dir + output on a generic retry', async () => {
+    await withRow({ status: 'failed', sourceType: 'hls_master', errorCode: 'GOOGLE_REAUTH_REQUIRED' })
+    await retryRemoteImport('import-1', 'user-1')
+    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2)
+    // The generic retry usually wipes the dir; for reauth it must NOT, so the
+    // remuxed output + resume marker survive and the retry resumes at upload.
+    expect(h.removeJobDirSpy).not.toHaveBeenCalled()
+  })
+
   it('enqueues BEFORE persisting the queued state (queue-first order)', async () => {
     const calls: string[] = []
     const enqueueOrder: string[] = []

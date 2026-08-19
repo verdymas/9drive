@@ -57,9 +57,15 @@ export async function ensureFolderStorageLocation(
   connectedAccountId: string,
 ): Promise<MaterializationResult> {
   const account = await prisma.connectedAccount.findFirst({
-    where: { id: connectedAccountId, userId, status: 'connected' },
+    where: { id: connectedAccountId, userId, status: { in: ['connected', 'reauth_required'] } },
   })
   if (!account) throw new AppError('STORAGE_ACCOUNT_NOT_ELIGIBLE', 'The storage account is not connected or does not belong to this user.', 400)
+  // Materializing a folder needs provider API access — a reauth account cannot
+  // serve it and no FolderStorageLocation row must be created. This is a
+  // distinct, stable error, never a folder-404 or a generic failure.
+  if (account.status === 'reauth_required') {
+    throw new AppError('GOOGLE_REAUTH_REQUIRED', 'This Google Drive account needs to be reconnected before it can be used.', 401)
+  }
 
   for (let attempt = 0; attempt < MAX_MATERIALIZATION_ATTEMPTS; attempt++) {
     const existing = await prisma.folderStorageLocation.findUnique({

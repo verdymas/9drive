@@ -13,10 +13,10 @@ import { resolveUploadPlacement } from '../storage/upload-placement.service.js'
 import type { RemoteImportJobData } from './queue.js'
 import { followRemoteUrl } from './url-downloader.js'
 import { uploadToGoogleResumable } from './google-resumable-uploader.js'
-import { createTempPartFile, removeTempFile, appendStreamToTemp } from './temp-storage.js'
+import { createTempPartFile, removeTempFile, appendStreamToTemp, tempFilePath } from './temp-storage.js'
 import { sanitizeFileName } from './filename-sanitize.js'
 import { runHlsPipeline } from './hls/pipeline.js'
-import { hlsJobDir, readResumeMarker, removeJobDir, removeResumeMarker } from './hls/job-dir.js'
+import { hlsJobDir, readResumeMarker, removeJobDir, removeResumeMarker, writeResumeMarker } from './hls/job-dir.js'
 import type { ContainerChoice } from './hls/output.js'
 import { ensureJobDir } from './hls/materializer.js'
 import { verifyOutput } from './hls/verify.js'
@@ -472,6 +472,23 @@ async function processHlsImport(
       const reportedBytes = downloadedBytes > 0n ? downloadedBytes : BigInt((await fsp.stat(outputPath!)).size)
       placement = await resolveUploadPlacement(userId, folderId, record.connectedAccountId, reportedBytes, undefined, 'remote-import')
     } catch (error: any) {
+      // GOOGLE_REAUTH_REQUIRED must preserve the remuxed output: write a
+      // resume marker so the job dir survives (the finally keeps the dir only
+      // while a marker exists) and the retry resumes at 'uploading' — the
+      // output file is already on disk, so no FFmpeg or segment re-download.
+      if (error?.code === 'GOOGLE_REAUTH_REQUIRED') {
+        await writeResumeMarker(jobDir, {
+          version: 1,
+          mode: 'remux-only',
+          playlistUrl: mimeCodeSuffix === 'mp4' ? sourceUrl : sourceUrl,
+          audioPlaylistUrl: null,
+          container: mimeCodeSuffix,
+          expectAudio: Boolean(record.hlsAudioTrackId || record.sourceType === 'hls_media'),
+          mediaDurationSeconds: mediaDurationSeconds ?? 0,
+        }).catch(() => undefined)
+        await markFailed(importId, 'GOOGLE_REAUTH_REQUIRED', 'Google Drive authorization expired. Reconnect the account, then retry.')
+        return null
+      }
       const code = error?.code === 'AUTOMATIC_STORAGE_NO_ELIGIBLE_ACCOUNT' ? 'NO_ACCOUNT_WITH_ENOUGH_SPACE' : (error?.code ?? 'IMPORT_FAILED')
       await markFailed(importId, code, error?.message ?? 'No connected storage account has enough space.')
       return null
@@ -543,6 +560,7 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
   const record = await prisma.remoteImport.findUnique({ where: { id: importId } })
   if (!record) return
   if (record.status === 'cancelled') return
+  keepPartForReauth = false
 
   const userId = record.userId
   const folderId = record.folderId
@@ -578,6 +596,27 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
       const result = await processHlsImport(job, record)
       if (result) return
       // processHlsImport already finalized status on failure; just return.
+      return
+    }
+
+    // ── Upload-resume retry (§32 Case C): the temp part from a failed
+    // upload (incl. GOOGLE_REAUTH_REQUIRED) survives on disk — skip the probe
+    // and download entirely and go straight to placement + upload.
+    const resumePartPath = tempFilePath(importId)
+    const resumePartExists = await fsp.access(resumePartPath).then(() => true).catch(() => false)
+    if (record.retryFromStage === 'uploading' && resumePartExists) {
+      const partStat = await fsp.stat(resumePartPath)
+      await continueFromPart({
+        importId,
+        record,
+        userId,
+        folderId,
+        fileName,
+        mimeType,
+        sourceUrl,
+        tempPartPath: resumePartPath,
+        contentLength: BigInt(partStat.size),
+      }, assertWithinTimeout)
       return
     }
 
@@ -633,60 +672,126 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
 
     assertWithinTimeout()
 
-    // Select destination account (default routing or pinned account).
-    await updateStage(importId, STAGES.SELECTING_STORAGE)
-    // Placement: a user-chosen account pin (import record) is authoritative —
-    // the import fails with a clear quota error rather than silently switching
-    // providers. Without a pin, Automatic routing applies (destination folder
-    // locations are only a soft preference).
-    let placement
-    try {
-      placement = await resolveUploadPlacement(userId, folderId, record.connectedAccountId, downloaded.contentLength ?? 0n, undefined, 'remote-import')
-    } catch (error: any) {
-      const code = error?.code === 'AUTOMATIC_STORAGE_NO_ELIGIBLE_ACCOUNT' ? 'NO_ACCOUNT_WITH_ENOUGH_SPACE' : (error?.code ?? 'IMPORT_FAILED')
-      await markFailed(importId, code, error?.message ?? 'No connected storage account has enough space.')
-      await removeTempFile(importId)
+    // Shared placement→upload→register tail (also used by upload-resume retries).
+    await continueFromPart({
+      importId,
+      record,
+      userId,
+      folderId,
+      fileName,
+      mimeType,
+      sourceUrl: finalUrl,
+      tempPartPath: downloaded.tempPartPath,
+      contentLength: downloaded.contentLength,
+    }, assertWithinTimeout)
+  } catch (error) {
+    // The tail already finalized a placement failure (with the mapped stable
+    // code) and signals via this marker so the row is not overwritten. A
+    // reauth marker also preserves the local part for the resume retry.
+    if (error instanceof AppError && (error as { placementFinalized?: boolean }).placementFinalized) {
+      if (error.code === '__PLACEMENT_REAUTH__') keepPartForReauth = true
       return
     }
-    const account = placement.connectedAccount
-
-    // Upload. `uploadTempFile` starts the upload phase (stage + uploadTotalBytes
-    // from the local file) and writes throttled progress for both providers.
-    const uploaded = await uploadTempFile(importId, { id: account.id, provider: account.provider }, userId, folderId, fileName, mimeType, downloaded.tempPartPath, placement.folderStorageLocation.providerFolderId)
-    assertWithinTimeout()
-    await updateStage(importId, STAGES.REGISTERING)
-
-    // Register file + link the import row.
-    const sizeBytes = downloaded.contentLength ?? (await fsp.stat(downloaded.tempPartPath)).size
-    const file = await registerFile(importId, { ...record, connectedAccountId: account.id, fileName, mimeType }, uploaded.providerFileId, BigInt(sizeBytes))
-
-    const totalSize = BigInt(sizeBytes)
-    await prisma.remoteImport.update({
-      where: { id: importId },
-      data: {
-        status: 'completed',
-        stage: STAGES.FINISHED,
-        fileId: file.id,
-        completedAt: new Date(),
-        downloadedBytes: totalSize,
-        uploadedBytes: totalSize,
-        uploadTotalBytes: totalSize,
-        tempPath: null,
-        finalUrlEncrypted: encryptText(finalUrl),
-      },
-    })
-    logProgress(importId, STAGES.FINISHED, 'import completed')
-
-    // Quota sync (best-effort).
-    if (account.provider === 's3') syncS3Quota(account.id).catch(() => undefined)
-    else syncGoogleQuota(account.id).catch(() => undefined)
-  } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error'
     const code = error instanceof AppError ? error.code : 'IMPORT_FAILED'
     const meta = (error as { meta?: string })?.meta
     await markFailed(importId, code, message, meta)
     console.error(`[remote-import] ${importId} failed: ${code} ${message}${meta ? ` :: ${meta.slice(-800)}` : ''}`)
+    // Auth-only failures keep the local .part so a retry after reconnect can
+    // resume at upload instead of re-downloading a possibly multi-GB source.
+    if (code === 'GOOGLE_REAUTH_REQUIRED') keepPartForReauth = true
   } finally {
-    await removeTempFile(importId)
+    if (!keepPartForReauth) await removeTempFile(importId)
   }
+}
+
+/** Set when the execution failed with GOOGLE_REAUTH_REQUIRED — the local part
+ * survives so the post-reconnect retry resumes at upload. */
+let keepPartForReauth = false
+
+type ContinuePartInput = {
+  importId: string
+  record: { id: string; userId: string; folderId: string | null; connectedAccountId: string | null; fileName: string; mimeType: string | null }
+  userId: string
+  folderId: string | null
+  fileName: string
+  mimeType: string
+  sourceUrl: string
+  tempPartPath: string
+  contentLength: bigint | null
+}
+
+/**
+ * Shared direct-import tail: placement → provider upload → registration.
+ * Used both by a fresh download and by an upload-resume retry with a
+ * surviving temp part. A `GOOGLE_REAUTH_REQUIRED` placement failure marks the
+ * row failed and keeps the part on disk (the caller's finally skips deletion)
+ * so the post-reconnect retry reuses it instead of re-downloading the source.
+ */
+async function continueFromPart(
+  input: ContinuePartInput,
+  assertWithinTimeout: () => void,
+) {
+  const { importId, userId, folderId, fileName, mimeType, sourceUrl, tempPartPath, contentLength } = input
+
+  // Select destination account (default routing or pinned account).
+  await updateStage(importId, STAGES.SELECTING_STORAGE)
+  // Placement: a user-chosen account pin (import record) is authoritative —
+  // the import fails with a clear quota error rather than silently switching
+  // providers. Without a pin, Automatic routing applies (destination folder
+  // locations are only a soft preference).
+  let placement
+  try {
+    placement = await resolveUploadPlacement(userId, folderId, input.record.connectedAccountId, contentLength ?? 0n, undefined, 'remote-import')
+  } catch (error: any) {
+    // GOOGLE_REAUTH_REQUIRED must preserve the local output for an
+    // upload-resume retry after the user reconnects — no temp-file deletion.
+    if (error?.code === 'GOOGLE_REAUTH_REQUIRED') {
+      await markFailed(importId, 'GOOGLE_REAUTH_REQUIRED', 'Google Drive authorization expired. Reconnect the account, then retry.')
+      const marker = new AppError('__PLACEMENT_REAUTH__', '', 0)
+      ;(marker as { placementFinalized?: boolean }).placementFinalized = true
+      throw marker
+    }
+    const code = error?.code === 'AUTOMATIC_STORAGE_NO_ELIGIBLE_ACCOUNT' ? 'NO_ACCOUNT_WITH_ENOUGH_SPACE' : (error?.code ?? 'IMPORT_FAILED')
+    // Finalize here; the caller's catch must not overwrite this stable code.
+    await markFailed(importId, code, error?.message ?? 'No connected storage account has enough space.')
+    const marker = new AppError('__PLACEMENT_FINALIZED__', '', 0)
+    ;(marker as { placementFinalized?: boolean }).placementFinalized = true
+    throw marker
+  }
+  const account = placement.connectedAccount
+
+  assertWithinTimeout()
+
+  // Upload. `uploadTempFile` starts the upload phase (stage + uploadTotalBytes
+  // from the local file) and writes throttled progress for both providers.
+  const uploaded = await uploadTempFile(importId, { id: account.id, provider: account.provider }, userId, folderId, fileName, mimeType, tempPartPath, placement.folderStorageLocation.providerFolderId)
+
+  assertWithinTimeout()
+  await updateStage(importId, STAGES.REGISTERING)
+
+  // Register file + link the import row.
+  const sizeBytes = contentLength ?? (await fsp.stat(tempPartPath)).size
+  const file = await registerFile(importId, { ...input.record, connectedAccountId: account.id, fileName, mimeType }, uploaded.providerFileId, BigInt(sizeBytes))
+
+  const totalSize = BigInt(sizeBytes)
+  await prisma.remoteImport.update({
+    where: { id: importId },
+    data: {
+      status: 'completed',
+      stage: STAGES.FINISHED,
+      fileId: file.id,
+      completedAt: new Date(),
+      downloadedBytes: totalSize,
+      uploadedBytes: totalSize,
+      uploadTotalBytes: totalSize,
+      tempPath: null,
+      finalUrlEncrypted: encryptText(sourceUrl),
+    },
+  })
+  logProgress(importId, STAGES.FINISHED, 'import completed')
+
+  // Quota sync (best-effort).
+  if (account.provider === 's3') syncS3Quota(account.id).catch(() => undefined)
+  else syncGoogleQuota(account.id).catch(() => undefined)
 }

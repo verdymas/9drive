@@ -55,10 +55,19 @@ function isCancelled(accountId: string): () => boolean {
 
 export async function runAccountSync(userId: string, connectedAccountId: string): Promise<AccountSyncResult> {
   const account = await prisma.connectedAccount.findFirst({
-    where: { id: connectedAccountId, userId, status: 'connected' },
-    select: { id: true, provider: true },
+    where: { id: connectedAccountId, userId, status: { in: ['connected', 'reauth_required'] } },
+    select: { id: true, provider: true, status: true },
   })
   if (!account) throw new AppError('SYNC_ACCOUNT_UNAVAILABLE', 'The storage account is not connected or does not belong to this user.', 404)
+
+  // Broken auth blocks provider access: fail the run cleanly with the stable
+  // reconnect error instead of hammering Google. NEVER runs missing cleanup —
+  // an auth failure does not mean provider resources were deleted.
+  if (account.status === 'reauth_required') {
+    const run = await createSyncRun({ userId, connectedAccountId: account.id, provider: account.provider })
+    await failSyncRun(run.id, 'GOOGLE_REAUTH_REQUIRED', 'This Google Drive account needs to be reconnected before it can be used.')
+    return { accountId: account.id, provider: account.provider, status: 'failed', runId: run.id, stats: emptyStats(), errorCode: 'GOOGLE_REAUTH_REQUIRED', errorMessage: 'This Google Drive account needs to be reconnected before it can be used.' }
+  }
 
   const run = await createSyncRun({ userId, connectedAccountId: account.id, provider: account.provider })
   const stats = emptyStats()
@@ -154,8 +163,10 @@ function errorCodeFor(error: unknown): string {
 export async function runSyncAll(userId: string): Promise<{
   results: AccountSyncResult[]
 }> {
+  // Reauth-required accounts are included so they surface in the results with
+  // the reconnect error instead of being silently skipped.
   const accounts = await prisma.connectedAccount.findMany({
-    where: { userId, status: 'connected' },
+    where: { userId, status: { in: ['connected', 'reauth_required'] } },
     select: { id: true, provider: true },
   })
 

@@ -121,16 +121,19 @@ model ProviderConfig {
 }
 
 model OauthState {
-  id               String         @id @default(uuid()) @db.Char(36)
-  userId           String?        @map("user_id") @db.Char(36)
-  providerConfigId String         @map("provider_config_id") @db.Char(36)
-  flow             String         @default("connect") @db.VarChar(32)
-  stateHash        String         @unique @map("state_hash") @db.VarChar(255)
-  expiresAt        DateTime       @map("expires_at")
-  usedAt           DateTime?      @map("used_at")
-  createdAt        DateTime       @default(now()) @map("created_at")
-  user             User?          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  providerConfig   ProviderConfig @relation(fields: [providerConfigId], references: [id], onDelete: Cascade)
+  id                 String         @id @default(uuid()) @db.Char(36)
+  userId             String?        @map("user_id") @db.Char(36)
+  providerConfigId   String         @map("provider_config_id") @db.Char(36)
+  flow               String         @default("connect") @db.VarChar(32)
+  stateHash          String         @unique @map("state_hash") @db.VarChar(255)
+  expiresAt          DateTime       @map("expires_at")
+  usedAt             DateTime?      @map("used_at")
+  // Bound for the `reconnect` flow: the existing ConnectedAccount this OAuth
+  // state must update. Deliberately not an FK — the state outlives the account.
+  connectedAccountId String?        @map("connected_account_id") @db.Char(36)
+  createdAt          DateTime       @default(now()) @map("created_at")
+  user               User?          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  providerConfig     ProviderConfig @relation(fields: [providerConfigId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@map("oauth_states")
@@ -155,6 +158,10 @@ model ConnectedAccount {
   // quota refresh and existing reads are unaffected.
   autoAllocationEnabled Boolean                 @default(true) @map("auto_allocation_enabled")
   lastError             String?                 @map("last_error") @db.Text
+  // Set when Google refresh fails with invalid_grant: auto-routing is
+  // suspended, manual pins fail fast, sync/quota fail fast — until reconnect.
+  reauthRequiredAt      DateTime?               @map("reauth_required_at")
+  lastAuthErrorCode     String?                 @map("last_auth_error_code") @db.VarChar(64)
   createdAt             DateTime                @default(now()) @map("created_at")
   updatedAt             DateTime                @updatedAt @map("updated_at")
   user                  User                    @relation(fields: [userId], references: [id], onDelete: Cascade)

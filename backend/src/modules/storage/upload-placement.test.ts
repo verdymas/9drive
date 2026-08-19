@@ -8,7 +8,7 @@ import { resolveUploadPlacement, rerouteOrFail } from './upload-placement.servic
 // materialization is mocked to return a canned location.
 const h = vi.hoisted(() => {
   const now = new Date('2026-08-07T00:00:00.000Z')
-  const account = (id: string, provider: string, availableBytes: bigint | null, autoAllocationEnabled = true) => ({
+  const account = (id: string, provider: string, availableBytes: bigint | null, autoAllocationEnabled = true, status = 'connected') => ({
     id,
     userId: 'user-1',
     providerConfigId: null,
@@ -21,9 +21,11 @@ const h = vi.hoisted(() => {
     refreshTokenEncrypted: null,
     tokenExpiresAt: null,
     scopes: [],
-    status: 'connected',
+    status,
     autoAllocationEnabled,
     lastError: null,
+    reauthRequiredAt: status === 'reauth_required' ? new Date('2026-08-18T00:00:00.000Z') : null,
+    lastAuthErrorCode: status === 'reauth_required' ? 'GOOGLE_OAUTH_INVALID_GRANT' : null,
     createdAt: now,
     updatedAt: now,
     storageAccount: {
@@ -50,7 +52,10 @@ const h = vi.hoisted(() => {
         const match = accounts.find((a) => {
           if (where.id !== undefined) return a.id === where.id
           if (where.userId && a.userId !== where.userId) return false
-          if (where.status && a.status !== where.status) return false
+          if (where.status) {
+            const wanted = typeof where.status === 'object' && 'in' in where.status ? where.status.in : [where.status]
+            if (!wanted.includes(a.status)) return false
+          }
           if (where.autoAllocationEnabled !== undefined && a.autoAllocationEnabled !== where.autoAllocationEnabled) return false
           return true
         })
@@ -122,7 +127,10 @@ function reset() {
     const match = h.accounts.find((a) => {
       if (where.id !== undefined) return a.id === where.id
       if (where.userId && a.userId !== where.userId) return false
-      if (where.status && a.status !== where.status) return false
+      if (where.status) {
+        const wanted = typeof where.status === 'object' && 'in' in where.status ? where.status.in : [where.status]
+        if (!wanted.includes(a.status)) return false
+      }
       if (where.autoAllocationEnabled !== undefined && a.autoAllocationEnabled !== where.autoAllocationEnabled) return false
       return true
     })
@@ -249,6 +257,14 @@ describe('resolveUploadPlacement — Manual (authoritative)', () => {
     h.accounts.push(h.account('acc-a', 'google_drive', 1n, false), h.account('acc-b', 'google_drive', 100n, true))
     await expect(resolveUploadPlacement('user-1', 'movies', 'acc-a', 10n, undefined, 'multipart')).rejects.toMatchObject({ code: 'STORAGE_ACCOUNT_INSUFFICIENT_QUOTA' })
     expect(ensureFolderStorageLocation).not.toHaveBeenCalled()
+  })
+
+  it('manual pin on a REAUTH_REQUIRED account fails fast with GOOGLE_REAUTH_REQUIRED (auth beats any pin)', async () => {
+    h.accounts.push(h.account('acc-a', 'google_drive', 500n, false, 'reauth_required'))
+    await expect(resolveUploadPlacement('user-1', 'movies', 'acc-a', 5n, undefined, 'multipart')).rejects.toMatchObject({ code: 'GOOGLE_REAUTH_REQUIRED' })
+    expect(ensureFolderStorageLocation).not.toHaveBeenCalled()
+    // Even the soft-pin fallback route must NOT select a reauth account.
+    await expect(resolveUploadPlacement('user-1', 'movies', 'acc-a', 5n, undefined, 'multipart')).rejects.toMatchObject({ code: 'GOOGLE_REAUTH_REQUIRED' })
   })
 })
 

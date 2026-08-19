@@ -110,7 +110,9 @@ export function UploadProvider({ children }: { children: ReactNode }) {
         let message = `Chunk upload failed (HTTP ${response.status})`
         try {
           const errorBody = await response.json() as { message?: string; code?: string }
-          if (errorBody?.message) {
+          if (errorBody?.code === 'GOOGLE_REAUTH_REQUIRED') {
+            message = 'Google Drive connection expired. Reconnect this account to continue uploading files.'
+          } else if (errorBody?.message) {
             message = errorBody.message
             if (errorBody.code) message = `${errorBody.code}: ${errorBody.message}`
           }

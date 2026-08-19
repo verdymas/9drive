@@ -91,10 +91,19 @@ const h = vi.hoisted(() => {
   const prisma = {
     connectedAccount: {
       findFirst: async ({ where }: any) => {
-        const a = ACCOUNTS.find((x) => x.id === where.id && x.userId === where.userId && x.status === where.status)
+        const okStatus = (x: any, w: any) => {
+          if (!w.status) return true
+          const wanted = typeof w.status === 'object' && 'in' in w.status ? w.status.in : [w.status]
+          return wanted.includes(x.status)
+        }
+        const a = ACCOUNTS.find((x) => x.id === where.id && x.userId === where.userId && okStatus(x, where))
         return a ? { ...a } : null
       },
-      findMany: async ({ where }: any) => ACCOUNTS.filter((x) => x.userId === where.userId && x.status === where.status).map((a) => ({ ...a })),
+      findMany: async ({ where }: any) => ACCOUNTS.filter((x) => {
+        if (x.userId !== where.userId) return false
+        const wanted = typeof where.status === 'object' && 'in' in where.status ? where.status.in : [where.status]
+        return wanted.includes(x.status)
+      }).map((a) => ({ ...a })),
       findUniqueOrThrow: async ({ where }: any) => {
         const a = ACCOUNTS.find((x) => x.id === where.id)
         if (!a) throw new TypeError('account not found')
@@ -271,6 +280,32 @@ beforeEach(() => {
 })
 
 describe('sync boundary — provider is READ-ONLY (§29/§70)', () => {
+  it('REAUTH_REQUIRED account fails the run cleanly: no scan, no missing cleanup, files intact', async () => {
+    h.ACCOUNTS.push(
+      { id: 'acc-reauth', userId: 'u1', provider: 'google_drive', status: 'reauth_required' },
+      { id: 'acc-ok', userId: 'u1', provider: 'google_drive', status: 'connected' },
+    )
+    installDriveFakes()
+    addFile('acc-reauth', 'app-root', 'f-keep', 'Keep.mp4', '10')
+
+    const { results } = await runSyncAll('u1')
+    const reauth = results.find((r) => r.accountId === 'acc-reauth')
+    expect(reauth!.status).toBe('failed')
+    expect(reauth!.errorCode).toBe('GOOGLE_REAUTH_REQUIRED')
+    // The run row carries the stable reconnect error (visible in Sync history).
+    expect(h.db.runs.some((r) => r.errorCode === 'GOOGLE_REAUTH_REQUIRED')).toBe(true)
+    // Nothing triggered the drive scanner for the reauth account (no lists
+    // beyond the fake registration calls — every recorded call is a provider
+    // QUERY, so assert none targeted the reauth account's tree).
+    expect(driveH.calls.every((q) => !q.includes('acc-reauth'))).toBe(true)
+    // No missing cleanup ran: nothing was deleted for the reauth account
+    // (its tree was never scanned, so no rows were ever created or removed);
+    // the healthy account completed and reconciled its own tree.
+    expect(h.db.files.length).toBe(0)
+    expect(h.db.locations.length).toBe(0)
+    expect(results.filter((r) => r.status === 'completed')).toHaveLength(1)
+  })
+
   it('full Sync All makes ZERO provider write calls', async () => {
     h.ACCOUNTS.push(
       { id: 'acc-a', userId: 'u1', provider: 'google_drive', status: 'connected' },

@@ -12,7 +12,7 @@ const h = vi.hoisted(() => {
   // module-level function after imports, and the mock calls it at call time.
   let p2002Ref: ((message: string) => Error) | null = null
   const now = new Date('2026-08-07T00:00:00.000Z')
-  const account = (id: string, provider: string) => ({
+  const account = (id: string, provider: string, status = 'connected') => ({
     id,
     userId: 'user-1',
     providerConfigId: null,
@@ -25,8 +25,10 @@ const h = vi.hoisted(() => {
     refreshTokenEncrypted: null,
     tokenExpiresAt: null,
     scopes: [],
-    status: 'connected',
+    status,
     lastError: null,
+    reauthRequiredAt: status === 'reauth_required' ? new Date('2026-08-18T00:00:00.000Z') : null,
+    lastAuthErrorCode: status === 'reauth_required' ? 'GOOGLE_OAUTH_INVALID_GRANT' : null,
     createdAt: now,
     updatedAt: now,
   })
@@ -44,7 +46,10 @@ const h = vi.hoisted(() => {
         const match = h.accounts.find((a) => a.id === where.id)
         if (!match) return null
         if (where.userId && match.userId !== where.userId) return null
-        if (where.status && match.status !== where.status) return null
+        if (where.status) {
+          const wanted = typeof where.status === 'object' && 'in' in where.status ? where.status.in : [where.status]
+          if (!wanted.includes(match.status)) return null
+        }
         return match
       }),
     },
@@ -124,7 +129,10 @@ function reset() {
     const match = h.accounts.find((a) => a.id === where.id)
     if (!match) return null
     if (where.userId && match.userId !== where.userId) return null
-    if (where.status && match.status !== where.status) return null
+    if (where.status) {
+      const wanted = typeof where.status === 'object' && 'in' in where.status ? where.status.in : [where.status]
+      if (!wanted.includes(match.status)) return null
+    }
     return match
   })
   ;(h.prismaMock.folderStorageLocation.findUnique as ReturnType<typeof vi.fn>).mockImplementation(async ({ where }: { where: { folderId_connectedAccountId: { folderId: string; connectedAccountId: string } } }) => {
@@ -262,5 +270,13 @@ describe('ensureFolderStorageLocation', () => {
     expect(second.createdCount).toBe(0)
     expect(h.locations).toHaveLength(1)
     expect(createProviderFolder).toHaveBeenCalledTimes(1)
+  })
+
+  it('REAUTH_REQUIRED account → GOOGLE_REAUTH_REQUIRED, no provider call, no location row', async () => {
+    h.accounts.push(h.account('acc-reauth', 'google_drive', 'reauth_required'))
+    h.folders.push(h.folder('movies-reauth', 'Movies'))
+    await expect(ensureFolderStorageLocation('user-1', 'movies-reauth', 'acc-reauth')).rejects.toMatchObject({ code: 'GOOGLE_REAUTH_REQUIRED' })
+    expect(createProviderFolder).not.toHaveBeenCalled()
+    expect(h.locations).toHaveLength(0)
   })
 })

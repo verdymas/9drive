@@ -16,12 +16,12 @@ import * as Api from '@/lib/api'
 const summary = { totalBytes: '1000', usedBytes: '400', availableBytes: '600' }
 const routingPolicy = { policy: { id: 'p1', mode: 'most_available' as const, priorityAccountIds: [], roundRobinCursor: 0 } }
 
-const account = (id: string, autoAllocationEnabled: boolean) => ({
+const account = (id: string, autoAllocationEnabled: boolean, status = 'connected') => ({
   id,
   email: `${id}@example.com`,
   displayName: null,
   provider: 'google_drive',
-  status: 'connected',
+  status,
   autoAllocationEnabled,
   storageAccount: { totalBytes: '500', usedBytes: '100', availableBytes: '400', lastSyncedAt: '2026-08-07T00:00:00.000Z' },
 })
@@ -66,6 +66,46 @@ function cardFor(email: string): HTMLElement {
   const emailNodes = screen.getAllByText(email)
   return emailNodes[1].closest('[class*="rounded-2xl"]') as HTMLElement
 }
+
+describe('QuotaTrackerPage — REAUTH_REQUIRED account state', () => {
+  beforeEach(() => {
+    vi.spyOn(window, 'open').mockImplementation(() => null)
+  })
+
+  it('renders the Reconnection Required pill, friendly text, and last-known quota for a reauth account (Allocation ON)', async () => {
+    mockApi([account('acc-a', true, 'reauth_required')])
+    await renderPage()
+    const card = cardFor('acc-a@example.com')
+    expect(within(card).getByText('Reconnection Required')).toBeTruthy()
+    expect(within(card).getByText(/Google authorization is no longer valid/)).toBeTruthy()
+    // Auto Allocation stays ON — preference visible, effective usage suspended.
+    expect(within(card).getByText('Unavailable until reconnected.')).toBeTruthy()
+    expect(within(card).getByRole('switch', { name: /disable automatic allocation for acc-a/i })).toHaveAttribute('aria-checked', 'true')
+    // Last-known quota numbers still shown.
+    expect(within(card).getByText(/100 B \/ 500 B/)).toBeTruthy()
+  })
+
+  it('reconnect button calls POST /connected-accounts/:id/reconnect and opens the popup URL', async () => {
+    mockApi([account('acc-a', true, 'reauth_required')])
+    await renderPage()
+    // Extend the mock: the reconnect POST returns the OAuth URL; the popup
+    // stub records where the popup is redirected.
+    const popupRedirects: string[] = []
+    ;(window.open as ReturnType<typeof vi.fn>).mockImplementation(() => ({ location: { set href(v: string) { popupRedirects.push(v) } }, document: { write: () => undefined } }) as unknown as Window)
+    const apiFetchMock = Api.apiFetch as unknown as ReturnType<typeof vi.fn>
+    const original = apiFetchMock.getMockImplementation() as (path: string, options?: RequestInit) => Promise<unknown>
+    apiFetchMock.mockImplementation(async (path: string, options?: RequestInit) => {
+      if (String(path) === '/connected-accounts/acc-a/reconnect' && options?.method === 'POST') return { url: 'https://accounts.google.com/o/oauth2/auth?state=xyz' }
+      return original(path, options)
+    })
+    const card = cardFor('acc-a@example.com')
+    await userEvent.click(within(card).getByRole('button', { name: /reconnect google drive/i }))
+    await waitFor(() => {
+      expect(Api.apiFetch).toHaveBeenCalledWith('/connected-accounts/acc-a/reconnect', expect.objectContaining({ method: 'POST' }))
+      expect(popupRedirects[0]).toContain('accounts.google.com')
+    })
+  })
+})
 
 describe('QuotaTrackerPage — Auto Allocation toggle', () => {
   beforeEach(() => {

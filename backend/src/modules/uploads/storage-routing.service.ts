@@ -70,8 +70,11 @@ export async function selectAccount(
   allowFallback = false,
   preferredAccountIds: string[] = [],
 ) {
+  // Reauth-required accounts are fetched for the stale-quota pass (the sync
+  // attempt naturally marks them) but are NOT eligible for selection.
+  const visibleStatuses = { in: ['connected', 'reauth_required'] }
   const accounts = await prisma.connectedAccount.findMany({
-    where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected', autoAllocationEnabled: true, ...(targetAccountId ? { id: targetAccountId } : {}) },
+    where: { userId, provider: { in: ['google_drive', 's3'] }, status: visibleStatuses, autoAllocationEnabled: true, ...(targetAccountId ? { id: targetAccountId } : {}) },
     include: { storageAccount: true },
   })
 
@@ -90,11 +93,15 @@ export async function selectAccount(
   }))
 
   const fresh = await prisma.connectedAccount.findMany({
-    where: { userId, provider: { in: ['google_drive', 's3'] }, status: 'connected', autoAllocationEnabled: true },
+    where: { userId, provider: { in: ['google_drive', 's3'] }, status: visibleStatuses, autoAllocationEnabled: true },
     include: { storageAccount: true },
   })
 
   const eligible = fresh
+    // Auth is a hard eligibility filter for Automatic routing (unlike the
+    // saved Auto Allocation preference, which stays intact): reauth accounts
+    // are excluded even when a FolderStorageLocation exists for them.
+    .filter((account) => account.status !== 'reauth_required')
     .map((account) => ({
       account,
       availableBytes:
@@ -200,8 +207,10 @@ export async function planBatchUploads(
   // but if it cannot hold a file the planner falls back to the other connected
   // accounts. Only when the pin is not a connected Google Drive account at all
   // (missing, or an S3 pin — S3 is never planned) is every file unroutable.
+  // Reauth-required accounts stay in the stale-sync pass but are never planned.
+  const visibleStatuses = { in: ['connected', 'reauth_required'] }
   const accounts = await prisma.connectedAccount.findMany({
-    where: { userId, provider: 'google_drive', status: 'connected' },
+    where: { userId, provider: 'google_drive', status: visibleStatuses },
     include: { storageAccount: true },
   })
 
@@ -233,18 +242,21 @@ export async function planBatchUploads(
   }))
 
   const fresh = await prisma.connectedAccount.findMany({
-    where: { userId, provider: 'google_drive', status: 'connected' },
+    where: { userId, provider: 'google_drive', status: visibleStatuses },
     include: { storageAccount: true },
   })
 
   // Auto Allocation OFF is a pre-routing exclusion: accounts opted out of
   // automatic placement are dropped from the pool before any strategy applies,
   // UNLESS the user explicitly pinned one (a manual pin stays authoritative).
+  // Reauth-required accounts are excluded regardless of a pin — broken auth is
+  // never bypassable by manual selection.
   const planningPool = targetAccountId
     ? fresh.filter((account) => account.id === targetAccountId || account.autoAllocationEnabled)
     : fresh.filter((account) => account.autoAllocationEnabled)
+  const healthyPool = planningPool.filter((account) => account.status !== 'reauth_required')
 
-  if (planningPool.length === 0) {
+  if (healthyPool.length === 0) {
     for (const file of files) {
       plans.push({
         fileName: file.fileName,
@@ -256,7 +268,7 @@ export async function planBatchUploads(
     return { plans, totalBytes, totalRoutedBytes, unroutedBytes: totalBytes }
   }
 
-  const available = planningPool.map((account) => ({
+  const available = healthyPool.map((account) => ({
     account,
     availableBytes:
       account.storageAccount?.availableBytes === null || account.storageAccount?.availableBytes === undefined

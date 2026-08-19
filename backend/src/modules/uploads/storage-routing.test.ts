@@ -6,7 +6,7 @@ import { planBatchUploads, selectAccount } from './storage-routing.service.js'
 // close over must come from vi.hoisted (see remote-import.service.test.ts).
 const h = vi.hoisted(() => {
   const now = new Date('2026-08-07T00:00:00.000Z')
-  const account = (id: string, provider: string, availableBytes: bigint | null, stale = false, autoAllocationEnabled = true) => ({
+  const account = (id: string, provider: string, availableBytes: bigint | null, stale = false, autoAllocationEnabled = true, status = 'connected') => ({
     id,
     userId: 'user-1',
     providerConfigId: null,
@@ -19,9 +19,11 @@ const h = vi.hoisted(() => {
     refreshTokenEncrypted: null,
     tokenExpiresAt: null,
     scopes: [],
-    status: 'connected',
+    status,
     autoAllocationEnabled,
     lastError: null,
+    reauthRequiredAt: status === 'reauth_required' ? new Date('2026-08-18T00:00:00.000Z') : null,
+    lastAuthErrorCode: status === 'reauth_required' ? 'GOOGLE_OAUTH_INVALID_GRANT' : null,
     createdAt: now,
     updatedAt: now,
     storageAccount: {
@@ -46,7 +48,10 @@ const h = vi.hoisted(() => {
         const all = h.allAccounts
         return all.filter((a) => {
           if (where?.userId && a.userId !== where.userId) return false
-          if (where?.status && a.status !== where.status) return false
+          if (where?.status) {
+            const wanted = typeof where.status === 'object' && 'in' in where.status ? where.status.in : [where.status]
+            if (!wanted.includes(a.status)) return false
+          }
           if (where?.provider) {
             const wanted = typeof where.provider === 'object' && 'in' in where.provider ? where.provider.in : [where.provider]
             if (!wanted.includes(a.provider)) return false
@@ -354,5 +359,48 @@ describe('selectAccount — Auto Allocation eligibility', () => {
     })
     const selected = await selectAccount('user-1', 10n)
     expect(selected?.id).toBe('acc-b')
+  })
+})
+
+describe('routing eligibility — REAUTH_REQUIRED', () => {
+  it('selectAccount picks the healthy account over a reauth one with an existing mapping (A reauth, B healthy)', async () => {
+    setupAccounts([
+      h.account('acc-a', 'google_drive', 500n, false, true, 'reauth_required'),
+      h.account('acc-b', 'google_drive', 100n, false, true),
+    ])
+    // Even though acc-a has both more space and a preferred folder location
+    // (mapping exists), broken auth must exclude it — B wins.
+    const selected = await selectAccount('user-1', 10n, new Map(), undefined, true, ['acc-a'])
+    expect(selected?.id).toBe('acc-b')
+  })
+
+  it('selectAccount returns null when every enabled account is reauth', async () => {
+    setupAccounts([
+      h.account('acc-a', 'google_drive', 500n, false, true, 'reauth_required'),
+      h.account('acc-b', 'google_drive', 300n, false, true, 'reauth_required'),
+    ])
+    const selected = await selectAccount('user-1', 10n)
+    expect(selected).toBeNull()
+  })
+
+  it('planBatchUploads excludes reauth accounts even with a manual pin', async () => {
+    setupAccounts([h.account('acc-a', 'google_drive', 500n, false, true, 'reauth_required')])
+    const result = await planBatchUploads('user-1', [{ fileName: 'a.bin', mimeType: 'application/octet-stream', sizeBytes: 10n }], 'acc-a')
+    expect(result.plans[0]).toEqual({ fileName: 'a.bin', accountId: null, provider: null, reason: 'no_accounts' })
+  })
+
+  it('planBatchUploads routes to the healthy account when the pinned one is reauth', async () => {
+    setupAccounts([
+      h.account('acc-a', 'google_drive', 500n, false, true, 'reauth_required'),
+      h.account('acc-b', 'google_drive', 100n, false, true),
+    ])
+    const result = await planBatchUploads('user-1', [{ fileName: 'a.bin', mimeType: 'application/octet-stream', sizeBytes: 10n }], 'acc-a')
+    expect(result.plans[0].accountId).toBe('acc-b')
+  })
+
+  it('keeps S3 accounts unaffected by the reauth concept (status stays connected)', async () => {
+    setupAccounts([h.account('acc-s3', 's3', 500n, false, true)])
+    const selected = await selectAccount('user-1', 10n)
+    expect(selected?.id).toBe('acc-s3')
   })
 })

@@ -8,7 +8,7 @@ import { AppError } from '../../utils/app-error.js'
 import { decryptText, encryptText, hashToken, randomToken } from '../../utils/crypto.js'
 import { hashPassword } from '../../utils/password.js'
 import { createAuditLog } from '../../utils/audit.js'
-import { createOAuthClient, syncGoogleQuota } from '../google/google.service.js'
+import { createOAuthClient, replaceCredentialsAfterReconnect, syncGoogleQuota } from '../google/google.service.js'
 import { syncS3Quota, testS3Connection } from '../s3/s3.service.js'
 
 export const connectedAccountRouter = Router()
@@ -31,8 +31,11 @@ async function syncQuotaForAccount(account: { id: string; provider: string }) {
 
 connectedAccountRouter.get('/', requireAuth, async (req: AuthRequest, res, next) => {
   try {
+    // Reauth-required accounts stay visible (with their last-known quota) so
+    // the UI can surface the reconnect action.
+    const connectedStatuses = { in: ['connected', 'reauth_required'] }
     const accounts = await prisma.connectedAccount.findMany({
-      where: { userId: req.user!.id, status: 'connected' },
+      where: { userId: req.user!.id, status: connectedStatuses },
       include: { storageAccount: true },
       orderBy: { createdAt: 'desc' },
     })
@@ -41,7 +44,7 @@ connectedAccountRouter.get('/', requireAuth, async (req: AuthRequest, res, next)
 
     const syncedAccounts = missingQuota.length > 0
       ? await prisma.connectedAccount.findMany({
-        where: { userId: req.user!.id, status: 'connected' },
+        where: { userId: req.user!.id, status: connectedStatuses },
         include: { storageAccount: true },
         orderBy: { createdAt: 'desc' },
       })
@@ -176,6 +179,52 @@ connectedAccountRouter.get('/google/connect', requireAuth, async (req: AuthReque
   }
 })
 
+/**
+ * Reconnect an EXISTING Google Drive connected account. The account id is
+ * bound into the OAuth state server-side (never an unsigned callback
+ * parameter); the callback updates the same ConnectedAccount row — no second
+ * account is ever created. `prompt=consent` is intentional so Google has an
+ * opportunity to issue a fresh refresh token.
+ */
+connectedAccountRouter.post('/:id/reconnect', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const accountId = String(req.params.id)
+    const account = await prisma.connectedAccount.findFirst({
+      where: { id: accountId, userId: req.user!.id },
+      select: { id: true, provider: true },
+    })
+    if (!account) throw new AppError('STORAGE_ACCOUNT_NOT_FOUND', 'The storage account does not exist.', 404)
+    if (account.provider !== 'google_drive') throw new AppError('INVALID_REQUEST', 'Only Google Drive accounts support reconnect.', 400)
+
+    const config = await prisma.providerConfig.findFirstOrThrow({
+      where: { userId: null, provider: 'google_drive', status: 'active' },
+      orderBy: { createdAt: 'desc' },
+    })
+    const state = randomToken()
+    await prisma.oauthState.create({
+      data: {
+        userId: req.user!.id,
+        providerConfigId: config.id,
+        flow: 'reconnect',
+        stateHash: hashToken(state),
+        connectedAccountId: account.id,
+        expiresAt: new Date(Date.now() + 10 * 60_000),
+      },
+    })
+    const client = createOAuthClient(config)
+    const url = client.generateAuthUrl({
+      access_type: 'offline',
+      prompt: 'consent',
+      include_granted_scopes: true,
+      scope: config.scopes as string[],
+      state,
+    })
+    return res.json({ url })
+  } catch (error) {
+    return next(error)
+  }
+})
+
 connectedAccountRouter.get('/google/callback', async (req, res, next) => {
   try {
     const query = z.object({ code: z.string(), state: z.string() }).parse(req.query)
@@ -240,6 +289,48 @@ connectedAccountRouter.get('/google/callback', async (req, res, next) => {
       return res.redirect(`${env.FRONTEND_URL}/google-auth?token=${handoffToken}`)
     }
 
+    if (oauthState.flow === 'reconnect') {
+      // Reconnect MUST update the existing account bound in the state — never
+      // creates or upserts a new row. Identity is validated against the stored
+      // provider account id so a different Google account cannot silently
+      // replace the credentials of the originally linked one.
+      if (!oauthState.userId || !oauthState.connectedAccountId) return res.status(400).json({ code: 'GOOGLE_OAUTH_STATE_INVALID', message: 'OAuth state expired.' })
+      const existing = await prisma.connectedAccount.findFirst({
+        where: { id: oauthState.connectedAccountId, userId: oauthState.userId, provider: 'google_drive' },
+      })
+      if (!existing) return res.status(400).json({ code: 'GOOGLE_OAUTH_STATE_INVALID', message: 'OAuth state expired.' })
+      if (existing.providerAccountId !== providerAccountId) {
+        console.info('[google-auth] reconnect_account_mismatch', JSON.stringify({ event: 'google.auth.reconnect_failed', connectedAccountId: existing.id, provider: 'google_drive', oauthErrorCode: 'account_mismatch' }))
+        return res.status(400).json({
+          code: 'GOOGLE_RECONNECT_ACCOUNT_MISMATCH',
+          message: 'You authenticated a different Google account. Reconnect using the same Google Drive account originally linked here.',
+        })
+      }
+      // Reconnect exists because the old refresh token is unusable — a callback
+      // without a refresh token must NOT mark the account healthy while keeping
+      // the known-invalid token.
+      if (!tokens.refresh_token) {
+        return res.status(400).json({
+          code: 'GOOGLE_OAUTH_REFRESH_TOKEN_MISSING',
+          message: 'Google did not return a new refresh token. Reconnect again and grant consent (approve all prompts) when prompted.',
+        })
+      }
+      await replaceCredentialsAfterReconnect(existing.id, {
+        accessTokenEncrypted: encryptText(tokens.access_token),
+        refreshTokenEncrypted: encryptText(tokens.refresh_token),
+        tokenExpiresAt: new Date(tokens.expiry_date ?? Date.now() + 3600_000),
+        providerConfigId: oauthState.providerConfigId,
+        email,
+        displayName: profile.data.name,
+        avatarUrl: profile.data.picture,
+        scopes: oauthState.providerConfig.scopes as string[],
+      })
+      await prisma.oauthState.update({ where: { id: oauthState.id }, data: { usedAt: new Date() } })
+      await syncGoogleQuota(existing.id).catch(() => undefined)
+      console.info('[google-auth] reconnect_succeeded', JSON.stringify({ event: 'google.auth.reconnect_succeeded', connectedAccountId: existing.id, provider: 'google_drive' }))
+      return res.redirect(`${env.FRONTEND_URL}/google-connected?status=success`)
+    }
+
     if (oauthState.flow !== 'connect' || !oauthState.userId) return res.status(400).json({ code: 'GOOGLE_OAUTH_STATE_INVALID', message: 'OAuth state expired.' })
     const existingAccount = await prisma.connectedAccount.findUnique({ where: { userId_provider_providerAccountId: { userId: oauthState.userId, provider: 'google_drive', providerAccountId } } })
     const refreshTokenEncrypted = tokens.refresh_token ? encryptText(tokens.refresh_token) : existingAccount?.refreshTokenEncrypted
@@ -297,6 +388,9 @@ connectedAccountRouter.post('/:id/sync-quota', requireAuth, async (req: AuthRequ
       },
     })
   } catch (error) {
+    // Map GOOGLE_REAUTH_REQUIRED (and other AppErrors) to a proper status so
+    // the frontend sees the friendly code + message instead of a raw 500.
+    if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
     return next(error)
   }
 })

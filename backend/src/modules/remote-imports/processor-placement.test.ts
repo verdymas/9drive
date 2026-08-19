@@ -232,6 +232,22 @@ describe('processRemoteImportJob — placement routing (direct)', () => {
     expect(h.downloader).not.toHaveBeenCalled()
   })
 
+  it('GOOGLE_REAUTH_REQUIRED at placement preserves the downloaded .part on disk', async () => {
+    h.resolvePlacement.mockRejectedValue(new AppError('GOOGLE_REAUTH_REQUIRED', 'This Google Drive account needs to be reconnected before it can be used.', 401))
+    // The downloader writes a real temp part under the scratch dir.
+    h.downloader.mockImplementation(async (_url: string) => {
+      const partPath = path.join(scratchDir, 'import-1.part')
+      await fsp.writeFile(partPath, 'downloaded-bytes')
+      return { finalUrl: 'https://example.com/movie.mkv', tempPartPath: partPath, contentLength: 16n, supportsRange: true }
+    })
+    await processRemoteImportJob(job())
+    const finalRow = h.rows.get('import-1')!
+    expect(finalRow.status).toBe('failed')
+    expect(finalRow.errorCode).toBe('GOOGLE_REAUTH_REQUIRED')
+    // The part file SURVIVES for the post-reconnect upload-resume retry.
+    await expect(fsp.access(path.join(scratchDir, 'import-1.part'))).resolves.toBeUndefined()
+  })
+
   it('fails with the raw quota code when a pinned account is insufficient (manual stays authoritative)', async () => {
     h.resolvePlacement.mockRejectedValue(new AppError('STORAGE_ACCOUNT_INSUFFICIENT_QUOTA', 'The selected storage account does not have enough available space.', 400))
     await processRemoteImportJob(job())

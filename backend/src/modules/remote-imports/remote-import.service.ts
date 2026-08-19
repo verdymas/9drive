@@ -412,8 +412,10 @@ async function enqueueRetry(
   // A full retry re-runs the whole pipeline — clear any stale HLS scratch dir
   // so segments from the failed attempt never leak into the next one. A
   // convert-only retry relies on the job dir (segments + resume marker) being
-  // preserved, so it never wipes.
-  if (kind === 'full') await removeJobDirIfExists(userId, importId)
+  // preserved, so it never wipes. An auth-only failure (GOOGLE_REAUTH_REQUIRED)
+  // also preserves the dir: the remuxed output + resume marker let the retry
+  // resume at upload instead of re-downloading the HLS segments.
+  if (kind === 'full' && row.errorCode !== 'GOOGLE_REAUTH_REQUIRED') await removeJobDirIfExists(userId, importId)
 
   // CAS: only one retry request may transition failed→queued; if another
   // request already moved the row, this is a duplicate → conflict.

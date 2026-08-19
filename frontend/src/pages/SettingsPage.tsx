@@ -7,6 +7,7 @@ import { PageHeader } from '@/components/drive/PageHeader'
 import { apiFetch, formatBytes, API_URL } from '@/lib/api'
 import { getGravatarUrl } from '@/lib/gravatar'
 import { getStoredUser, getAccessToken, clearAuthSession } from '@/lib/auth'
+import { isReauthRequired, accountStatusLabel, REAUTH_MESSAGE } from '@/lib/connectedAccounts'
 
 type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string; autoAllocationEnabled: boolean; storageAccount?: { totalBytes: string | null; usedBytes: string; availableBytes: string | null; lastSyncedAt: string | null } | null }
 
@@ -305,6 +306,28 @@ export function SettingsPage() {
     }
   }
 
+  async function reconnectDrive(accountId: string) {
+    setConnecting(true)
+    setMessage('')
+    const popup = window.open('', 'google-drive-connect', 'width=540,height=720')
+    if (popup) {
+      popup.document.write('<html><head><title>Connecting...</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f8fafc;color:#64748b;}</style></head><body><div style="text-align:center;"><h2>Reconnecting to Google...</h2><p>Please wait while we redirect you.</p></div></body></html>')
+    }
+    try {
+      const data = await apiFetch<{ url: string }>(`/connected-accounts/${accountId}/reconnect`, { method: 'POST' })
+      if (popup) {
+        popup.location.href = data.url
+      } else {
+        window.location.href = data.url
+      }
+    } catch (error) {
+      if (popup) popup.close()
+      setMessage(error instanceof Error ? error.message : 'Failed to start Google Drive reconnect')
+    } finally {
+      setConnecting(false)
+    }
+  }
+
   async function sync(accountId: string) {
     setSyncingAccountId(accountId)
     try {
@@ -399,15 +422,19 @@ export function SettingsPage() {
             <h2 className="text-[16px] font-bold">Connected Storage Accounts</h2>
             <div className="mt-3.5 grid gap-3">
               {accounts.length === 0 ? <p className="text-xs text-slate-500">No connected storage account yet.</p> : <>
-                <label className="grid gap-1.5 text-xs font-semibold text-slate-500">Choose Account<select className="h-10 rounded-xl border border-slate-200 bg-white px-3 text-sm focus:outline-none" value={selectedAccount?.id ?? ''} onChange={(event) => setSelectedAccountId(event.target.value)}>{accounts.map((account) => <option key={account.id} value={account.id}>{providerLabel(account.provider)} - {account.displayName || account.email} ({account.status})</option>)}</select></label>
+                <label className="grid gap-1.5 text-xs font-semibold text-slate-500">Choose Account<select className="h-10 rounded-xl border border-slate-200 bg-white px-3 text-sm focus:outline-none" value={selectedAccount?.id ?? ''} onChange={(event) => setSelectedAccountId(event.target.value)}>{accounts.map((account) => <option key={account.id} value={account.id}>{providerLabel(account.provider)} - {account.displayName || account.email} ({accountStatusLabel(account.status)})</option>)}</select></label>
                 {selectedAccount ? <div className="rounded-xl bg-slate-50 p-3 dark:bg-slate-900/60 border border-slate-100 dark:border-slate-800">
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                    <div className="min-w-0"><p className="break-all font-semibold text-sm">{selectedAccount.displayName || selectedAccount.email}</p><p className="text-xs text-slate-500 mt-0.5">{providerLabel(selectedAccount.provider)} · {selectedAccount.status}</p></div>
+                    <div className="min-w-0"><p className="break-all font-semibold text-sm">{selectedAccount.displayName || selectedAccount.email}</p><p className="text-xs text-slate-500 mt-0.5">{providerLabel(selectedAccount.provider)} · {accountStatusLabel(selectedAccount.status)}</p></div>
                     <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                      {isReauthRequired(selectedAccount) ? <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700" title={REAUTH_MESSAGE}>Reconnection Required</span> : null}
                       {!selectedAccount.autoAllocationEnabled ? <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500" title="Excluded from Automatic storage allocation. Existing files and Sync are not affected.">Allocation Disabled</span> : null}
-                      <div className="grid grid-cols-2 gap-2 sm:flex"><Button className="w-full" size="sm" variant="outline" onClick={() => sync(selectedAccount.id)} disabled={syncingAccountId === selectedAccount.id}><RefreshCw className={syncingAccountId === selectedAccount.id ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{syncingAccountId === selectedAccount.id ? 'Syncing...' : 'Sync'}</Button><Button className="w-full" size="sm" variant="danger" onClick={() => setAccountToDisconnect(selectedAccount)}><Trash2 className="h-4 w-4" />Disconnect</Button></div>
+                      <div className="grid grid-cols-2 gap-2 sm:flex">
+                        {isReauthRequired(selectedAccount) ? <Button className="w-full" size="sm" onClick={() => reconnectDrive(selectedAccount.id)} disabled={connecting}><Link2 className="h-4 w-4" />{connecting ? 'Opening...' : 'Reconnect Google Drive'}</Button> : null}
+                        <Button className="w-full" size="sm" variant="outline" onClick={() => sync(selectedAccount.id)} disabled={syncingAccountId === selectedAccount.id}><RefreshCw className={syncingAccountId === selectedAccount.id ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{syncingAccountId === selectedAccount.id ? 'Syncing...' : 'Sync'}</Button><Button className="w-full" size="sm" variant="danger" onClick={() => setAccountToDisconnect(selectedAccount)}><Trash2 className="h-4 w-4" />Disconnect</Button></div>
                     </div>
                   </div>
+                  {isReauthRequired(selectedAccount) ? <p className="mt-2 rounded-xl bg-amber-50 p-2.5 text-xs text-amber-800">{REAUTH_MESSAGE}</p> : null}
                   <div className="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
                     <div className="rounded-xl bg-white dark:bg-slate-950 p-2 border border-slate-100 dark:border-slate-800"><p className="font-extrabold text-slate-950">{formatBytes(selectedAccount.storageAccount?.usedBytes)}</p><p className="mt-0.5 text-[10px] text-slate-500">Used</p></div>
                     <div className="rounded-xl bg-white dark:bg-slate-950 p-2 border border-slate-100 dark:border-slate-800"><p className="font-extrabold text-slate-950">{storageLimitLabel(selectedAccount)}</p><p className="mt-0.5 text-[10px] text-slate-500">Total</p></div>

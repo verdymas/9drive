@@ -6,6 +6,7 @@ import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/drive/PageHeader'
 import { apiFetch, formatBytes } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { isReauthRequired, REAUTH_MESSAGE } from '@/lib/connectedAccounts'
 
 type StorageSummary = { totalBytes: string; usedBytes: string; availableBytes: string }
 type ConnectedAccount = { id: string; email: string; displayName?: string | null; provider: string; status: string; autoAllocationEnabled: boolean; storageAccount?: { totalBytes: string | null; usedBytes: string; availableBytes: string | null; lastSyncedAt: string | null } | null }
@@ -53,6 +54,7 @@ export function QuotaTrackerPage() {
   const [refreshing, setRefreshing] = useState(false)
   const [syncingAccountId, setSyncingAccountId] = useState<string | null>(null)
   const [updatingAllocationId, setUpdatingAllocationId] = useState<string | null>(null)
+  const [reconnectingAccountId, setReconnectingAccountId] = useState<string | null>(null)
 
   async function load() {
     const [summaryData, accountData, policyData] = await Promise.all([
@@ -117,8 +119,29 @@ export function QuotaTrackerPage() {
     try {
       await apiFetch(`/connected-accounts/${accountId}/sync-quota`, { method: 'POST' })
       await load()
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Failed to refresh quota.')
     } finally {
       setSyncingAccountId(null)
+    }
+  }
+
+  async function reconnectDrive(accountId: string) {
+    if (reconnectingAccountId) return
+    setReconnectingAccountId(accountId)
+    const popup = window.open('', 'google-drive-connect', 'width=540,height=720')
+    if (popup) {
+      popup.document.write('<html><head><title>Connecting...</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f8fafc;color:#64748b;}</style></head><body><div style="text-align:center;"><h2>Reconnecting to Google...</h2><p>Please wait while we redirect you.</p></div></body></html>')
+    }
+    try {
+      const data = await apiFetch<{ url: string }>(`/connected-accounts/${accountId}/reconnect`, { method: 'POST' })
+      if (popup) popup.location.href = data.url
+      else window.location.href = data.url
+    } catch (error) {
+      if (popup) popup.close()
+      setMessage(error instanceof Error ? error.message : 'Failed to start Google Drive reconnect.')
+    } finally {
+      setReconnectingAccountId(null)
     }
   }
 
@@ -214,6 +237,7 @@ export function QuotaTrackerPage() {
         ) : accounts.map((account) => {
           const percent = pct(account)
           const color = statusColor(percent)
+          const reauth = isReauthRequired(account)
           return (
             <Card key={account.id} className="overflow-hidden p-5">
               <div className="flex items-start justify-between gap-4">
@@ -222,10 +246,19 @@ export function QuotaTrackerPage() {
                   <div><h2 className="font-extrabold">{providerLabel(account.provider)}</h2><p className="text-sm text-slate-500">{account.email}</p></div>
                 </div>
                 <div className="flex items-center gap-2">
+                  {reauth ? <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700" title={REAUTH_MESSAGE}>Reconnection Required</span> : null}
                   {!account.autoAllocationEnabled ? <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500" title="Excluded from Automatic storage allocation. Existing files and Sync are not affected.">Allocation Disabled</span> : null}
                   <Button variant="outline" size="icon" onClick={() => sync(account.id)} disabled={syncingAccountId === account.id}><RefreshCw className={syncingAccountId === account.id ? 'h-5 w-5 animate-spin' : 'h-5 w-5'} /></Button>
                 </div>
               </div>
+              {reauth ? (
+                <div className="mt-3 rounded-xl bg-amber-50 p-3 text-xs text-amber-800">
+                  <p>{REAUTH_MESSAGE}</p>
+                  <Button size="sm" variant="soft" className="mt-2" onClick={() => reconnectDrive(account.id)} disabled={reconnectingAccountId === account.id}>
+                    <Link2 className="h-4 w-4" />{reconnectingAccountId === account.id ? 'Opening...' : 'Reconnect Google Drive'}
+                  </Button>
+                </div>
+              ) : null}
               <div className="mt-4 grid gap-3">
                 <div className="mb-1 flex items-center justify-between text-sm">
                   <span className="flex items-center gap-2 font-semibold"><span className={cn('h-3 w-3 rounded-full', color.split(' ')[0])} />storage</span>
@@ -233,10 +266,19 @@ export function QuotaTrackerPage() {
                 </div>
                 <div className="h-2 rounded-full bg-slate-100"><div className={cn('h-full rounded-full', color.split(' ')[0])} style={{ width: `${percent}%` }} /></div>
                 <div className="flex items-center justify-between text-sm text-slate-500"><span>{formatBytes(account.storageAccount?.usedBytes)} / {storageLimitLabel(account)}</span><span>Available {availableLabel(account)}</span></div>
+                {reauth ? <p className="text-xs text-slate-400">Last known usage — quota unavailable until the account is reconnected.</p> : null}
                 <div className="flex items-center justify-between gap-3 border-t border-slate-100 pt-3">
                   <div className="min-w-0">
                     <p className="flex items-center gap-2 text-sm font-semibold">Auto Allocation <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500">{account.autoAllocationEnabled ? 'ON' : 'OFF'}</span></p>
-                    <p className="mt-0.5 text-xs text-slate-500">{account.autoAllocationEnabled ? 'Eligible for Automatic storage allocation.' : 'Excluded from Automatic storage allocation. Existing files and Sync are not affected.'}</p>
+                    <p className="mt-0.5 text-xs text-slate-500">
+                      {reauth
+                        ? account.autoAllocationEnabled
+                          ? 'Unavailable until reconnected.'
+                          : 'Unavailable until reconnected. Existing files and Sync are not affected.'
+                        : account.autoAllocationEnabled
+                          ? 'Eligible for Automatic storage allocation.'
+                          : 'Excluded from Automatic storage allocation. Existing files and Sync are not affected.'}
+                    </p>
                   </div>
                   <Switch
                     checked={account.autoAllocationEnabled}

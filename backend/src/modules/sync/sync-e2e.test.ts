@@ -42,11 +42,20 @@ const h = vi.hoisted(() => {
   const prisma = {
     connectedAccount: {
       findFirst: async ({ where }: any) => {
-        const acct = ACCOUNTS.find((x) => x.id === where.id && x.userId === where.userId && x.status === where.status)
+        const okStatus = (x: any, w: any) => {
+          if (!w.status) return true
+          const wanted = typeof w.status === 'object' && 'in' in w.status ? w.status.in : [w.status]
+          return wanted.includes(x.status)
+        }
+        const acct = ACCOUNTS.find((x) => x.id === where.id && x.userId === where.userId && okStatus(x, where))
         return acct ? { ...acct } : null
       },
       findMany: async ({ where }: any) =>
-        ACCOUNTS.filter((x) => x.userId === where.userId && x.status === where.status).map((a) => ({ ...a })),
+        ACCOUNTS.filter((x) => {
+        if (x.userId !== where.userId) return false
+        const wanted = typeof where.status === 'object' && 'in' in where.status ? where.status.in : [where.status]
+        return wanted.includes(x.status)
+      }).map((a) => ({ ...a })),
       findUniqueOrThrow: async ({ where }: any) => {
         const acct = ACCOUNTS.find((x) => x.id === where.id)
         if (!acct) throw new TypeError('account not found')

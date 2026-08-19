@@ -333,6 +333,11 @@ export function RemoteImportsPage() {
                           <span className="min-w-0 truncate">{hlsActivityLine(item) ?? hlsSummaryLine(item)}</span>
                         </p>
                       ) : null}
+                      {item.errorCode === 'GOOGLE_REAUTH_REQUIRED' ? (
+                        <p className="mt-1 inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-amber-700">
+                          Reconnect required — retry after reconnecting the Google Drive account
+                        </p>
+                      ) : null}
                       <p className="mt-0.5 min-w-0 truncate text-xs text-slate-500" title={`Created ${formatDate(item.createdAt)}${item.totalBytes ? ` · ${formatBytes(item.totalBytes)}` : ''}`}>
                         Created {formatDate(item.createdAt)}
                         {item.totalBytes ? ` · ${formatBytes(item.totalBytes)}` : ''}
