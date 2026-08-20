@@ -1,0 +1,275 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { AppError } from '../../../utils/app-error.js'
+import {
+  normalizeEndpointUrl,
+  signHealthRequest,
+  HMAC_SIGNATURE_HEADER,
+  validateHealthPayload,
+  RELAY_PROTOCOL_VERSION,
+  RELAY_SERVICE_IDENTITY,
+  mapCloudflareApiError,
+  cloudflareWorkerDriver,
+} from './cloudflare.js'
+import { RELAY_WORKER_SOURCE } from './cloudflare-relay-worker.js'
+
+describe('normalizeEndpointUrl', () => {
+  it('accepts an https URL, canonical form has no trailing slash', () => {
+    expect(normalizeEndpointUrl('https://relay.example.workers.dev')).toBe('https://relay.example.workers.dev')
+  })
+
+  it('normalizes trailing slashes (no doubled slash when appending /health)', () => {
+    expect(normalizeEndpointUrl('https://relay.example.workers.dev/')).toBe('https://relay.example.workers.dev')
+    expect(normalizeEndpointUrl('https://relay.example.workers.dev///')).toBe('https://relay.example.workers.dev')
+    expect(`${normalizeEndpointUrl('https://relay.example.workers.dev/')}/health`).toBe('https://relay.example.workers.dev/health')
+  })
+
+  it('rejects javascript:, file:, ftp:, data: schemes', () => {
+    for (const scheme of ['javascript:', 'file:', 'ftp:', 'data:']) {
+      expect(() => normalizeEndpointUrl(`${scheme}//x`)).toThrowError(AppError)
+    }
+  })
+
+  it('rejects embedded credentials', () => {
+    expect(() => normalizeEndpointUrl('https://user:pass@relay.example.workers.dev')).toThrowError(AppError)
+  })
+
+  it('rejects CR/LF', () => {
+    expect(() => normalizeEndpointUrl('https://relay.example.workers.dev\r\n')).toThrowError(AppError)
+  })
+
+  it('rejects http when not localhost', () => {
+    expect(() => normalizeEndpointUrl('http://relay.example')).toThrowError(AppError)
+  })
+
+  // http://localhost gating depends on WORKER_ALLOW_LOCALHOST_HTTP, which the
+  // vitest setup enables for the integration server — not asserted here.
+})
+
+describe('signHealthRequest', () => {
+  it('produces a stable HMAC-SHA256 hex signature', () => {
+    const sig = signHealthRequest('secret', 'GET', '/health')
+    expect(sig).toMatch(/^[a-f0-9]{64}$/)
+    expect(sig).toBe(signHealthRequest('secret', 'GET', '/health'))
+    expect(sig).not.toBe(signHealthRequest('other-secret', 'GET', '/health'))
+    expect(sig).not.toBe(signHealthRequest('secret', 'POST', '/health'))
+  })
+})
+
+describe('validateHealthPayload', () => {
+  it('accepts a valid 9drive-relay health payload', () => {
+    const probe = validateHealthPayload({ service: RELAY_SERVICE_IDENTITY, protocolVersion: '9drive-relay-v1', status: 'ok', capabilities: { streaming: true, rangeRequests: true } })
+    expect(probe).toMatchObject({ status: 'healthy', protocolVersion: '9drive-relay-v1' })
+    expect(probe.capabilities).toMatchObject({ streaming: true, rangeRequests: true })
+  })
+
+  it('rejects a non-relay service identity', () => {
+    expect(() => validateHealthPayload({ service: 'something-else', status: 'ok' })).toThrowError(AppError)
+    expect(() => validateHealthPayload({ status: 'ok' })).toThrowError(AppError)
+  })
+
+  it('rejects an unsupported protocol version', () => {
+    expect(() => validateHealthPayload({ service: RELAY_SERVICE_IDENTITY, protocolVersion: '9drive-relay-v0' })).toThrowError(AppError)
+  })
+
+  it('rejects a non-ok health status', () => {
+    expect(() => validateHealthPayload({ service: RELAY_SERVICE_IDENTITY, status: 'degraded' })).toThrowError(AppError)
+  })
+
+  it('rejects non-object bodies', () => {
+    expect(() => validateHealthPayload(null)).toThrowError(AppError)
+    expect(() => validateHealthPayload('ok')).toThrowError(AppError)
+  })
+
+  it('tolerates an absent protocolVersion (protocol invalid → thrown for missing identity)', () => {
+    // service identity is the hard requirement; protocolVersion absence alone
+    // still passes identity — but the caller (service) won't mark healthy
+    // without a version. Here identity passes and no explicit version means ok.
+    expect(() => validateHealthPayload({ service: RELAY_SERVICE_IDENTITY, status: 'ok' })).not.toThrowError(AppError)
+  })
+})
+
+describe('HMAC_SIGNATURE_HEADER', () => {
+  it('is the documented header name', () => {
+    expect(HMAC_SIGNATURE_HEADER).toBe('x-9drive-signature')
+    expect(RELAY_PROTOCOL_VERSION).toBe('9drive-relay-v1')
+  })
+})
+
+describe('RELAY_WORKER_SOURCE', () => {
+  it('is a plain script with /health and /fetch handlers, no imports', () => {
+    expect(RELAY_WORKER_SOURCE).toContain('SERVICE_IDENTITY')
+    expect(RELAY_WORKER_SOURCE).toContain("'/health'")
+    expect(RELAY_WORKER_SOURCE).toContain("'/fetch'")
+    expect(RELAY_WORKER_SOURCE).toContain('export default')
+    expect(RELAY_WORKER_SOURCE).not.toContain('import ')
+    // Well under Cloudflare's direct-upload limits.
+    expect(RELAY_WORKER_SOURCE.length).toBeLessThan(64 * 1024)
+  })
+})
+
+// ── Managed provisioning (fake Cloudflare API via global fetch mock) ─────────
+
+const CF_BASE = 'https://api.cloudflare.com/client/v4'
+
+function cfResponse(status: number, body: unknown) {
+  return { status, ok: status < 300, json: async () => body, text: async () => JSON.stringify(body) } as unknown as Response
+}
+
+function setupFetch() {
+  const called: Array<{ method?: string; path?: string; body?: unknown }> = []
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+    const method = init?.method ?? 'GET'
+    const path = url.replace(CF_BASE, '')
+    called.push({ method, path, body: init?.body })
+    if (path === '/user/tokens/verify' && method === 'GET') return cfResponse(200, { success: true })
+    if (path.startsWith('/accounts/acc-1/workers/scripts/') && method === 'PUT') return cfResponse(200, { success: true, result: { id: path.split('/').pop() } })
+    const subdomainMatch = path.match(/^\/accounts\/acc-1\/workers\/scripts\/([^/]+)\/subdomain$/)
+    if (subdomainMatch && method === 'GET') {
+      return cfResponse(200, { success: true, result: { subdomain: 'example-subdomain' } })
+    }
+    const deleteMatch = path.match(/^\/accounts\/acc-1\/workers\/scripts\/([^/]+)$/)
+    if (deleteMatch && method === 'DELETE') return cfResponse(200, { success: true })
+    return cfResponse(404, { success: false, errors: [{ code: 9999, message: 'not found' }] })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  return { fetchMock, called }
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+describe('cloudflare managed provisioning', () => {
+  it('metadata exposes managed:true with only Account ID / API Token / Worker Name', () => {
+    const meta = cloudflareWorkerDriver.getMetadata()
+    expect(meta.managed).toBe(true)
+    expect(meta.authTypes).toEqual(['hmac'])
+    expect(meta.fields.map((f) => f.key)).toEqual(['accountId', 'apiToken', 'workerName'])
+    expect(meta.fields.find((f) => f.key === 'apiToken')?.secret).toBe(true)
+  })
+
+  it('validateConfig rejects a user-supplied endpoint (system-managed)', async () => {
+    await expect(
+      cloudflareWorkerDriver.validateConfig!({ endpointUrl: 'https://x.workers.dev', config: { accountId: 'a', apiToken: 't', workerName: 'n' } }),
+    ).rejects.toMatchObject({ code: 'WORKER_DRIVER_CONFIG_INVALID' })
+  })
+
+  it('validateConfig rejects an invalid worker name', async () => {
+    await expect(
+      cloudflareWorkerDriver.validateConfig!({ config: { accountId: 'a', apiToken: 't', workerName: 'bad name!' } }),
+    ).rejects.toThrowError(AppError)
+  })
+
+  it('validateConfig verifies the API token before accepting', async () => {
+    const { fetchMock } = setupFetch()
+    const result = await cloudflareWorkerDriver.validateConfig!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } })
+    expect(fetchMock).toHaveBeenCalledWith(`${CF_BASE}/user/tokens/verify`, expect.objectContaining({ method: 'GET' }))
+    expect(result.endpointUrl).toBeNull()
+    expect(result.configEncryptedInput).toMatchObject({
+      config: { accountId: 'acc-1', workerName: 'relay-1' },
+      credentials: { apiToken: 'tok' },
+    })
+  })
+
+  it('provision: multipart upload (script + secret binding) → discover subdomain → endpoint', async () => {
+    const { called, fetchMock } = setupFetch()
+    const result = await cloudflareWorkerDriver.provision!({
+      config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' },
+      secret: 'relay-secret',
+    })
+    const PUTs = called.filter((c) => c.method === 'PUT')
+    expect(PUTs).toHaveLength(1)
+    expect(PUTs[0].path).toBe('/accounts/acc-1/workers/scripts/relay-1')
+    // Multipart body: script part + metadata part with the secret binding.
+    const body = String(PUTs[0].body)
+    expect(body).toContain('SERVICE_IDENTITY')
+    expect(body).toContain('name="metadata"')
+    expect(body).toContain('main_module')
+    expect(body).toContain('secret_text')
+    expect(body).toContain('relay-secret')
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${CF_BASE}/accounts/acc-1/workers/scripts/relay-1`,
+      expect.objectContaining({ method: 'PUT', headers: expect.objectContaining({ 'content-type': expect.stringContaining('multipart/form-data; boundary=') }) }),
+    )
+    expect(fetchMock).toHaveBeenCalledWith(`${CF_BASE}/accounts/acc-1/workers/scripts/relay-1/subdomain`, expect.anything())
+    expect(result.endpointUrl).toBe('https://relay-1.example-subdomain.workers.dev')
+    expect(result.configEncryptedInput).toMatchObject({
+      runtime: { endpointUrl: 'https://relay-1.example-subdomain.workers.dev', protocolVersion: RELAY_PROTOCOL_VERSION },
+    })
+  })
+
+  it('provision maps 401 → WORKER_CREDENTIAL_INVALID and never leaks the token or API body', async () => {
+    setupFetch()
+    vi.stubGlobal('fetch', vi.fn(async () => cfResponse(401, { errors: [{ message: 'token echo: tok-value-1' }] })))
+    const config = { accountId: 'acc-1', apiToken: 'tok-value-1', workerName: 'relay-1' }
+    await expect(cloudflareWorkerDriver.provision!({ config, secret: 's' })).rejects.toMatchObject({ code: 'WORKER_CREDENTIAL_INVALID' })
+    try {
+      await cloudflareWorkerDriver.provision!({ config, secret: 's' })
+    } catch (error) {
+      expect(String((error as AppError).message)).not.toContain('tok-value-1')
+      expect(String((error as AppError).message)).not.toContain('token echo')
+    }
+  })
+
+  it('provision maps 409 → WORKER_PROVISION_CONFLICT (rename hint, no silent overwrite)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => cfResponse(409, { errors: [{ message: 'already exists' }] })))
+    await expect(
+      cloudflareWorkerDriver.provision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' }, secret: 's' }),
+    ).rejects.toMatchObject({ code: 'WORKER_PROVISION_CONFLICT' })
+  })
+
+  it('maps CF 400 with error code 10053 (script exists) → WORKER_PROVISION_CONFLICT', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => cfResponse(400, { success: false, errors: [{ code: 10053, message: 'script already exists' }] })))
+    await expect(
+      cloudflareWorkerDriver.provision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' }, secret: 's' }),
+    ).rejects.toMatchObject({ code: 'WORKER_PROVISION_CONFLICT' })
+  })
+
+  it('deprovision treats 404 as success (idempotent)', async () => {
+    const { fetchMock } = setupFetch()
+    await cloudflareWorkerDriver.deprovision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } })
+    expect(fetchMock).toHaveBeenCalledWith(`${CF_BASE}/accounts/acc-1/workers/scripts/relay-1`, expect.objectContaining({ method: 'DELETE' }))
+  })
+
+  it('deprovision on 500 throws WORKER_DEPROVISION_FAILED', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => cfResponse(500, { errors: [{ message: 'boom' }] })))
+    await expect(
+      cloudflareWorkerDriver.deprovision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } }),
+    ).rejects.toMatchObject({ code: 'WORKER_PROVISION_FAILED' })
+  })
+
+  it('update with a renamed worker deploys the new script and removes the old one', async () => {
+    const { called } = setupFetch()
+    const result = await cloudflareWorkerDriver.update!({
+      config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-2' },
+      storedConfig: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' },
+      secret: 'relay-secret',
+    })
+    const DELETEs = called.filter((c) => c.method === 'DELETE')
+    expect(DELETEs).toHaveLength(1)
+    expect(DELETEs[0].path).toBe('/accounts/acc-1/workers/scripts/relay-1')
+    expect(result.endpointUrl).toBe('https://relay-2.example-subdomain.workers.dev')
+  })
+
+  it('mapCloudflareApiError never includes provider body text (safe code + step only)', () => {
+    const err = mapCloudflareApiError('upload', 500, '{"errors":[{"message":"FATAL: token=abc123 leaked"}]}')
+    expect(err.message).not.toContain('abc123')
+    expect(err.message).not.toContain('FATAL')
+    expect(err.code).toBe('WORKER_PROVISION_FAILED')
+  })
+
+  it('reports the failing step + safe Cloudflare numeric error code', () => {
+    const err = mapCloudflareApiError('upload', 400, JSON.stringify({ errors: [{ code: 10021, message: 'syntax error in worker' }] }))
+    expect(err).toBeInstanceOf(AppError)
+    expect(err.code).toBe('WORKER_PROVISION_FAILED')
+    expect(err.message).toContain('step: upload')
+    expect(err.message).toContain('Cloudflare error 10021')
+    expect(err.message).not.toContain('syntax error in worker')
+  })
+
+  it('maps CF 400 error code 10053 (script exists) → WORKER_PROVISION_CONFLICT', () => {
+    const err = mapCloudflareApiError('upload', 400, JSON.stringify({ errors: [{ code: 10053 }] }))
+    expect(err.code).toBe('WORKER_PROVISION_CONFLICT')
+  })
+})

@@ -51,6 +51,9 @@ const h = vi.hoisted(() => {
         return next
       }),
     },
+    remoteFetchWorker: {
+      findFirst: vi.fn(async () => null),
+    },
     connectedAccount: {
       findUniqueOrThrow: vi.fn(async () => ({ id: 'acc-b', provider: 'google_drive' })),
     },
@@ -141,6 +144,10 @@ vi.mock('../../utils/crypto.js', () => ({
 
 vi.mock('../../utils/audit.js', () => ({
   createAuditLog: (...args: unknown[]) => h.audit(...args),
+}))
+
+vi.mock('../remote-fetch-workers/driver-registry.js', () => ({
+  hasDriver: (key: string) => key === 'cloudflare' || key === 'test-relay',
 }))
 
 vi.mock('../google/google.service.js', () => ({
@@ -361,5 +368,36 @@ describe('processRemoteImportJob — placement routing (direct)', () => {
     expect(h.googleUploader).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), 'My Movie.mkv', expect.anything(), expect.anything(), expect.anything(), expect.any(Function))
     const createCalls = (h.prismaMock.file.create as ReturnType<typeof vi.fn>).mock.calls
     expect(createCalls[0][0].data.name).toBe('My Movie.mkv')
+  })
+
+  it('fails the job with WORKER_TRANSPORT_NOT_IMPLEMENTED when a worker is selected (no silent Direct)', async () => {
+    // A selected worker whose driver has no transport (this phase) must fail
+    // the job explicitly — the source must NEVER be fetched via Direct.
+    h.rows.set('import-1', h.baseRow({ workerId: 'worker-1', workerNameSnapshot: 'Cloudflare SG #1' }))
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'worker-1',
+      name: 'Cloudflare SG #1',
+      driver: 'cloudflare',
+      endpointUrl: 'https://relay.example.workers.dev',
+      isEnabled: true,
+    })
+    await processRemoteImportJob(job())
+    const row = h.rows.get('import-1')
+    expect(row?.status).toBe('failed')
+    expect(row?.errorCode).toBe('WORKER_TRANSPORT_NOT_IMPLEMENTED')
+    // Never touched the downloader — the guard aborts before any remote fetch.
+    expect(h.downloader).not.toHaveBeenCalled()
+    expect(h.resolvePlacement).not.toHaveBeenCalled()
+    expect(h.googleUploader).not.toHaveBeenCalled()
+  })
+
+  it('fails the job with REMOTE_IMPORT_WORKER_UNAVAILABLE when the selected worker was deleted', async () => {
+    h.rows.set('import-1', h.baseRow({ workerId: 'worker-gone', workerNameSnapshot: 'Gone' }))
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null)
+    await processRemoteImportJob(job())
+    const row = h.rows.get('import-1')
+    expect(row?.status).toBe('failed')
+    expect(row?.errorCode).toBe('REMOTE_IMPORT_WORKER_UNAVAILABLE')
+    expect(h.downloader).not.toHaveBeenCalled()
   })
 })

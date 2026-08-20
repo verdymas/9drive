@@ -15,6 +15,7 @@ import {
   type ProbeResult,
   type RequestContextInput,
 } from '@/lib/remoteImports'
+import { workerStatusLabel, type WorkerItem } from '@/lib/workers'
 
 const RECORDING_MIN_SECONDS = 60
 const RECORDING_MAX_SECONDS = 21600
@@ -249,6 +250,7 @@ export function RemoteImportModal({
   accounts,
   folders,
   defaultFolderId,
+  workers,
 }: {
   open: boolean
   onClose: () => void
@@ -256,6 +258,8 @@ export function RemoteImportModal({
   accounts: ConnectedAccount[]
   folders: FolderOption[]
   defaultFolderId?: string | null
+  /** Enabled Remote Fetch Workers for Network Route selection (spec §25). */
+  workers: WorkerItem[]
 }) {
   const [mode, setMode] = useState<'url' | 'curl'>('url')
   const [url, setUrl] = useState('')
@@ -266,6 +270,10 @@ export function RemoteImportModal({
   const [context, setContext] = useState<RequestContextInput>({})
   const [folderId, setFolderId] = useState<string>(defaultFolderId ?? '')
   const [accountId, setAccountId] = useState('')
+  // Network Route: '' = Direct / no relay; otherwise the selected worker id.
+  // Preselects the enabled default worker when one exists (spec §26), and the
+  // user can override or return to Direct.
+  const [workerId, setWorkerId] = useState('')
   const [fileName, setFileName] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
@@ -313,6 +321,7 @@ export function RemoteImportModal({
       setContext({})
       setFolderId(defaultFolderId ?? '')
       setAccountId('')
+      setWorkerId(workers.find((worker) => worker.isDefault)?.id ?? '')
       setFileName('')
       setError('')
       setProbe({ status: 'idle' })
@@ -326,7 +335,7 @@ export function RemoteImportModal({
       if (debounceRef.current) clearTimeout(debounceRef.current)
       if (curlDebounceRef.current) clearTimeout(curlDebounceRef.current)
     }
-  }, [open, defaultFolderId])
+  }, [open, defaultFolderId, workers])
 
   // Unmount / close cleanup.
   useEffect(() => {
@@ -510,6 +519,7 @@ export function RemoteImportModal({
           curl: curlInput.trim(),
           folderId: folderId || null,
           connectedAccountId: accountId || null,
+          workerId: workerId || undefined,
           fileName: fileName.trim() || null,
           detectedFileName: detectedFileName || null,
           hls: hlsOptions ?? undefined,
@@ -521,6 +531,7 @@ export function RemoteImportModal({
           url: trimmedUrl,
           folderId: folderId || null,
           connectedAccountId: accountId || null,
+          workerId: workerId || undefined,
           fileName: fileName.trim() || null,
           detectedFileName: detectedFileName || null,
           // Direct files send no `hls` field at all (the backend schema accepts
@@ -657,6 +668,30 @@ export function RemoteImportModal({
             ) : null}
           </>
         )}
+        {/* Network Route: Direct by default; an enabled default worker is
+            preselected (§26) and the user can override per import (§25). */}
+        <label className="grid gap-2 text-sm font-semibold">
+          Network Route
+          <select className="h-11 rounded-xl border border-slate-200 px-3 text-sm" value={workerId} onChange={(event) => setWorkerId(event.target.value)}>
+            <option value="">Direct / No Worker</option>
+            {workers.map((worker) => (
+              <option key={worker.id} value={worker.id}>
+                {worker.name} — {workerStatusLabel(worker.status)}
+              </option>
+            ))}
+          </select>
+          {workers.length === 0 ? (
+            <p className="text-xs text-slate-500">No workers registered — imports run directly from 9Drive.</p>
+          ) : null}
+          {workerId && workers.find((worker) => worker.id === workerId)?.status === 'unhealthy' ? (
+            <p className="flex items-center gap-1.5 rounded-xl bg-amber-50 p-2.5 text-sm font-semibold text-amber-700">
+              <AlertTriangle className="h-4 w-4" /> This worker last reported unhealthy — the import may fail.
+            </p>
+          ) : null}
+          {workerId && workers.find((worker) => worker.id === workerId)?.status === 'unknown' ? (
+            <p className="text-xs text-slate-500">This worker has not been tested yet.</p>
+          ) : null}
+        </label>
         <label className="grid gap-2 text-sm font-semibold">
           File Name (optional)
           <div className="relative">

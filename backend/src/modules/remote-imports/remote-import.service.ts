@@ -16,6 +16,8 @@ import { removeTempFile, tempFilePath } from './temp-storage.js'
 import { hlsJobDir, readResumeMarker, removeJobDir } from './hls/job-dir.js'
 import { reconcileQueuedRow } from './queue-reconcile.js'
 import { containerExtension } from './hls/output.js'
+import { hasDriver } from '../remote-fetch-workers/driver-registry.js'
+import { REMOTE_FETCH_WORKER_ERROR_CODES, REMOTE_FETCH_WORKER_ERROR_MESSAGES } from '../remote-fetch-workers/errors.js'
 import fsp from 'node:fs/promises'
 
 const MAX_NAME = 255
@@ -38,6 +40,11 @@ export type CreateRemoteImportInput = {
   sourceUrl: string
   folderId?: string | null
   connectedAccountId?: string | null
+  /**
+   * Selected Remote Fetch Worker (network relay). Null/absent = Direct / no
+   * relay. Persisted BEFORE enqueueing so the same worker survives retries.
+   */
+  workerId?: string | null
   /** User-entered filename. When supplied it wins over any server detection. */
   fileName?: string | null
   /** Server-side detected filename (from the probe), used when the user did
@@ -72,6 +79,19 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
     if (!account) throw new AppError('ACCOUNT_NOT_FOUND', 'The storage account does not exist.', 404)
   }
 
+  // Network Route: validate the selected Remote Fetch Worker (spec §28). The
+  // worker must exist, be enabled, and use a driver installed in the registry.
+  // Network Worker and destination Storage Account are separate concepts.
+  let workerId = input.workerId ?? null
+  let workerNameSnapshot: string | null = null
+  if (workerId) {
+    const worker = await prisma.remoteFetchWorker.findFirst({ where: { id: workerId, deletedAt: null } })
+    if (!worker) throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_INVALID, 'The selected network worker does not exist.', 400)
+    if (!worker.isEnabled) throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_DISABLED, 'The selected network worker is disabled.', 400)
+    if (!hasDriver(worker.driver)) throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED, 'The selected network worker uses an unsupported service.', 400)
+    workerNameSnapshot = worker.name
+  }
+
   // Filename precedence: an explicitly user-supplied name always wins over a
   // server-detected one (the probe result is a convenience, never a mandate),
   // and the winner is sanitized AGAIN here — a probe could have happened long
@@ -94,6 +114,8 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
       userId: input.userId,
       folderId,
       connectedAccountId,
+      workerId,
+      workerNameSnapshot,
       sourceUrlEncrypted: encryptText(input.sourceUrl),
       requestContextEncrypted: input.requestContext ? encryptRequestContext(input.requestContext) : null,
       displayUrl: displayUrl(input.sourceUrl),
@@ -235,7 +257,10 @@ export function serializeRemoteImport(importRow: any) {
 export async function getRemoteImportForUser(importId: string, userId: string) {
   const row = await prisma.remoteImport.findFirst({
     where: { id: importId, userId },
-    include: { connectedAccount: { select: { id: true, provider: true, email: true, displayName: true } } },
+    include: {
+      connectedAccount: { select: { id: true, provider: true, email: true, displayName: true } },
+      worker: { select: { id: true, name: true, driver: true, region: true, status: true, isEnabled: true } },
+    },
   })
   if (!row) throw new AppError('REMOTE_IMPORT_NOT_FOUND', 'Remote import not found.', 404)
   // Reconcile-on-read: a `queued` row past the start timeout with a missing
@@ -249,7 +274,10 @@ export async function getRemoteImportForUser(importId: string, userId: string) {
       // Re-read so the response reflects the reconciled state.
       return prisma.remoteImport.findFirstOrThrow({
         where: { id: importId, userId },
-        include: { connectedAccount: { select: { id: true, provider: true, email: true, displayName: true } } },
+        include: {
+          connectedAccount: { select: { id: true, provider: true, email: true, displayName: true } },
+          worker: { select: { id: true, name: true, driver: true, region: true, status: true, isEnabled: true } },
+        },
       })
     }
   }
@@ -264,6 +292,7 @@ export async function listRemoteImportsForUser(userId: string, limit = 50, curso
     include: {
       file: { select: { id: true, name: true, sizeBytes: true } },
       connectedAccount: { select: { id: true, provider: true, email: true, displayName: true } },
+      worker: { select: { id: true, name: true, driver: true, region: true, status: true, isEnabled: true } },
     },
   })
   void reconcileStaleQueuedRows(rows)
@@ -385,6 +414,16 @@ async function enqueueRetry(
     throw new AppError('REMOTE_IMPORT_NOT_RETRYABLE', 'Only failed or cancelled imports can be retried.', 400)
   }
 
+  // The retry keeps the SAME selected worker (spec §30). If the worker has
+  // since been deleted/disabled/unsupported, fail clearly — NEVER silently
+  // switch to Direct or to another worker.
+  if (row.workerId) {
+    const worker = await prisma.remoteFetchWorker.findFirst({ where: { id: row.workerId, deletedAt: null } })
+    if (!worker || !worker.isEnabled || !hasDriver(worker.driver)) {
+      throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_UNAVAILABLE, REMOTE_FETCH_WORKER_ERROR_MESSAGES.REMOTE_IMPORT_WORKER_UNAVAILABLE, 409)
+    }
+  }
+
   const nextAttempt = row.attempt + 1
   const retryFromStage = await determineRetryStage(row)
 
@@ -447,7 +486,10 @@ async function enqueueRetry(
   // relation; the audit log must not block the retry.
   const fresh = await prisma.remoteImport.findUniqueOrThrow({
     where: { id: importId },
-    include: { connectedAccount: { select: { id: true, provider: true, email: true, displayName: true } } },
+    include: {
+      connectedAccount: { select: { id: true, provider: true, email: true, displayName: true } },
+      worker: { select: { id: true, name: true, driver: true, region: true, status: true, isEnabled: true } },
+    },
   })
   try {
     await createAuditLog(userId, 'IMPORT_URL_RETRY', 'remote_import', importId, { name: row.fileName })

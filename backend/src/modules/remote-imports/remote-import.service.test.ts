@@ -52,6 +52,9 @@ const h = vi.hoisted(() => {
       updateMany: vi.fn(),
       delete: vi.fn(),
     },
+    remoteFetchWorker: {
+      findFirst: vi.fn(),
+    },
   }
   return {
     baseRow,
@@ -106,6 +109,11 @@ vi.mock('./temp-storage.js', () => ({
 // rows are `failed`). Mock the module so its import in the service resolves.
 vi.mock('./queue-reconcile.js', () => ({
   reconcileQueuedRow: vi.fn(async () => 'kept'),
+}))
+
+// The driver registry: `hasDriver` gates worker selection at creation/retry.
+vi.mock('../remote-fetch-workers/driver-registry.js', () => ({
+  hasDriver: (key: string) => key === 'cloudflare',
 }))
 
 // `determineRetryStage` probes the filesystem for artifacts (temp part, HLS
@@ -259,6 +267,69 @@ describe('serializeRemoteImport', () => {
     expect(serialized.hlsOutputContainer).toBe('mkv')
     expect(serialized.hlsIsLive).toBe(false)
     expect(() => JSON.stringify(serialized)).not.toThrow()
+  })
+})
+
+describe('retryRemoteImport with a selected worker', () => {
+  beforeEach(() => {
+    resetMocks()
+    // Default findFirst = missing worker (per-test overrides install the row).
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null as never)
+  })
+
+  it('rejects a retry when the worker was deleted (no silent Direct fallback)', async () => {
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null)
+    const row = await withRow({ status: 'failed', workerId: 'worker-gone', workerNameSnapshot: 'Gone' })
+    void row
+    await expect(retryRemoteImport('import-1', 'user-1')).rejects.toMatchObject({
+      code: 'REMOTE_IMPORT_WORKER_UNAVAILABLE',
+      status: 409,
+    })
+    expect(h.enqueueSpy).not.toHaveBeenCalled()
+  })
+
+  it('rejects a retry when the worker is disabled (no silent Direct fallback)', async () => {
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'worker-off',
+      name: 'Off',
+      driver: 'cloudflare',
+      isEnabled: false,
+    })
+    const row = await withRow({ status: 'failed', workerId: 'worker-off', workerNameSnapshot: 'Off' })
+    void row
+    await expect(retryRemoteImport('import-1', 'user-1')).rejects.toMatchObject({
+      code: 'REMOTE_IMPORT_WORKER_UNAVAILABLE',
+      status: 409,
+    })
+    expect(h.enqueueSpy).not.toHaveBeenCalled()
+  })
+
+  it('rejects a retry when the worker driver is unsupported', async () => {
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'worker-fut',
+      name: 'Future Relay',
+      driver: 'vercel',
+      isEnabled: true,
+    })
+    const row = await withRow({ status: 'failed', workerId: 'worker-fut', workerNameSnapshot: 'Future' })
+    void row
+    await expect(retryRemoteImport('import-1', 'user-1')).rejects.toMatchObject({
+      code: 'REMOTE_IMPORT_WORKER_UNAVAILABLE',
+      status: 409,
+    })
+  })
+
+  it('allows a retry when the worker is still valid (same worker kept)', async () => {
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'worker-A',
+      name: 'Cloudflare SG #1',
+      driver: 'cloudflare',
+      isEnabled: true,
+    })
+    const row = await withRow({ status: 'failed', workerId: 'worker-A', workerNameSnapshot: 'Cloudflare SG #1', sourceType: null, fileId: null })
+    void row
+    await expect(retryRemoteImport('import-1', 'user-1')).resolves.toMatchObject({ status: 'queued' })
+    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2)
   })
 })
 
@@ -491,6 +562,80 @@ describe('createRemoteImport', () => {
     // the raw cookie never leaks into other persisted fields.
     expect(createArgs.data.sourceUrlEncrypted).not.toContain('session=valid')
     expect(JSON.stringify(createArgs.data)).not.toContain('"cookie"')
+  })
+
+  it('persists workerId + workerNameSnapshot when a valid worker is selected', async () => {
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'worker-A',
+      name: 'Cloudflare SG #1',
+      driver: 'cloudflare',
+      isEnabled: true,
+    })
+    const created = await createRemoteImport({
+      userId: 'user-1',
+      sourceUrl: 'https://cdn.example/file.mp4',
+      fileName: 'File.mp4',
+      workerId: 'worker-A',
+    })
+    const createArgs = (h.prismaMock.remoteImport.create as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    expect(createArgs.data.workerId).toBe('worker-A')
+    expect(createArgs.data.workerNameSnapshot).toBe('Cloudflare SG #1')
+    expect(h.enqueueSpy).toHaveBeenCalledWith(created.id, 1)
+  })
+
+  it('Direct mode persists workerId null', async () => {
+    const created = await createRemoteImport({
+      userId: 'user-1',
+      sourceUrl: 'https://cdn.example/file.mp4',
+      fileName: 'File.mp4',
+    })
+    const createArgs = (h.prismaMock.remoteImport.create as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    expect(createArgs.data.workerId).toBeNull()
+    expect(createArgs.data.workerNameSnapshot).toBeNull()
+  })
+
+  it('rejects a missing worker (REMOTE_IMPORT_WORKER_INVALID)', async () => {
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null)
+    await expect(
+      createRemoteImport({
+        userId: 'user-1',
+        sourceUrl: 'https://cdn.example/file.mp4',
+        workerId: 'worker-gone',
+      }),
+    ).rejects.toMatchObject({ code: 'REMOTE_IMPORT_WORKER_INVALID', status: 400 })
+    expect(h.enqueueSpy).not.toHaveBeenCalled()
+  })
+
+  it('rejects a disabled worker (REMOTE_IMPORT_WORKER_DISABLED)', async () => {
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'worker-off',
+      name: 'Off',
+      driver: 'cloudflare',
+      isEnabled: false,
+    })
+    await expect(
+      createRemoteImport({
+        userId: 'user-1',
+        sourceUrl: 'https://cdn.example/file.mp4',
+        workerId: 'worker-off',
+      }),
+    ).rejects.toMatchObject({ code: 'REMOTE_IMPORT_WORKER_DISABLED', status: 400 })
+  })
+
+  it('rejects a worker with an unsupported driver (REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED)', async () => {
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'worker-fut',
+      name: 'Future Relay',
+      driver: 'vercel',
+      isEnabled: true,
+    })
+    await expect(
+      createRemoteImport({
+        userId: 'user-1',
+        sourceUrl: 'https://cdn.example/file.mp4',
+        workerId: 'worker-fut',
+      }),
+    ).rejects.toMatchObject({ code: 'REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED', status: 400 })
   })
 
   it('does not leave the row queued when enqueuing fails', async () => {

@@ -17,6 +17,10 @@ process.env.TOKEN_ENCRYPTION_KEY ??= 'test-encryption-key-32bytes!!!'
 // wait the full production default (60s).
 process.env.REMOTE_IMPORT_IDLE_TIMEOUT_SECONDS ??= '1'
 
+// Remote Fetch Worker integration tests stand up a local http relay (127.0.0.1),
+// so allow http://localhost in the test environment only.
+process.env.WORKER_ALLOW_LOCALHOST_HTTP ??= 'true'
+
 // On Windows dev hosts the FFmpeg defaults are Linux paths (/usr/bin/ffmpeg).
 // Point the env at the winget-installed binaries so the real-FFmpeg HLS
 // integration tests execute instead of silently skipping (the worker container

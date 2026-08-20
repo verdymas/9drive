@@ -153,6 +153,8 @@ remoteImportRouter.post('/', requireAuth, async (req: AuthRequest, res, next) =>
         requestContext: requestContextSchema,
         folderId: z.string().nullable().optional(),
         connectedAccountId: z.string().nullable().optional(),
+        // Selected Remote Fetch Worker (network relay). null/absent = Direct.
+        workerId: z.string().nullable().optional(),
         fileName: z.string().max(255).nullable().optional(),
         // Server-side detected name from the probe; used only when the user did
         // not type one. Never trusted as-is — sanitized again at creation.
@@ -193,6 +195,7 @@ remoteImportRouter.post('/', requireAuth, async (req: AuthRequest, res, next) =>
       requestContext,
       folderId: body.folderId,
       connectedAccountId: body.connectedAccountId,
+      workerId: body.workerId,
       fileName: body.fileName,
       detectedFileName: body.detectedFileName,
       mimeType: body.mimeType,

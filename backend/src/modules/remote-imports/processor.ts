@@ -20,6 +20,8 @@ import { hlsJobDir, readResumeMarker, removeJobDir, removeResumeMarker, writeRes
 import type { ContainerChoice } from './hls/output.js'
 import { ensureJobDir } from './hls/materializer.js'
 import { verifyOutput } from './hls/verify.js'
+import { hasDriver } from '../remote-fetch-workers/driver-registry.js'
+import { REMOTE_FETCH_WORKER_ERROR_CODES } from '../remote-fetch-workers/errors.js'
 
 const STAGES = {
   PROBING: 'probing',
@@ -39,6 +41,32 @@ type Stage = (typeof STAGES)[keyof typeof STAGES]
 /** True when the stored import is an HLS source. */
 function isHlsRecord(record: { sourceType?: string | null }): boolean {
   return record.sourceType === 'hls_master' || record.sourceType === 'hls_media'
+}
+
+/**
+ * Execution-time worker guard (spec §29-§31). The selected worker must still
+ * exist, be enabled, and use a supported driver. THIS PHASE has no relay
+ * transport yet — a selected worker fails the job explicitly with
+ * WORKER_TRANSPORT_NOT_IMPLEMENTED instead of silently fetching Direct.
+ */
+async function assertWorkerUsable(record: { workerId: string | null }) {
+  if (!record.workerId) return
+  const worker = await prisma.remoteFetchWorker.findFirst({ where: { id: record.workerId, deletedAt: null } })
+  if (!worker) {
+    throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_UNAVAILABLE, 'The selected network worker is no longer available.', 409)
+  }
+  if (!worker.isEnabled) {
+    throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_DISABLED, 'The selected network worker is disabled.', 409)
+  }
+  if (!hasDriver(worker.driver)) {
+    throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED, 'The selected network worker uses an unsupported service.', 409)
+  }
+  // Provisioned workers have no endpoint until the deployment succeeds.
+  if (!worker.endpointUrl) {
+    throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_UNAVAILABLE, 'The selected network worker is no longer available.', 409)
+  }
+  // No driver implements createTransport this phase.
+  throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_TRANSPORT_NOT_IMPLEMENTED, 'Relay transport for this worker is not implemented yet. Switch this import to Direct or choose a different worker.', 501)
 }
 
 /**
@@ -274,6 +302,7 @@ async function processHlsImport(
     userId: string
     folderId: string | null
     connectedAccountId: string | null
+    workerId: string | null
     fileName: string
     mimeType: string | null
     sourceType: string | null
@@ -300,6 +329,10 @@ async function processHlsImport(
     await markFailed(importId, 'HLS_DISABLED', 'HLS imports are disabled.')
     return null
   }
+
+  // Worker guard lives at the top of the HLS path too (the direct path guards
+  // in processRemoteImportJob; HLS may also be reached via retry-convert).
+  await assertWorkerUsable(record)
 
   const jobDir = hlsJobDir(userId, importId)
   await ensureJobDir(jobDir)
@@ -590,6 +623,10 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
         data: { status: 'processing', stage: record.retryFromStage ?? STAGES.PROBING, jobId: job.id },
       })
     }
+
+    // ── Selected worker guard: a worker-backed import must still be usable, and
+//    relay transport is not implemented this phase (no silent Direct). ──────
+    await assertWorkerUsable(record)
 
     // ── HLS imports skip the direct-download path entirely. ─────────────────
     if (isHlsRecord(record)) {

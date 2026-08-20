@@ -52,6 +52,8 @@ const baseItem: RemoteImportItem = {
   fileId: null,
   folderId: null,
   connectedAccountId: null,
+  workerId: null,
+  workerNameSnapshot: null,
 }
 
 function item(overrides: Partial<RemoteImportItem> = {}): RemoteImportItem {

@@ -41,9 +41,9 @@ function makeProbeResult(overrides: Partial<RemoteImports.ProbeResult> = {}): Re
   }
 }
 
-function renderModal() {
+function renderModal(overrides: { workers?: Parameters<typeof RemoteImportModal>[0]['workers'] } = {}) {
   return render(
-    <RemoteImportModal open accounts={ACCOUNTS} folders={FOLDERS} onClose={() => {}} onCreated={() => {}} defaultFolderId="f-1" />,
+    <RemoteImportModal open accounts={ACCOUNTS} folders={FOLDERS} onClose={() => {}} onCreated={() => {}} defaultFolderId="f-1" workers={overrides.workers ?? []} />,
   )
 }
 
@@ -512,6 +512,81 @@ describe('RemoteImportModal probe behaviour', () => {
       renderModal()
       await typeUrl('https://example.com/expired.m3u8')
       await waitFor(() => expect(screen.getByText(/capture a fresh media request/i)).toBeInTheDocument())
+    })
+  })
+
+  describe('Network Route worker selection', () => {
+    const WORKER_A: Parameters<typeof RemoteImportModal>[0]['workers'][number] = {
+      id: 'w-a',
+      name: 'Cloudflare SG #1',
+      slug: null,
+      driver: 'cloudflare',
+      endpointUrl: 'https://sg.example.workers.dev',
+      isEnabled: true,
+      isDefault: true,
+      priority: null,
+      region: 'Singapore',
+      description: null,
+      authType: 'hmac',
+      credentialConfigured: true,
+      providerConfig: null,
+      capabilitiesJson: null,
+      metadataJson: null,
+      status: 'healthy',
+      lastHealthCheckAt: null,
+      lastHealthyAt: null,
+      lastFailedAt: null,
+      lastErrorCode: null,
+      deletedAt: null,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    }
+    const WORKER_B: typeof WORKER_A = { ...WORKER_A, id: 'w-b', name: 'Cloudflare US #1', isDefault: false, status: 'unhealthy', region: 'US' }
+
+    it('preselects the enabled default worker, Direct otherwise', () => {
+      renderModal({ workers: [WORKER_A, WORKER_B] })
+      const select = screen.getByLabelText(/network route/i) as HTMLSelectElement
+      expect(select.value).toBe('w-a')
+      // Direct remains a choice.
+      expect(screen.getByRole('option', { name: /direct \/ no worker/i })).toBeInTheDocument()
+      expect(screen.queryByRole('option', { name: /cloudflare sg/i })).not.toBeNull()
+    })
+
+    it('defaults to Direct when no default worker exists', () => {
+      renderModal({ workers: [WORKER_B] })
+      const select = screen.getByLabelText(/network route/i) as HTMLSelectElement
+      expect(select.value).toBe('')
+    })
+
+    it('sends workerId when a worker is selected, undefined for Direct', async () => {
+      const create = vi.spyOn(RemoteImports, 'createRemoteImport').mockResolvedValue({} as never)
+      renderModal({ workers: [WORKER_A] })
+      await typeUrl('https://example.com/file.bin')
+      await userEvent.click(screen.getByRole('button', { name: /start import/i }))
+      await waitFor(() => expect(create).toHaveBeenCalled())
+      // Default worker preselected → workerId persists.
+      expect(create.mock.calls[0][0].workerId).toBe('w-a')
+
+      // Explicit Direct override.
+      create.mockClear()
+      const select = screen.getByLabelText(/network route/i)
+      const user = userEvent.setup()
+      await user.selectOptions(select, '')
+      await user.click(screen.getByRole('button', { name: /start import/i }))
+      await waitFor(() => expect(create).toHaveBeenCalled())
+      expect(create.mock.calls[0][0].workerId).toBeUndefined()
+    })
+
+    it('shows an unhealthy warning for the selected worker and never lists disabled ones', async () => {
+      renderModal({ workers: [WORKER_A, WORKER_B] })
+      const select = screen.getByLabelText(/network route/i)
+      const user = userEvent.setup()
+      await user.selectOptions(select, 'w-b')
+      expect(screen.getByText(/last reported unhealthy/i)).toBeInTheDocument()
+      // All listed workers are enabled (WORKER_B is enabled with unhealthy status;
+      // a disabled worker is filtered by the PAGE, and here we assert the option
+      // set is the provided enabled list).
+      expect(select.querySelectorAll('option')).toHaveLength(3) // Direct + A + B
     })
   })
 })

@@ -19,6 +19,7 @@ import {
   statusLabel,
   type RemoteImportItem,
 } from '@/lib/remoteImports'
+import { listWorkers, type WorkerItem } from '@/lib/workers'
 
 type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string; autoAllocationEnabled: boolean }
 type FolderOption = { id: string; name: string }
@@ -167,6 +168,7 @@ export function RemoteImportsPage() {
   const [modalOpen, setModalOpen] = useState(false)
   const [accounts, setAccounts] = useState<ConnectedAccount[]>([])
   const [folders, setFolders] = useState<FolderOption[]>([])
+  const [workers, setWorkers] = useState<WorkerItem[]>([])
   const [busyId, setBusyId] = useState<string | null>(null)
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -208,12 +210,18 @@ export function RemoteImportsPage() {
   useEffect(() => {
     async function loadMeta() {
       try {
-        const [accountsData, foldersData] = await Promise.all([
+        const [accountsData, foldersData, workersData] = await Promise.all([
           apiFetch<{ accounts: ConnectedAccount[] }>('/connected-accounts'),
           apiFetch<{ folders: FolderOption[] }>('/folders?all=1'),
+          listWorkers(),
         ])
         setAccounts(accountsData.accounts || [])
         setFolders(foldersData.folders || [])
+        // Only enabled, ready workers are selectable as a Network Route (§27):
+        // provisioning/provision_failed workers have no usable endpoint yet.
+        setWorkers(workersData.filter(
+          (worker) => worker.isEnabled && worker.status !== 'provisioning' && worker.status !== 'provision_failed',
+        ))
       } catch {
         /* non-fatal */
       }
@@ -351,6 +359,12 @@ export function RemoteImportsPage() {
                           Request context attached
                         </p>
                       ) : null}
+                      {item.workerNameSnapshot ? (
+                        <p className="mt-0.5 inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500">
+                          <Wand2 className="h-3.5 w-3.5 text-slate-400" />
+                          Network route: {item.workerNameSnapshot}
+                        </p>
+                      ) : null}
                     </div>
 
                     {/* Actions column: shrink-0, stays inside the card */}
@@ -430,6 +444,7 @@ export function RemoteImportsPage() {
         onCreated={() => load().catch(() => undefined)}
         accounts={accounts}
         folders={folders}
+        workers={workers}
       />
     </>
   )

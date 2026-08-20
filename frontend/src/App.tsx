@@ -19,6 +19,7 @@ import { ActivityLogPage } from '@/pages/ActivityLogPage'
 import { SmbPage } from '@/pages/SmbPage'
 import { WebDavPage } from '@/pages/WebDavPage'
 import { RemoteImportsPage } from '@/pages/RemoteImportsPage'
+import { WorkersPage } from '@/pages/WorkersPage'
 import { UploadProvider } from '@/context/UploadContext'
 
 
@@ -48,6 +49,7 @@ function App() {
           <Route path="smb" element={<SmbPage />} />
           <Route path="storage/webdav" element={<WebDavPage />} />
           <Route path="remote-imports" element={<RemoteImportsPage />} />
+          <Route path="workers" element={<WorkersPage />} />
         </Route>
       </Route>
       <Route path="*" element={<Navigate to="/all-files" replace />} />

@@ -74,6 +74,18 @@ const envSchema = z.object({
   SYNC_FOLDER_LIST_CONCURRENCY: z.coerce.number().default(2),
   SYNC_MAX_DEPTH: z.coerce.number().default(40),
   SYNC_DRIVE_MAX_RETRIES: z.coerce.number().default(3),
+  // Remote Fetch Worker registry (network relays for Remote Imports).
+  // Test-connection timeout for driver health checks (matches the connect
+  // timeout default of 15s).
+  WORKER_TEST_TIMEOUT_SECONDS: z.coerce.number().default(10),
+  // Allows http://localhost endpoints in dev (e.g. a local relay stub). Never
+  // true in production — remote relays must use HTTPS.
+  WORKER_ALLOW_LOCALHOST_HTTP: z.coerce.boolean().default(false),
+  // Managed Cloudflare driver provisioning.
+  // Provider API base — tests point this at a local fake Cloudflare API.
+  CLOUDFLARE_API_BASE: z.string().url().default('https://api.cloudflare.com/client/v4'),
+  // Timeout for each Cloudflare Workers API call during provision/deprovision.
+  CLOUDFLARE_DEPLOY_TIMEOUT_SECONDS: z.coerce.number().default(30),
 })
 
 export const env = envSchema.parse(process.env)

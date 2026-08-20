@@ -26,7 +26,8 @@ import {
   CheckCircle,
   ChevronDown,
   Upload,
-  Server
+  Server,
+  Waypoints
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { BrandLogo } from '@/components/drive/BrandLogo'
@@ -53,6 +54,7 @@ const storageMenu = [
   { label: 'WebDAV', icon: FolderCog, href: '/storage/webdav' },
   { label: 'SMB', icon: Server, href: '/smb' },
   { label: 'Remote Imports', icon: CloudDownload, href: '/remote-imports' },
+  { label: 'Workers', icon: Waypoints, href: '/workers' },
 ]
 
 type StorageSummary = {

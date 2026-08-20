@@ -258,73 +258,79 @@ model File {
 }
 
 model RemoteImport {
-  id                          String            @id @default(uuid()) @db.Char(36)
-  userId                      String            @map("user_id") @db.Char(36)
-  folderId                    String?           @map("folder_id") @db.Char(36)
-  connectedAccountId          String?           @map("connected_account_id") @db.Char(36)
-  fileId                      String?           @unique @map("file_id") @db.Char(36)
-  sourceUrlEncrypted          String            @map("source_url_encrypted") @db.Text
+  id                          String             @id @default(uuid()) @db.Char(36)
+  userId                      String             @map("user_id") @db.Char(36)
+  folderId                    String?            @map("folder_id") @db.Char(36)
+  connectedAccountId          String?            @map("connected_account_id") @db.Char(36)
+  // Selected Remote Fetch Worker (null = Direct / no relay). Persisted before
+  // enqueueing so retries use the same worker. `workerNameSnapshot` preserves
+  // the choice in history even if the worker is later renamed or deleted.
+  workerId                    String?            @map("worker_id") @db.Char(36)
+  workerNameSnapshot          String?            @map("worker_name_snapshot") @db.VarChar(191)
+  fileId                      String?            @unique @map("file_id") @db.Char(36)
+  sourceUrlEncrypted          String             @map("source_url_encrypted") @db.Text
   // User-supplied Referer/Origin/User-Agent/Cookie for protected sources,
   // AES-256-GCM encrypted at rest; never returned by any API (booleans only).
-  requestContextEncrypted     String?           @map("request_context_encrypted") @db.Text
-  displayUrl                  String            @map("display_url") @db.Text
-  finalUrlEncrypted           String?           @map("final_url_encrypted") @db.Text
-  fileName                    String            @map("file_name") @db.VarChar(255)
-  mimeType                    String?           @map("mime_type") @db.VarChar(191)
-  status                      String            @default("queued") @db.VarChar(32)
-  stage                       String            @default("waiting") @db.VarChar(32)
-  totalBytes                  BigInt?           @map("total_bytes")
-  downloadedBytes             BigInt            @default(0) @map("downloaded_bytes")
-  uploadedBytes               BigInt            @default(0) @map("uploaded_bytes")
+  requestContextEncrypted     String?            @map("request_context_encrypted") @db.Text
+  displayUrl                  String             @map("display_url") @db.Text
+  finalUrlEncrypted           String?            @map("final_url_encrypted") @db.Text
+  fileName                    String             @map("file_name") @db.VarChar(255)
+  mimeType                    String?            @map("mime_type") @db.VarChar(191)
+  status                      String             @default("queued") @db.VarChar(32)
+  stage                       String             @default("waiting") @db.VarChar(32)
+  totalBytes                  BigInt?            @map("total_bytes")
+  downloadedBytes             BigInt             @default(0) @map("downloaded_bytes")
+  uploadedBytes               BigInt             @default(0) @map("uploaded_bytes")
   // Final output size (the file being uploaded) — distinct from `totalBytes`,
   // which is the SOURCE download size. For HLS the two often differ.
-  uploadTotalBytes            BigInt?           @map("upload_total_bytes")
-  sourceETag                  String?           @map("source_etag") @db.VarChar(191)
-  sourceLastModified          DateTime?         @map("source_last_modified")
-  sourceRangeSupported        Boolean           @default(false) @map("source_range_supported")
+  uploadTotalBytes            BigInt?            @map("upload_total_bytes")
+  sourceETag                  String?            @map("source_etag") @db.VarChar(191)
+  sourceLastModified          DateTime?          @map("source_last_modified")
+  sourceRangeSupported        Boolean            @default(false) @map("source_range_supported")
   // ── HLS/M3U8 source metadata (populated by the probe for HLS imports) ─────
-  sourceType                  String?           @map("source_type") @db.VarChar(32)
-  hlsPlaylistType             String?           @map("hls_playlist_type") @db.VarChar(16)
-  hlsVariantId                String?           @map("hls_variant_id") @db.VarChar(64)
-  hlsVariantBandwidth         Int?              @map("hls_variant_bandwidth")
-  hlsVariantWidth             Int?              @map("hls_variant_width")
-  hlsVariantHeight            Int?              @map("hls_variant_height")
-  hlsAudioTrackId             String?           @map("hls_audio_track_id") @db.VarChar(64)
-  hlsAudioTrackLanguage       String?           @map("hls_audio_track_language") @db.VarChar(32)
-  hlsOutputContainer          String?           @map("hls_output_container") @db.VarChar(16)
-  hlsIsLive                   Boolean?          @map("hls_is_live")
-  hlsRecordingDurationSeconds Int?              @map("hls_recording_duration_seconds")
-  hlsMediaDurationSeconds     Float?            @map("hls_media_duration_seconds")
-  hlsSegmentCount             Int?              @map("hls_segment_count")
-  hlsCompletedSegmentCount    Int?              @map("hls_completed_segment_count")
-  remuxProgress               Float?            @map("remux_progress")
-  outputDurationSeconds       Float?            @map("output_duration_seconds")
-  outputCodecSummary          String?           @map("output_codec_summary") @db.VarChar(191)
-  tempPath                    String?           @map("temp_path") @db.Text
-  resumeSessionEncrypted      String?           @map("resume_session_encrypted") @db.Text
-  jobId                       String?           @map("job_id") @db.VarChar(191)
-  attempt                     Int               @default(0)
+  sourceType                  String?            @map("source_type") @db.VarChar(32)
+  hlsPlaylistType             String?            @map("hls_playlist_type") @db.VarChar(16)
+  hlsVariantId                String?            @map("hls_variant_id") @db.VarChar(64)
+  hlsVariantBandwidth         Int?               @map("hls_variant_bandwidth")
+  hlsVariantWidth             Int?               @map("hls_variant_width")
+  hlsVariantHeight            Int?               @map("hls_variant_height")
+  hlsAudioTrackId             String?            @map("hls_audio_track_id") @db.VarChar(64)
+  hlsAudioTrackLanguage       String?            @map("hls_audio_track_language") @db.VarChar(32)
+  hlsOutputContainer          String?            @map("hls_output_container") @db.VarChar(16)
+  hlsIsLive                   Boolean?           @map("hls_is_live")
+  hlsRecordingDurationSeconds Int?               @map("hls_recording_duration_seconds")
+  hlsMediaDurationSeconds     Float?             @map("hls_media_duration_seconds")
+  hlsSegmentCount             Int?               @map("hls_segment_count")
+  hlsCompletedSegmentCount    Int?               @map("hls_completed_segment_count")
+  remuxProgress               Float?             @map("remux_progress")
+  outputDurationSeconds       Float?             @map("output_duration_seconds")
+  outputCodecSummary          String?            @map("output_codec_summary") @db.VarChar(191)
+  tempPath                    String?            @map("temp_path") @db.Text
+  resumeSessionEncrypted      String?            @map("resume_session_encrypted") @db.Text
+  jobId                       String?            @map("job_id") @db.VarChar(191)
+  attempt                     Int                @default(0)
   // Queue-lifecycle metadata (spec: retry/queue fix). `queuedAt` is set only
   // when queue.add() actually succeeded; `heartbeatAt` is the rolling liveness
   // signal while the worker is active; `retryFromStage` is the server-derived
   // resume stage for a retry (never frontend-supplied).
-  queuedAt                    DateTime?         @map("queued_at")
-  retryRequestedAt            DateTime?         @map("retry_requested_at")
-  heartbeatAt                 DateTime?         @map("heartbeat_at")
-  retryFromStage              String?           @map("retry_from_stage") @db.VarChar(32)
-  errorCode                   String?           @map("error_code") @db.VarChar(64)
-  errorMessage                String?           @map("error_message") @db.Text
-  internalError               String?           @map("internal_error") @db.Text
-  startedAt                   DateTime?         @map("started_at")
-  completedAt                 DateTime?         @map("completed_at")
-  failedAt                    DateTime?         @map("failed_at")
-  cancelledAt                 DateTime?         @map("cancelled_at")
-  createdAt                   DateTime          @default(now()) @map("created_at")
-  updatedAt                   DateTime          @updatedAt @map("updated_at")
-  user                        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
-  folder                      Folder?           @relation(fields: [folderId], references: [id], onDelete: SetNull)
-  connectedAccount            ConnectedAccount? @relation(fields: [connectedAccountId], references: [id], onDelete: SetNull)
-  file                        File?             @relation("RemoteImportFile", fields: [fileId], references: [id], onDelete: SetNull)
+  queuedAt                    DateTime?          @map("queued_at")
+  retryRequestedAt            DateTime?          @map("retry_requested_at")
+  heartbeatAt                 DateTime?          @map("heartbeat_at")
+  retryFromStage              String?            @map("retry_from_stage") @db.VarChar(32)
+  errorCode                   String?            @map("error_code") @db.VarChar(64)
+  errorMessage                String?            @map("error_message") @db.Text
+  internalError               String?            @map("internal_error") @db.Text
+  startedAt                   DateTime?          @map("started_at")
+  completedAt                 DateTime?          @map("completed_at")
+  failedAt                    DateTime?          @map("failed_at")
+  cancelledAt                 DateTime?          @map("cancelled_at")
+  createdAt                   DateTime           @default(now()) @map("created_at")
+  updatedAt                   DateTime           @updatedAt @map("updated_at")
+  user                        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  folder                      Folder?            @relation(fields: [folderId], references: [id], onDelete: SetNull)
+  connectedAccount            ConnectedAccount?  @relation(fields: [connectedAccountId], references: [id], onDelete: SetNull)
+  worker                      RemoteFetchWorker? @relation(fields: [workerId], references: [id], onDelete: SetNull)
+  file                        File?              @relation("RemoteImportFile", fields: [fileId], references: [id], onDelete: SetNull)
 
   @@index([userId, createdAt])
   @@index([userId, status, createdAt])
@@ -332,6 +338,7 @@ model RemoteImport {
   @@index([jobId])
   @@index([folderId])
   @@index([status, queuedAt])
+  @@index([workerId])
   @@map("remote_imports")
 }
 
@@ -518,4 +525,52 @@ model WorkspaceInvite {
   @@index([inviteeEmail])
   @@index([targetType, targetId])
   @@map("workspace_invites")
+}
+
+// ── Remote Fetch Worker: a remote network relay used by 9Drive to fetch
+// remote resources for Remote Imports. Workers are relays/transports ONLY —
+// FFmpeg, HLS parsing, orchestration, temp files and uploads stay in 9Drive.
+// Provider-agnostic by design: `driver` is a string resolved against the
+// backend driver registry (cloudflare first; future: generic-http-relay,
+// vercel, self-hosted), never Cloudflare-specific columns.
+model RemoteFetchWorker {
+  id                String         @id @default(uuid()) @db.Char(36)
+  name              String         @db.VarChar(191)
+  slug              String?        @unique @db.VarChar(191)
+  driver            String         @db.VarChar(64)
+  // System-managed for managed (provisioned) drivers — null until deployment
+  // succeeds. User-supplied for manual drivers (future self-hosted relays).
+  endpointUrl       String?        @map("endpoint_url") @db.Text
+  isEnabled         Boolean        @default(true) @map("is_enabled")
+  isDefault         Boolean        @default(false) @map("is_default")
+  priority          Int?
+  region            String?        @db.VarChar(64)
+  description       String?        @db.Text
+  // hmac | bearer | none — validated in application code against the driver.
+  authType          String         @default("hmac") @map("auth_type") @db.VarChar(16)
+  // Sensitive provider credentials (shared secret, bearer token), AES-256-GCM
+  // encrypted at rest; never returned by any API (`credentialConfigured` only).
+  secretEncrypted   String?        @map("secret_encrypted") @db.Text
+  configEncrypted   String?        @map("config_encrypted") @db.Text
+  // Last-known safe capability set from a successful test connection.
+  capabilitiesJson  Json?          @map("capabilities_json")
+  // Safe non-sensitive display metadata only.
+  metadataJson      Json?          @map("metadata_json")
+  // unknown | healthy | unhealthy | disabled | provisioning | provision_failed
+  status            String         @default("unknown") @db.VarChar(16)
+  lastHealthCheckAt DateTime?      @map("last_health_check_at")
+  lastHealthyAt     DateTime?      @map("last_healthy_at")
+  lastFailedAt      DateTime?      @map("last_failed_at")
+  lastErrorCode     String?        @map("last_error_code") @db.VarChar(64)
+  deletedAt         DateTime?      @map("deleted_at")
+  createdAt         DateTime       @default(now()) @map("created_at")
+  updatedAt         DateTime       @updatedAt @map("updated_at")
+  remoteImports     RemoteImport[]
+
+  @@index([driver])
+  @@index([isEnabled])
+  @@index([isDefault])
+  @@index([status])
+  @@index([deletedAt])
+  @@map("remote_fetch_workers")
 }

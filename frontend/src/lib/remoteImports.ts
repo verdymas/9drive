@@ -36,6 +36,12 @@ export type RemoteImportItem = {
   fileId: string | null
   folderId: string | null
   connectedAccountId: string | null
+  /** Selected Remote Fetch Worker (network relay). null = Direct / no relay. */
+  workerId: string | null
+  /** History snapshot of the worker name (survives rename/delete). */
+  workerNameSnapshot: string | null
+  /** Safe worker fields for the "Network route" label (spec §24). */
+  worker?: { id: string; name: string; driver: string; region: string | null; status: string; isEnabled: boolean } | null
   /** Resolved destination account (safe fields only, for the upload label). */
   connectedAccount?: { id: string; provider: string; email: string | null; displayName: string | null } | null
   file?: { id: string; name: string; sizeBytes: string } | null
@@ -68,6 +74,8 @@ export type CreateRemoteImportInput = {
   curl?: string
   folderId?: string | null
   connectedAccountId?: string | null
+  /** Selected Remote Fetch Worker (network relay). null/absent = Direct. */
+  workerId?: string | null
   /** User-entered filename (wins over any detection). */
   fileName?: string | null
   /** Server-side detected filename from the probe (fallback when no custom). */
