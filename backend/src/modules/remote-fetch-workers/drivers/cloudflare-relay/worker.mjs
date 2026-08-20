@@ -1,8 +1,8 @@
 /**
- * The 9Drive relay Worker source, bundled as a plain JS string and deployed by
- * the Cloudflare driver via the Workers Scripts API (direct upload, no build
- * step, no imports). This is a NETWORK RELAY ONLY: it forwards bytes between
- * 9Drive and the remote source. No HLS parsing, no FFmpeg, no remux, no uploads.
+ * 9Drive relay Worker — deployed verbatim by the Cloudflare driver through the
+ * Workers Scripts multipart API (ES module Worker, entry module worker.mjs).
+ * This is a NETWORK RELAY ONLY: it forwards bytes between 9Drive and the
+ * remote source. No HLS parsing, no FFmpeg, no remux, no uploads.
  *
  * Protocol (9drive-relay-v1):
  * - GET /health  — HMAC-verified, returns service identity + capabilities.
@@ -10,12 +10,14 @@
  *                  response (body base64-encoded, non-streaming for v1).
  * Every other path returns 404.
  *
- * The relay secret arrives as the `SECRET` binding (secret_text), set by the
- * driver at provisioning time. All HMAC signing happens in the 9Drive backend;
- * the worker only verifies.
+ * The relay secret arrives as the `RELAY_SECRET` binding (secret_text), set by
+ * the driver at provisioning time. All HMAC signing happens in the 9Drive
+ * backend; the worker only verifies.
+ *
+ * This file must stay plain ES module JavaScript — no imports, no TypeScript,
+ * no Node APIs — so it can be uploaded as-is with no build step.
  */
 
-export const RELAY_WORKER_SOURCE = `
 const SERVICE_IDENTITY = '9drive-relay';
 const PROTOCOL_VERSION = '9drive-relay-v1';
 const SIGNATURE_HEADER = 'x-9drive-signature';
@@ -32,8 +34,8 @@ function signaturesMatch(a, b) {
   return diff === 0;
 }
 
-async function verifyHmac(request) {
-  const secret = globalThis.env && globalThis.env.SECRET ? globalThis.env.SECRET : '';
+async function verifyHmac(request, env) {
+  const secret = env.RELAY_SECRET || '';
   if (!secret) return false;
   const url = new URL(request.url);
   const canonical = request.method + ' ' + url.pathname;
@@ -97,7 +99,7 @@ async function handleFetch(request) {
   if (headers && typeof headers === 'object') {
     for (const [key, value] of Object.entries(headers)) {
       if (typeof value !== 'string') continue;
-      if (key.includes('\\r') || key.includes('\\n') || value.includes('\\r') || value.includes('\\n')) continue;
+      if (key.includes('\r') || key.includes('\n') || value.includes('\r') || value.includes('\n')) continue;
       outHeaders.set(key, value);
     }
   }
@@ -130,8 +132,8 @@ async function handleFetch(request) {
 }
 
 export default {
-  async fetch(request) {
-    if (!(await verifyHmac(request))) {
+  async fetch(request, env) {
+    if (!(await verifyHmac(request, env))) {
       return json({ error: 'unauthorized' }, 401);
     }
     const url = new URL(request.url);
@@ -140,4 +142,3 @@ export default {
     return json({ error: 'not found' }, 404);
   },
 };
-`.trim()

@@ -26,6 +26,9 @@ export const REMOTE_FETCH_WORKER_ERROR_CODES = {
   WORKER_PROVISION_FAILED: 'WORKER_PROVISION_FAILED',
   WORKER_PROVISION_CONFLICT: 'WORKER_PROVISION_CONFLICT',
   WORKER_DEPROVISION_FAILED: 'WORKER_DEPROVISION_FAILED',
+  // Local relay build/preflight failure — the artifact is invalid, so no
+  // provider request is made (the provider would only reject it).
+  WORKER_RELAY_BUILD_FAILED: 'WORKER_RELAY_BUILD_FAILED',
   // Remote Import selection / execution
   REMOTE_IMPORT_WORKER_INVALID: 'REMOTE_IMPORT_WORKER_INVALID',
   REMOTE_IMPORT_WORKER_DISABLED: 'REMOTE_IMPORT_WORKER_DISABLED',
@@ -56,6 +59,7 @@ export const REMOTE_FETCH_WORKER_ERROR_MESSAGES: Record<RemoteFetchWorkerErrorCo
   WORKER_PROVISION_FAILED: 'The relay could not be provisioned by the provider.',
   WORKER_PROVISION_CONFLICT: 'A relay with this name already exists at the provider. Choose a different name.',
   WORKER_DEPROVISION_FAILED: 'The remote relay could not be removed. The worker was not deleted — retry or clean it up at the provider.',
+  WORKER_RELAY_BUILD_FAILED: 'The relay could not be built locally. No changes were made at the provider.',
   REMOTE_IMPORT_WORKER_INVALID: 'The selected network worker does not exist.',
   REMOTE_IMPORT_WORKER_DISABLED: 'The selected network worker is disabled.',
   REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED: 'The selected network worker uses an unsupported service.',

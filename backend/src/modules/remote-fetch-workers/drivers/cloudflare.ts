@@ -14,7 +14,7 @@ import type {
   WorkerDriverMetadata,
 } from '../types.js'
 import { REMOTE_FETCH_WORKER_ERROR_CODES, REMOTE_FETCH_WORKER_ERROR_MESSAGES } from '../errors.js'
-import { RELAY_WORKER_SOURCE } from './cloudflare-relay-worker.js'
+import { RELAY_MODULE_NAME, RELAY_SECRET_BINDING, RELAY_COMPATIBILITY_DATE, buildCloudflareRelay, validateRelaySource, relaySourceSha256 } from './cloudflare-relay.js'
 
 /**
  * Cloudflare Worker relay driver.
@@ -32,7 +32,7 @@ export const RELAY_SERVICE_IDENTITY = '9drive-relay'
 export const RELAY_PROTOCOL_VERSION = '9drive-relay-v1'
 
 /** Cloudflare binding name that carries the relay secret to the deployed script. */
-export const RELAY_SECRET_BINDING = 'SECRET'
+export { RELAY_SECRET_BINDING }
 
 const SUPPORTED_PROTOCOLS = new Set<string>([RELAY_PROTOCOL_VERSION])
 
@@ -184,6 +184,28 @@ function parseCfErrorCode(bodyText: string): number | null {
   }
 }
 
+/**
+ * Known CF error codes for Worker script deploy/upload failures → safe short
+ * reason. NEVER free-form provider text: the provider can echo arbitrary
+ * request data (tokens, URLs) in messages. The numeric code alone is what we
+ * trust, mapped to our own static description.
+ */
+const CF_KNOWN_ERRORS: Record<number, string> = {
+  10021: 'script content could not be parsed (syntax or format error)',
+  10022: 'script validation failed',
+  10051: 'script name is not valid',
+  10053: 'script already exists',
+  10058: 'script not found',
+  10061: 'script is not a valid module',
+  11005: 'worker already exists',
+}
+
+function safeCfReason(bodyText: string): string | null {
+  const code = parseCfErrorCode(bodyText)
+  if (code === null) return null
+  return CF_KNOWN_ERRORS[code] ?? null
+}
+
 /** A Cloudflare API failure with enough non-sensitive detail to act on. */
 export class CloudflareApiError extends AppError {
   /** Which provisioning step failed: token_verify | upload | subdomain | delete. */
@@ -191,16 +213,20 @@ export class CloudflareApiError extends AppError {
   /** Safe numeric Cloudflare error code, or null. Never the provider message. */
   cfCode: number | null
   httpStatus: number
+  /** Short safe description for diagnosis (e.g. "script content invalid").
+   * Stripped of anything that could echo request data. */
+  reason: string | null
 
-  constructor(step: string, httpStatus: number, cfCode: number | null) {
+  constructor(step: string, httpStatus: number, cfCode: number | null, reason: string | null) {
     super(
       REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_FAILED,
-      `The relay could not be provisioned by the provider. (step: ${step})${cfCode !== null ? ` (Cloudflare error ${cfCode})` : ''}`,
+      `The relay could not be provisioned by the provider. (step: ${step})${cfCode !== null ? ` (Cloudflare error ${cfCode})` : ''}${reason ? ` — ${reason}` : ''}`,
       400,
     )
     this.step = step
     this.cfCode = cfCode
     this.httpStatus = httpStatus
+    this.reason = reason
   }
 }
 
@@ -225,17 +251,20 @@ export function mapCloudflareApiError(step: string, status: number, bodyText: st
       return new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_CONFLICT, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROVISION_CONFLICT, 400)
     }
   }
-  return new CloudflareApiError(step, status, parseCfErrorCode(bodyText))
+  return new CloudflareApiError(step, status, parseCfErrorCode(bodyText), safeCfReason(bodyText))
 }
 
-async function cloudflareApi(path: string, options: { method?: string; apiToken: string; body?: string; contentType?: string }): Promise<{ status: number; bodyText: string }> {
+async function cloudflareApi(path: string, options: { method?: string; apiToken: string; body?: BodyInit | null; contentType?: string }): Promise<{ status: number; bodyText: string }> {
   let response: Response
   try {
     response = await fetch(`${apiBase()}${path}`, {
       method: options.method ?? 'GET',
       headers: {
         authorization: `Bearer ${options.apiToken}`,
-        ...(options.contentType ? { 'content-type': options.contentType } : {}),
+        // FormData bodies compute their own multipart boundary: omitting the
+        // content-type lets the runtime generate `multipart/form-data;
+        // boundary=...` correctly. Explicit string bodies keep their content-type.
+        ...(options.body instanceof FormData ? {} : options.contentType ? { 'content-type': options.contentType } : {}),
       },
       body: options.body,
       signal: AbortSignal.timeout(apiTimeout()),
@@ -256,36 +285,57 @@ async function validateApiToken(apiToken: string) {
   }
 }
 
-/** Build a multipart/form-data body (string) for a Worker script upload. */
-function multipartScriptUpload(script: string, relaySecret: string): { body: string; contentType: string } {
-  const boundary = `----9drive-${crypto.randomBytes(16).toString('hex')}`
-  const metadata = JSON.stringify({
-    main_module: 'index.js',
-    compatibility_date: '2024-09-01',
-    bindings: [{ type: 'secret_text', name: RELAY_SECRET_BINDING, text: relaySecret }],
-  })
-  const parts = [
-    `--${boundary}\r\nContent-Disposition: form-data; name="script"; filename="worker.js"\r\nContent-Type: application/javascript\r\n\r\n${script}`,
-    `--${boundary}\r\nContent-Disposition: form-data; name="metadata"\r\nContent-Type: application/json\r\n\r\n${metadata}`,
-    `--${boundary}--\r\n`,
-  ]
-  return { body: parts.join('\r\n'), contentType: `multipart/form-data; boundary=${boundary}` }
+/**
+ * Build the multipart/form-data upload payload for a Worker script deploy.
+ *
+ * Cloudflare's Workers Scripts multipart API resolves the ES module entry by
+ * matching part NAMES to `metadata.main_module` — each module is uploaded as a
+ * part named after its file. The entry module part therefore MUST be named
+ * `worker.mjs` (== filename == main_module) or the API cannot resolve the
+ * declared entry module and rejects with parse error 10021. The module part's
+ * Content-Type is `application/javascript+module`, per the API contract.
+ *
+ * Built with native FormData/Blob (not manual string framing) so the runtime
+ * generates the multipart container, boundary and per-part framing correctly.
+ */
+function multipartScriptUpload(script: string, metadata: string): { body: FormData; contentType: undefined } {
+  const form = new FormData()
+  const metadataPart = new Blob([metadata], { type: 'application/json' })
+  const modulePart = new Blob([script], { type: 'application/javascript+module' })
+  form.append('metadata', metadataPart)
+  form.append(RELAY_MODULE_NAME, modulePart, RELAY_MODULE_NAME)
+  return { body: form, contentType: undefined }
 }
 
 /**
- * Upload the bundled relay script + its secret binding in ONE multipart PUT
- * (the modern Workers Scripts API): `script` part (JS, filename worker.js —
- * the module parser keys off the filename) + `metadata` part (JSON with
- * main_module / compatibility_date / bindings, including the secret_text
- * binding carrying the generated relay secret).
+ * Upload the relay artifact + its secret binding in ONE multipart PUT (the
+ * modern Workers Scripts API): `worker.mjs` module part (identical to
+ * metadata.main_module) + `metadata` part (JSON with main_module /
+ * compatibility_date / bindings, including the secret_text binding carrying
+ * the generated relay secret — never interpolated into the source).
+ *
+ * Preflight: the canonical relay source is locally parsed (validateRelaySource)
+ * before any Cloudflare API request, so a known-invalid artifact fails as
+ * WORKER_RELAY_BUILD_FAILED instead of a doomed provider call.
  */
 async function uploadWorkerScript(accountId: string, workerName: string, apiToken: string, relaySecret: string) {
-  const { body, contentType } = multipartScriptUpload(RELAY_WORKER_SOURCE, relaySecret)
+  const { source, moduleName, metadata } = buildCloudflareRelay(relaySecret)
+  await validateRelaySource(source)
+  console.log(
+    `[worker:cloudflare] step=upload worker=${workerName} module=${moduleName} mainModule=${moduleName} ` +
+      `contentType=application/javascript+module moduleBytes=${Buffer.byteLength(source, 'utf8')} ` +
+      `moduleSha256=${relaySourceSha256(source)} compatibilityDate=${RELAY_COMPATIBILITY_DATE} bindings=${RELAY_SECRET_BINDING}`,
+  )
+  const { body, contentType } = multipartScriptUpload(source, metadata)
   const { status, bodyText } = await cloudflareApi(
     `/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}`,
     { method: 'PUT', apiToken, body, contentType }
   )
-  if (status >= 300) throw mapCloudflareApiError('upload', status, bodyText)
+  if (status >= 300) {
+    const code = parseCfErrorCode(bodyText)
+    console.error(`[worker:cloudflare] step=upload status=${status}${code !== null ? ` cloudflareCode=${code}` : ''}`)
+    throw mapCloudflareApiError('upload', status, bodyText)
+  }
 }
 
 /** Discover the deployed workers.dev subdomain for a script. */
@@ -493,7 +543,7 @@ const metadata: WorkerDriverMetadata = {
       type: 'password',
       secret: true,
       required: true,
-      help: 'A token with permissions to deploy and manage Workers. Encrypted on 9Drive and never shown again; leave blank on edit to keep the stored token.',
+      help: 'Must include "Workers Scripts: Edit" permission. Encrypted on 9Drive and never shown again; leave blank on edit to keep the stored token.',
     },
     {
       key: 'workerName',

@@ -125,20 +125,44 @@ validate Account ID / API Token / Worker Name
   → encrypt the API token + relay secret at rest
   → persist the worker as status = provisioning
   → CloudflareWorkerDriver.provision():
-        PUT /accounts/{id}/workers/scripts/{name}   (multipart upload:
-            script part   = bundled relay source
-            metadata part = main_module + compatibility_date +
-                            SECRET secret_text binding carrying the relay secret)
+        build relay artifact (static worker.mjs from disk, preflight-parsed
+          locally; any build failure → WORKER_RELAY_BUILD_FAILED, no API call)
+        PUT /accounts/{id}/workers/scripts/{name}   (multipart FormData upload:
+            worker.mjs part = static relay source
+                              (Content-Type: application/javascript+module)
+            metadata part   = main_module + compatibility_date +
+                              RELAY_SECRET secret_text binding carrying the
+                              relay secret)
         GET .../scripts/{name}/subdomain            (discover workers.dev endpoint)
   → driver.testConnection() against the discovered endpoint
   → persist status = healthy + endpointUrl + capabilities
 ```
 
-The script upload and the secret binding happen in ONE multipart PUT — the
-metadata part carries the `SECRET` secret_text binding, so the relay secret is
-never a separate request. A duplicate-named script surfaces as
-`WORKER_PROVISION_CONFLICT` (HTTP 409 or CF error code 10053) with a rename
-hint — 9Drive never silently overwrites a possibly-foreign script.
+The module upload and the secret binding happen in ONE multipart PUT — the
+metadata part carries the `RELAY_SECRET` secret_text binding, so the relay
+secret is never a separate request and never appears inside the Worker source
+(source is a deterministic static asset). Two details matter to Cloudflare's
+parser:
+- the uploaded module part must be NAMED exactly like the entry module and
+  `metadata.main_module` must reference exactly that name (`worker.mjs` on
+  both — part name, filename, and main_module all match), and
+- the module part's `Content-Type` must be `application/javascript+module`
+  (per the Workers Scripts multipart API contract; an unresolvable
+  main_module or wrong part content type is what trips parser error 10021).
+The multipart body is built with native `FormData`/`Blob` — the runtime
+generates the boundary and per-part framing; 9Drive never hand-assembles the
+multipart string. The `compatibility_date` is a fixed app-controlled constant
+(RELAY_COMPATIBILITY_DATE, tied to protocol 9drive-relay-v1), never derived
+from the current date.
+
+A duplicate-named script surfaces as `WORKER_PROVISION_CONFLICT` (HTTP 409 or
+CF error code 10053) with a rename hint — 9Drive never silently overwrites a
+possibly-foreign script.
+
+Provisioning failures surface the failing step + the safe Cloudflare numeric
+error code (e.g. `(step: upload) (Cloudflare error 10021)`). Known codes:
+10021 script content/format error, 10053/10058/11005 script already exists,
+10022 validation failed, 10051 invalid name, 10061 not a valid module.
 
 A **provisioning failure** persists `status = provision_failed` + a safe
 `lastErrorCode`, triggers best-effort `deprovision()` cleanup of any partially

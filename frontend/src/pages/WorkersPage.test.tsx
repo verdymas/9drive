@@ -105,6 +105,18 @@ describe('WorkersPage', () => {
     expect(within(modal).queryByLabelText(/^name/i)).not.toBeInTheDocument()
   })
 
+  it('add modal includes the API token creation tutorial', async () => {
+    render(<WorkersPage />)
+    await waitFor(() => expect(screen.getByRole('button', { name: /add worker/i })).toBeInTheDocument())
+    await openAddModal()
+    const modal = addModal()
+    expect(within(modal).getByText('How to create an API token')).toBeInTheDocument()
+    // Opens the steps (collapsed by default — expand and check the permissions note).
+    await userEvent.click(within(modal).getByText('How to create an API token'))
+    expect(within(modal).getAllByText(/Workers Scripts: Edit/).length).toBeGreaterThan(0)
+    expect(within(modal).getAllByText(/dash\.cloudflare\.com/).length).toBeGreaterThan(0)
+  })
+
   it('submits config-only payload {driver, config, isEnabled} — no endpointUrl', async () => {
     const create = vi.spyOn(Workers, 'createWorker').mockResolvedValue(WORKER_A)
     render(<WorkersPage />)

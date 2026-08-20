@@ -10,7 +10,14 @@ import {
   mapCloudflareApiError,
   cloudflareWorkerDriver,
 } from './cloudflare.js'
-import { RELAY_WORKER_SOURCE } from './cloudflare-relay-worker.js'
+import {
+  RELAY_MODULE_NAME,
+  RELAY_COMPATIBILITY_DATE,
+  loadRelaySource,
+  buildCloudflareRelay,
+  validateRelaySource,
+  relaySourceSha256,
+} from './cloudflare-relay.js'
 
 describe('normalizeEndpointUrl', () => {
   it('accepts an https URL, canonical form has no trailing slash', () => {
@@ -95,15 +102,68 @@ describe('HMAC_SIGNATURE_HEADER', () => {
   })
 })
 
-describe('RELAY_WORKER_SOURCE', () => {
-  it('is a plain script with /health and /fetch handlers, no imports', () => {
-    expect(RELAY_WORKER_SOURCE).toContain('SERVICE_IDENTITY')
-    expect(RELAY_WORKER_SOURCE).toContain("'/health'")
-    expect(RELAY_WORKER_SOURCE).toContain("'/fetch'")
-    expect(RELAY_WORKER_SOURCE).toContain('export default')
-    expect(RELAY_WORKER_SOURCE).not.toContain('import ')
+describe('relay build (static artifact → local preflight)', () => {
+  it('loads a parse-clean ES module with /health and /fetch handlers, no imports', async () => {
+    const source = loadRelaySource()
+    expect(source).toContain('SERVICE_IDENTITY')
+    expect(source).toContain("'/health'")
+    expect(source).toContain("'/fetch'")
+    expect(source).toContain('export default')
+    expect(source).not.toContain('import ')
     // Well under Cloudflare's direct-upload limits.
-    expect(RELAY_WORKER_SOURCE.length).toBeLessThan(64 * 1024)
+    expect(source.length).toBeLessThan(64 * 1024)
+    await expect(validateRelaySource(source)).resolves.toBeUndefined()
+  })
+
+  it('preflight rejects an invalid artifact as WORKER_RELAY_BUILD_FAILED', async () => {
+    await expect(validateRelaySource('export const broken = ')).rejects.toMatchObject({ code: 'WORKER_RELAY_BUILD_FAILED' })
+    // TypeScript-syntax leftovers must be caught locally, never uploaded.
+    await expect(validateRelaySource('interface Foo {}\nexport default { fetch: () => {} }')).rejects.toMatchObject({ code: 'WORKER_RELAY_BUILD_FAILED' })
+    // Missing entrypoint (no export default) must be caught too.
+    await expect(validateRelaySource('const x = 1;')).rejects.toMatchObject({ code: 'WORKER_RELAY_BUILD_FAILED' })
+  })
+
+  it('build output parses locally and never contains secrets, TS or process.env', async () => {
+    const { source } = buildCloudflareRelay('sup3r-s3cret-value')
+    await expect(validateRelaySource(source)).resolves.toBeUndefined()
+    expect(source).toContain('export default')
+    expect(source).not.toContain('interface ')
+    expect(source).not.toContain('process.env')
+    expect(source).not.toContain('sup3r-s3cret-value')
+    // The secret travels only as the binding metadata, never in source.
+    expect(source).not.toContain('RELAY_SECRET =')
+  })
+
+  it('source is byte-identical regardless of secret content (no interpolation)', () => {
+    // Secrets with characters that would break JS string interpolation must
+    // leave the artifact untouched: the secret is a binding, not source.
+    const baseline = buildCloudflareRelay('baseline').source
+    const nasty = [`dq"dq`, `sq'sq`, `bs\\bs`, 'bt`bt', 'dol${x}dol', 'nl\nline', "nl\rcr"] as const
+    for (const secret of nasty) {
+      expect(buildCloudflareRelay(secret).source).toBe(baseline)
+    }
+  })
+
+  it('build returns metadata with main_module === module name and the secret binding', () => {
+    const { source, moduleName, metadata } = buildCloudflareRelay('relay-secret')
+    expect(moduleName).toBe('worker.mjs')
+    expect(metadata).toContain('"main_module":"worker.mjs"')
+    expect(metadata).toContain('"type":"secret_text"')
+    expect(metadata).toContain('"name":"RELAY_SECRET"')
+    expect(metadata).toContain('relay-secret')
+    expect(metadata).toContain(`"compatibility_date":"${RELAY_COMPATIBILITY_DATE}"`)
+    expect(source.length).toBeGreaterThan(0)
+  })
+
+  it('exports the canonical module name and compatibility date constants', () => {
+    expect(RELAY_MODULE_NAME).toBe('worker.mjs')
+    expect(RELAY_COMPATIBILITY_DATE).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+  })
+
+  it('relaySourceSha256 is a stable hex digest (safe to log)', () => {
+    const s = loadRelaySource()
+    expect(relaySourceSha256(s)).toMatch(/^[a-f0-9]{64}$/)
+    expect(relaySourceSha256(s)).toBe(relaySourceSha256(s))
   })
 })
 
@@ -172,7 +232,7 @@ describe('cloudflare managed provisioning', () => {
     })
   })
 
-  it('provision: multipart upload (script + secret binding) → discover subdomain → endpoint', async () => {
+  it('provision: multipart upload (module + metadata with secret binding) → discover subdomain → endpoint', async () => {
     const { called, fetchMock } = setupFetch()
     const result = await cloudflareWorkerDriver.provision!({
       config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' },
@@ -181,16 +241,48 @@ describe('cloudflare managed provisioning', () => {
     const PUTs = called.filter((c) => c.method === 'PUT')
     expect(PUTs).toHaveLength(1)
     expect(PUTs[0].path).toBe('/accounts/acc-1/workers/scripts/relay-1')
-    // Multipart body: script part + metadata part with the secret binding.
-    const body = String(PUTs[0].body)
-    expect(body).toContain('SERVICE_IDENTITY')
-    expect(body).toContain('name="metadata"')
-    expect(body).toContain('main_module')
-    expect(body).toContain('secret_text')
-    expect(body).toContain('relay-secret')
+    // The body is a native FormData: metadata part + module part named after
+    // the entry module (worker.mjs).
+    const form = PUTs[0].body as FormData
+    expect(form).toBeInstanceOf(FormData)
+    const metadataPart = form.get('metadata') as Blob
+    expect(metadataPart.type).toBe('application/json')
+    const metadataJson = JSON.parse(await metadataPart.text()) as {
+      main_module: string
+      compatibility_date: string
+      bindings: Array<{ type: string; name: string; text: string }>
+    }
+    // main_module MUST reference exactly the uploaded module part name —
+    // a mismatch is what trips Cloudflare parse error 10021.
+    expect(metadataJson.main_module).toBe('worker.mjs')
+    expect(metadataJson.compatibility_date).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+    expect(metadataJson.bindings).toEqual([{ type: 'secret_text', name: 'RELAY_SECRET', text: 'relay-secret' }])
+    const modulePart = form.get('worker.mjs') as Blob
+    expect(modulePart.type).toBe('application/javascript+module')
+    const moduleSource = await modulePart.text()
+    expect(moduleSource.length).toBeGreaterThan(0)
+    expect(moduleSource).toContain('export default')
+    expect(moduleSource).not.toContain('relay-secret')
+    // Metadata part before module part: both present, module part non-empty.
+    expect([...form.keys()]).toEqual(['metadata', 'worker.mjs'])
+    // Serialize the FormData the way the runtime would: the generated framing
+    // must contain a proper boundary with the module part named exactly
+    // worker.mjs and typed as a JavaScript module.
+    const serialized = await new Response(form).text()
+    // The runtime's generated framing: undici serializes the field name inside
+    // Content-Disposition (filename carries the module name), with each part's
+    // own Content-Type header, closing with the boundary terminator.
+    const lines = serialized.split('\r\n')
+    expect(lines[0]).toMatch(/^--[^\r\n]+$/)
+    expect(serialized).toContain('Content-Disposition: form-data; name="metadata"; filename="blob"\r\nContent-Type: application/json')
+    expect(serialized).toContain('Content-Disposition: form-data; name="worker.mjs"; filename="worker.mjs"\r\nContent-Type: application/javascript+module')
+    expect(serialized).toContain('"main_module":"worker.mjs"')
+    expect(lines[lines.length - 2]).toMatch(/^--[^\r\n]+--$/)
+    // The driver lets the runtime generate the multipart container + boundary:
+    // no explicit content-type is passed for FormData bodies.
     expect(fetchMock).toHaveBeenCalledWith(
       `${CF_BASE}/accounts/acc-1/workers/scripts/relay-1`,
-      expect.objectContaining({ method: 'PUT', headers: expect.objectContaining({ 'content-type': expect.stringContaining('multipart/form-data; boundary=') }) }),
+      expect.objectContaining({ method: 'PUT', headers: expect.not.objectContaining({ 'content-type': expect.anything() }) }),
     )
     expect(fetchMock).toHaveBeenCalledWith(`${CF_BASE}/accounts/acc-1/workers/scripts/relay-1/subdomain`, expect.anything())
     expect(result.endpointUrl).toBe('https://relay-1.example-subdomain.workers.dev')

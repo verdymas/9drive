@@ -156,7 +156,31 @@ function startFakeCfApi(): Promise<string> {
       }
 
       if (path === '/user/tokens/verify') return write(200, { success: true })
-      if (path.startsWith('/accounts/acc-1/workers/scripts/') && req.method === 'PUT') return write(200, { success: true, result: { id: path.split('/').pop() } })
+      if (path.startsWith('/accounts/acc-1/workers/scripts/') && req.method === 'PUT') {
+        // The fake API validates the multipart contract the same way the real
+        // one does: the uploaded module part must be named exactly worker.mjs
+        // (== metadata.main_module) with the module content type.
+        void (async () => {
+          try {
+            const raw = Buffer.concat(await iterableToBuffer(req))
+            const ct = req.headers['content-type'] ?? ''
+            console.log(`[test:fake-cf] PUT ${path} content-type="${ct}" bodyBytes=${raw.length}`)
+            // Inspect the raw multipart framing.
+            const text = raw.toString('utf8')
+            // If strictly required, a real parser (busboy) would be used; for
+            // asserting the upload contract this string inspection suffices and
+            // keeps the fake deterministic.
+            if (text.includes('name="worker.mjs"; filename="worker.mjs"') && text.includes('application/javascript+module') && text.includes('"main_module":"worker.mjs"')) {
+              write(200, { success: true, result: { id: path.split('/').pop() } })
+            } else {
+              write(400, { success: false, errors: [{ code: 10021, message: 'script content could not be parsed (syntax or format error)' }] })
+            }
+          } catch {
+            write(400, { success: false, errors: [{ code: 10021, message: 'script content could not be parsed (syntax or format error)' }] })
+          }
+        })()
+        return
+      }
       if (path === '/accounts/acc-1/workers/scripts/relay-e2e/subdomain') return write(200, { success: true, result: { subdomain: 'e2e-sub' } })
       if (path === '/accounts/acc-1/workers/scripts/relay-e2e' && req.method === 'DELETE') return write(200, { success: true })
       return write(404, { success: false })
@@ -165,6 +189,16 @@ function startFakeCfApi(): Promise<string> {
       const { port } = cfServer.address() as AddressInfo
       resolve(`http://127.0.0.1:${port}`)
     })
+  })
+}
+
+/** Collect an IncomingMessage body into a single Buffer. */
+function iterableToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer[]> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    stream.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+    stream.on('end', () => resolve(chunks))
+    stream.on('error', reject)
   })
 }
 
@@ -271,6 +305,39 @@ describe('managed provisioning through the real driver (fake CF API)', () => {
     // The 409 happens at the first upload — the script was never deployed, so
     // the best-effort deprovision cleanup never exists.
     expect(h.prismaMock.remoteFetchWorker.update).toHaveBeenCalled()
+  })
+
+  it('reports step=upload with the safe Cloudflare 10021 code when the script parse is rejected', async () => {
+    const realFetch = (globalThis as any).fetch as typeof fetch
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      const method = init?.method ?? 'GET'
+      if (url.includes('/workers/scripts/') && method === 'PUT') {
+        return { status: 400, ok: false, text: async () => '{"success":false,"errors":[{"code":10021,"message":"script content could not be parsed (syntax or format error)"}]}' } as unknown as Response
+      }
+      return realFetch(url, init)
+    }))
+    try {
+      await expect(
+        createWorker('user-1', {
+          driver: 'cloudflare',
+          config: { accountId: 'acc-1', apiToken: 'tok-e2e', workerName: 'relay-e2e' },
+        }),
+      ).rejects.toMatchObject({ code: 'WORKER_PROVISION_FAILED' })
+      await expect(
+        createWorker('user-1', {
+          driver: 'cloudflare',
+          config: { accountId: 'acc-1', apiToken: 'tok-e2e', workerName: 'relay-e2e' },
+        }),
+      ).rejects.toMatchObject({ message: expect.stringContaining('step: upload') })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+    const updates = h.prismaMock.remoteFetchWorker.update.mock.calls.map((c: { 0: { data: any } }) => c[0].data)
+    const failUpdate = updates.find((d: { status?: string }) => d.status === 'provision_failed')
+    expect(failUpdate).toBeDefined()
+    expect(failUpdate.lastErrorCode).toBe('WORKER_PROVISION_FAILED')
+    expect(failUpdate.endpointUrl ?? undefined).toBeUndefined()
   })
 
   it('never returns a fake endpoint when provisioning failed (no endpoint persisted)', async () => {

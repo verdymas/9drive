@@ -3,6 +3,7 @@ import {
   Activity,
   AlertTriangle,
   Crown,
+  ExternalLink,
   Loader2,
   Pencil,
   Plus,
@@ -14,6 +15,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { Collapsible } from '@/components/ui/collapsible'
 import { DummyModal } from '@/components/drive/DummyModal'
 import { PageHeader } from '@/components/drive/PageHeader'
 import { timeAgo } from '@/lib/utils'
@@ -256,7 +258,7 @@ export function WorkersPage() {
         ) : (
           <input
             type={isSecret ? 'password' : 'text'}
-            className={`${common} ${isSecret || field.type === 'number' ? '' : ''}`}
+            className={common}
             value={form.fields[field.key] ?? ''}
             onChange={(e) => setField(field.key, e.target.value)}
             required={field.required && !(editing && isSecret)}
@@ -264,7 +266,54 @@ export function WorkersPage() {
           />
         )}
         {field.help ? <span className="text-xs text-slate-400">{field.help}</span> : null}
+        {/* Cloudflare API Token: inline tutorial for the required permissions —
+            missing permissions are the #1 cause of provisioning failures. */}
+        {field.key === 'apiToken' ? <ApiTokenTutorial /> : null}
       </label>
+    )
+  }
+
+  /** Step-by-step Cloudflare API token creation (see docs/WORKERS.md). */
+  function ApiTokenTutorial() {
+    return (
+      <Collapsible title="How to create an API token" defaultOpen={false}>
+        <ol className="list-none space-y-2 text-xs text-slate-600">
+          <li>
+            <b className="text-slate-700">1.</b> Open{' '}
+            <a
+              href="https://dash.cloudflare.com/profile/api-tokens"
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 font-semibold text-blue-600 hover:underline"
+            >
+              dash.cloudflare.com → My Profile → API Tokens <ExternalLink className="h-3 w-3" />
+            </a>
+            .
+          </li>
+          <li>
+            <b className="text-slate-700">2.</b> <span className="font-semibold text-slate-700">Create Token</span> and pick the{' '}
+            <span className="font-semibold text-slate-700">Edit Cloudflare Workers</span> template.
+          </li>
+          <li>
+            <b className="text-slate-700">3.</b> Select the account you registered above and keep zone permissions at{' '}
+            <span className="font-semibold text-slate-700">All zones</span> (or the zone hosting your Worker).
+          </li>
+          <li>
+            <b className="text-slate-700">4.</b> Create the token and copy it here. It needs at least:
+            <ul className="mt-1 space-y-1 pl-1">
+              <li>· <span className="font-semibold text-slate-700">Workers Scripts: Edit</span></li>
+              <li>· <span className="font-semibold text-slate-700">Workers R2 Storage: Edit</span> (if you later use R2)</li>
+            </ul>
+          </li>
+          <li>
+            <b className="text-slate-700">5.</b> 9Drive deploys the relay Worker automatically — no dashboard setup needed beyond the token.
+          </li>
+        </ol>
+        <p className="text-xs text-slate-400">
+          The token is encrypted on 9Drive and never shown again. If provisioning fails with “credentials invalid”, check that the
+          token has the <b>Workers Scripts: Edit</b> permission for this account.
+        </p>
+      </Collapsible>
     )
   }
 
