@@ -81,6 +81,11 @@ describe('serializer → worker.mjs parser (real artifact, real serializer)', ()
     worker = await loadWorker()
     upstream = http.createServer((req, res) => {
       upstreamHits.push({ method: req.method ?? 'GET', url: req.url ?? '/', headers: req.headers })
+      if (req.url === '/redirect-to-final') {
+        res.writeHead(302, { Location: '/final.m3u8' })
+        res.end()
+        return
+      }
       res.writeHead(200, {
         'content-type': 'application/vnd.apple.mpegurl',
         'content-length': String(UPSTREAM_BODY_LEN),
@@ -126,6 +131,22 @@ describe('serializer → worker.mjs parser (real artifact, real serializer)', ()
     const res = await worker.fetch(buildRequest(payload), { RELAY_SECRET: SECRET })
     expect(res.status).toBe(200)
     expect(upstreamHits[upstreamHits.length - 1].headers.range).toBe('bytes=0-1023')
+  })
+
+  it('returns the post-redirect finalUrl (redirects stay on the relay)', async () => {
+    const payload = {
+      protocolVersion: RELAY_PROTOCOL_VERSION,
+      url: `${upstreamUrl}/redirect-to-final`,
+      method: 'GET' as const,
+      headers: {},
+    }
+    const res = await worker.fetch(buildRequest(payload), { RELAY_SECRET: SECRET })
+    expect(res.status).toBe(200)
+    const json = (await res.json()) as { status: number; finalUrl?: string }
+    expect(json.status).toBe(200)
+    expect(json.finalUrl).toBe(`${upstreamUrl}/final.m3u8`)
+    // The relay (not the backend transport) performed the redirect hop.
+    expect(upstreamHits.some((site) => site.url === '/redirect-to-final')).toBe(true)
   })
 
   it('rejects a wrong protocol version with reason INVALID_PROTOCOL (never the URL/secret)', async () => {

@@ -273,6 +273,7 @@ describe('CloudflareRemoteFetchTransport via mock relay', () => {
               statusText: upstreamRes.statusText,
               headers: respHeaders,
               body: buf.toString('base64'),
+              finalUrl: upstreamRes.url,
               protocolVersion: RELAY_PROTOCOL_VERSION,
             }),
           )
@@ -326,6 +327,27 @@ describe('CloudflareRemoteFetchTransport via mock relay', () => {
     const res = await transport.request({ method: 'GET', url: `${upstreamUrl}/test`, headers: {}, range: 'bytes=0-0' })
     expect(res.status).toBe(200)
     expect(upstreamHits[0].headers['range']).toBe('bytes=0-0')
+  })
+
+  it('validates the relayed target with resolveDns:false (no backend DNS in relay mode)', async () => {
+    const calls: Array<{ raw: string; opts?: unknown }> = []
+    validationSpy.validateRemoteUrl.mockImplementation(async (raw: string, opts?: unknown) => {
+      calls.push({ raw, opts })
+      return new URL(raw)
+    })
+    validationSpy.resolveAndValidateHost.mockImplementation(async (host: string) => host)
+    const transport = new CloudflareRemoteFetchTransport({ endpointUrl: relayUrl, secret: SECRET, workerId: 'w1', driver: 'cloudflare' })
+    await transport.request({ method: 'GET', url: `${upstreamUrl}/file`, headers: {} })
+    expect(calls[0]).toMatchObject({ raw: `${upstreamUrl}/file`, opts: { resolveDns: false } })
+    // The backend never DNS-resolves the relayed target — the relay edge enforces IP space.
+    expect(validationSpy.resolveAndValidateHost).not.toHaveBeenCalled()
+  })
+
+  it('passes the relay-reported post-redirect finalUrl through', async () => {
+    const transport = new CloudflareRemoteFetchTransport({ endpointUrl: relayUrl, secret: SECRET, workerId: 'w1', driver: 'cloudflare' })
+    const res = await transport.request({ method: 'GET', url: `${upstreamUrl}/test`, headers: {} })
+    // Mock relay echoes upstream.fetch's URL (it never redirects at /test).
+    expect((res as { finalUrl?: string }).finalUrl).toBe(`${upstreamUrl}/test`)
   })
 
   it('HLS manifest GET through relay (with HLS headers) succeeds', async () => {

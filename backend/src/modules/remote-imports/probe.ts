@@ -142,6 +142,13 @@ const PROBE_MANIFEST_HEADERS: Record<string, string> = {
   'User-Agent': '9Drive-Remote-Import/1.0',
 }
 
+/** Route identity for probe logs: `route=direct` | `route=worker workerId driver relayHost`. */
+function probeRouteParts(fetcher: SecureRemoteFetcher): string {
+  const r = fetcher.routeInfo()
+  if (r.route !== 'worker') return 'route=direct'
+  return `route=worker workerId=${r.workerId ?? ''} driver=${r.driver ?? ''} relayHost=${r.relayHost ?? ''}`
+}
+
 /**
  * Probe a remote URL without downloading the file. Returns the detected
  * filename (always sanitized), its source, response metadata, and an HLS
@@ -159,20 +166,36 @@ export async function probeRemoteUrl(
   requestContext?: RemoteImportRequestContext,
   opts: { workerId?: string | null; fetcher?: SecureRemoteFetcher } = {},
 ): Promise<ProbeResult> {
-  const originalUrl = await validateRemoteUrl(rawUrl)
-  const originalUrlHref = originalUrl.href
   const log = (message: string, extra: Record<string, string | number | boolean> = {}) => {
     console.log(
       `[remote-import:probe] ${correlationId} ${message} ${Object.entries(extra).map(([k, v]) => `${k}=${String(v)}`).join(' ')}`.trim(),
     )
   }
+  // Route identity for logs: route=direct | route=worker workerId driver relayHost
+  const routeParts = probeRouteParts
 
-  // Resolve fetcher generically: opts.fetcher wins, else workerId → registry, else Direct
+  const workerSelected = Boolean(opts.workerId)
+
+  // Resolve the worker transport FIRST: validation errors for the selected
+  // worker (missing / disabled / unsupported / unusable) surface before any
+  // URL or DNS work and with no source request having happened (§28). The
+  // factory reuses the SAME generic registry the download path uses — probe
+  // and download can never diverge on the selected route.
   let fetcher: SecureRemoteFetcher | null = opts.fetcher ?? null
-  if (!fetcher && opts.workerId !== undefined) {
-    fetcher = await createSecureFetcherForWorkerId(opts.workerId ?? null, { requestContext, sourceUrl: originalUrlHref })
+  if (!fetcher && workerSelected) {
+    fetcher = await createSecureFetcherForWorkerId(opts.workerId!, { requestContext, sourceUrl: rawUrl })
   }
-  // Fallback to direct fetcher for tests / when no workerId provided and no fetcher supplied
+
+  // URL validation: syntax/policy checks always; backend DNS ONLY in Direct
+  // mode. In relay mode the backend must not resolve hostnames it never
+  // connects to — a strict-firewall host may be unresolvable from the backend
+  // even though the relay can reach it. The relay edge (Cloudflare Workers
+  // fetch) enforces host → IP-space safety for the relayed request.
+  const originalUrl = await validateRemoteUrl(rawUrl, { resolveDns: !workerSelected })
+  const originalUrlHref = originalUrl.href
+
+  // Direct mode (or when a custom fetcher was not supplied): resolve the
+  // always-available direct transport.
   if (!fetcher) {
     fetcher = await createSecureFetcherForWorkerId(null, { requestContext, sourceUrl: originalUrlHref })
   }
@@ -184,11 +207,12 @@ export async function probeRemoteUrl(
   let headRedirects = 0
   let headResult: ProbeResult | null = null
   try {
-    // Use fetcher for HEAD when available; fallback to followRemoteUrl for direct tests that mock ssrf
+    log(`${routeParts(fetcher)} method=HEAD targetHost=${hostOf(originalUrlHref)}`)
     const headRes = await fetcher.fetch({ method: 'HEAD', url: originalUrlHref, requestContext: requestContext as any } as any)
     headStatus = headRes.status
     headRedirects = (headRes as any).redirectCount ?? 0
     const finalUrl = (headRes as any).finalUrl ?? originalUrlHref
+    log(`response ${routeParts(fetcher)} status=${headStatus}`)
     // HEAD has no body; headers are already lowercased
     headResult = buildProbeResult(originalUrlHref, finalUrl, { statusCode: headStatus, headers: headRes.headers }, null)
   } catch (headError) {
@@ -259,7 +283,9 @@ async function getProbe(
     let redirectCount = 0
     let finalUrlForResult = originalUrlHref
     if (fetcher) {
+      log(`${probeRouteParts(fetcher)} method=GET range=bytes=0-0 targetHost=${hostOf(originalUrlHref)}`)
       const res = await fetcher.fetch({ method: 'GET', url: originalUrlHref, range: 'bytes=0-0', headers: { Range: 'bytes=0-0' }, requestContext: requestContext as any } as any)
+      log(`response ${probeRouteParts(fetcher)} status=${res.status}`)
       const finalUrl = (res as any).finalUrl ?? originalUrlHref
       redirectCount = (res as any).redirectCount ?? 0
       finalUrlForResult = finalUrl
@@ -372,7 +398,9 @@ async function finalizeProbe(
   let fetch: { body: string; finalUrl: string }
   try {
     if (fetcher) {
+      log(`${probeRouteParts(fetcher)} method=GET role=manifest targetHost=${hostOf(base.sourceUrlForFetch)}`)
       const res = await fetcher.boundedGet(base.sourceUrlForFetch, { requestContext, maxBytes: 1024 * 1024, sourceUrl: base.sourceUrlForFetch })
+      log(`response ${probeRouteParts(fetcher)} status=${res.status} role=manifest`)
       if (res.status >= 400) {
         // Map status to typed error (mirrors fetchManifestForProbe logic)
         const hasCtx = Boolean(requestContext)

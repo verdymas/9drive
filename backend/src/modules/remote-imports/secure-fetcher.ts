@@ -17,6 +17,11 @@ export class SecureRemoteFetcher {
     private diagnostics: { route: 'direct' | 'worker'; workerId?: string | null; driver?: string | null; relayHost?: string | null },
   ) {}
 
+  /** Safe route diagnostics for probe-level logging (never secrets/URLs). */
+  routeInfo(): { route: 'direct' | 'worker'; workerId?: string | null; driver?: string | null; relayHost?: string | null } {
+    return this.diagnostics
+  }
+
   async fetch(input: RemoteFetchRequest): Promise<RemoteFetchResponse & { finalUrl?: string; redirectCount?: number }> {
     const targetHost = (() => {
       try {

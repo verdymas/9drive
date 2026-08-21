@@ -10,3 +10,9 @@
 - Centralize shared constants/protocol definitions (protocol versions, allowed methods, canonical field names) in one place instead of duplicating magic strings across files. Confidence: 0.85
 - Avoid silent fallback behavior that defeats an explicit design choice (e.g., a selected worker silently falling back to direct fetch); fail explicitly instead. Confidence: 0.9
 - Provide compact PASS/FAIL test output and final reports; document exact commands to run and their results. Confidence: 0.75
+- Design delete/deprovision/cleanup operations to be idempotent: treat an already-absent remote resource (404 / provider "not found") as success, and never permanently trap a row that has no remote identity (dummy/test/failed rows delete without a provider call). Confidence: 0.9
+- Destructive admin operations (e.g., force-delete) must require an explicit user confirmation, be never-automatic (a separate endpoint/flow, never reached via fallback), and be audited with a warning about consequences (e.g., remote resource may remain). Confidence: 0.9
+- Reuse existing generic architecture and validation logic (transports, resolvers, worker validation) instead of creating provider-specific duplicates (e.g., a second probe fetcher) or re-doing provider validation in the backend. Confidence: 0.9
+- Use structured correlation-ID logs with step/status/result/route fields and target/probe context; keep values developer-comprehensible while never logging secrets, URLs, or query strings. Confidence: 0.85
+- Keep fixes scoped: do not modify unrelated features or out-of-scope behavior when addressing a specific issue. Confidence: 0.9
+- Apply SSRF enforcement at the layer that performs the connection: the relay edge enforces host→IP-space for relayed requests while the backend still validates URL syntax/policy (so relay mode must not require the backend to resolve targets it never connects to). Confidence: 0.85

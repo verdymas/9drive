@@ -92,4 +92,26 @@ describe('validateRemoteUrl / resolveAndValidateHost', () => {
   it('throws a stable AppError for unresolvable hosts', async () => {
     await expect(resolveAndValidateHost('host-that-does-not-exist.invalid')).rejects.toMatchObject({ code: 'SSRF_DNS_FAILED' })
   })
+
+  it('resolveDns:false still rejects blocked LITERAL IPs without needing DNS', async () => {
+    await expect(validateRemoteUrl('http://127.0.0.1/file', { resolveDns: false })).rejects.toMatchObject({ code: 'SSRF_BLOCKED_ADDRESS' })
+    await expect(validateRemoteUrl('http://169.254.169.254/latest/meta-data/', { resolveDns: false })).rejects.toMatchObject({ code: 'SSRF_BLOCKED_ADDRESS' })
+    await expect(validateRemoteUrl('http://10.0.0.5/file', { resolveDns: false })).rejects.toMatchObject({ code: 'SSRF_BLOCKED_ADDRESS' })
+    await expect(validateRemoteUrl('http://192.168.1.1/file', { resolveDns: false })).rejects.toMatchObject({ code: 'SSRF_BLOCKED_ADDRESS' })
+  })
+
+  it('resolveDns:false does NOT resolve hostnames (relay mode: the relay enforces IP space)', async () => {
+    // `.invalid` is guaranteed NXDOMAIN — this only passes because NO DNS runs.
+    const url = await validateRemoteUrl('http://metadata.guard.invalid/path?token=abc', { resolveDns: false })
+    expect(url.hostname).toBe('metadata.guard.invalid')
+    // Syntax/policy checks still apply: scheme, credentials, host presence.
+    await expect(validateRemoteUrl('ftp://metadata.guard.invalid/', { resolveDns: false })).rejects.toMatchObject({ code: 'UNSUPPORTED_URL_SCHEME' })
+    await expect(validateRemoteUrl('http://user:pass@metadata.guard.invalid/', { resolveDns: false })).rejects.toMatchObject({ code: 'URL_CREDENTIALS_NOT_ALLOWED' })
+    await expect(validateRemoteUrl('not-a-url', { resolveDns: false })).rejects.toMatchObject({ code: 'INVALID_URL' })
+  })
+
+  it('resolveDns defaults to true (Direct mode still resolves hostnames)', async () => {
+    await expect(validateRemoteUrl('http://host-that-does-not-exist.invalid/')).rejects.toMatchObject({ code: 'SSRF_DNS_FAILED' })
+    await expect(validateRemoteUrl('http://host-that-does-not-exist.invalid/', { resolveDns: true })).rejects.toMatchObject({ code: 'SSRF_DNS_FAILED' })
+  })
 })

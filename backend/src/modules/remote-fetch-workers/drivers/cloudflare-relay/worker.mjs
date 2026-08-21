@@ -165,6 +165,7 @@ async function handleFetch(request) {
         statusText: upstream.statusText,
         headers: responseHeaders,
         body: btoa(binary),
+        finalUrl: upstream.url,
         protocolVersion: PROTOCOL_VERSION,
       },
       200

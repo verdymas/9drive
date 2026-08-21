@@ -105,15 +105,23 @@ export function urlHasCredentials(url: URL): boolean {
 }
 
 /**
- * Validate a user-supplied remote import URL at creation time:
+ * Validate a user-supplied remote import URL:
  *  - only http/https schemes,
  *  - no embedded credentials,
- *  - DNS resolves to a public, non-blocked address.
+ *  - DNS resolves to a public, non-blocked address (Direct mode).
  *
- * Returns the URL object. This is a first gate; the downloader re-validates
- * every hop (including redirect targets) with resolveAndValidateHost.
+ * Relay mode (`resolveDns: false`) must NOT require backend DNS: the relay
+ * (Cloudflare Workers fetch) is the enforcement point for hostname → IP —
+ * its runtime rejects private / loopback / link-local / metadata destinations.
+ * The backend still applies every syntax + policy check that needs no network
+ * (scheme, credentials, hostname presence, literal-IP blocklist), so SSRF
+ * protection is preserved without requiring the backend to resolve targets it
+ * does not connect to.
+ *
+ * Returns the URL object. This is a first gate; the Direct downloader
+ * re-validates every hop (including redirect targets) with resolveAndValidateHost.
  */
-export async function validateRemoteUrl(rawUrl: string): Promise<URL> {
+export async function validateRemoteUrl(rawUrl: string, opts: { resolveDns?: boolean } = {}): Promise<URL> {
   let url: URL
   try {
     url = new URL(rawUrl)
@@ -129,6 +137,13 @@ export async function validateRemoteUrl(rawUrl: string): Promise<URL> {
   if (!url.hostname) {
     throw new AppError('INVALID_URL', 'The URL is missing a host.', 400)
   }
-  await resolveAndValidateHost(url.hostname)
+  // Literal IP hosts never need DNS — validate the address directly (policy).
+  if (ipaddr.isValid(url.hostname)) {
+    await resolveAndValidateHost(url.hostname)
+    return url
+  }
+  if (opts.resolveDns !== false) {
+    await resolveAndValidateHost(url.hostname)
+  }
   return url
 }

@@ -435,8 +435,19 @@ export function RemoteImportModal({
   // No hard-coded driver checks — the backend resolves workerId → driver → transport.
   // handleUrlChange aborts any in-flight probe and invalidates its token, so a
   // direct→worker switch never leaves a direct source request in flight.
+  const prevWorkerIdRef = useRef('')
   useEffect(() => {
+    const workerChanged = prevWorkerIdRef.current !== workerId
+    prevWorkerIdRef.current = workerId
     workerIdRef.current = workerId
+    if (workerChanged) {
+      // Invalidate the previous probe result immediately: probe metadata from
+      // Worker A must never be submitted for a Worker B import (the re-probe
+      // below rebuilds it under the NEW route).
+      setProbe({ status: 'idle' })
+      setHlsOptions(null)
+      setDetectedFileName('')
+    }
     if (open && mode === 'url' && url.trim()) {
       handleUrlChange(url)
     }

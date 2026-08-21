@@ -35,9 +35,13 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
 
   async request(input: RemoteFetchRequest): Promise<RemoteFetchResponse> {
     const targetUrl = input.url
-    // Validate URL before relaying (SSRF for initial host)
+    // URL syntax/policy validation before relaying (scheme, credentials,
+    // literal-IP blocklist). The relay edge — Cloudflare Workers fetch — is
+    // the DNS/IP enforcement point for the relayed hostname, so the backend
+    // must NOT resolve the target here (strict-firewall hosts may be
+    // unresolvable from the backend even though the relay can reach them).
     try {
-      await validateRemoteUrl(targetUrl)
+      await validateRemoteUrl(targetUrl, { resolveDns: false })
     } catch (error) {
       throw error
     }
@@ -220,7 +224,9 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
       statusText: data.statusText ?? String(status),
       headers: respHeaders,
       body,
-      finalUrl: targetUrl, // relay follows redirects internally, we treat target as final
+      // The relay follows redirects internally and reports the final URL;
+      // older deployments without `finalUrl` fall back to the requested URL.
+      finalUrl: typeof data.finalUrl === 'string' && data.finalUrl ? data.finalUrl : targetUrl,
       redirectCount: 0,
     } as RemoteFetchResponse & { finalUrl?: string; redirectCount?: number }
   }
