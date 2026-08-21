@@ -224,4 +224,30 @@ describe('WorkersPage', () => {
     expect(screen.getAllByText('relay-c').length).toBeGreaterThan(0)
     expect(screen.getByText('Unhealthy')).toBeInTheDocument()
   })
+
+  it('managed delete offers the explicitly-confirmed local-only fallback (never automatic)', async () => {
+    const forceDelete = vi.spyOn(Workers, 'forceDeleteWorkerLocal').mockResolvedValue({ message: 'Local record deleted.' })
+    render(<WorkersPage />)
+    await waitFor(() => expect(screen.getAllByText('9drive-relay').length).toBeGreaterThan(0))
+    await userEvent.click(screen.getByTitle('Delete worker'))
+    // The local-only fallback is present with an explicit warning.
+    expect(screen.getByText('Delete local record only?')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: /delete local record only/i }))
+    await waitFor(() => expect(forceDelete).toHaveBeenCalledWith('w-a'))
+    await waitFor(() => expect(screen.getByText('Local record deleted.')).toBeInTheDocument())
+  })
+
+  it('a failed provider delete keeps the modal open so the fallback stays reachable', async () => {
+    const del = vi.spyOn(Workers, 'deleteWorker').mockRejectedValue(new Error('WORKER_DEPROVISION_FAILED'))
+    const forceDelete = vi.spyOn(Workers, 'forceDeleteWorkerLocal').mockResolvedValue({ message: 'Local record deleted.' })
+    render(<WorkersPage />)
+    await waitFor(() => expect(screen.getAllByText('9drive-relay').length).toBeGreaterThan(0))
+    await userEvent.click(screen.getByTitle('Delete worker'))
+    await userEvent.click(screen.getByRole('button', { name: /^delete worker$/i }))
+    await waitFor(() => expect(del).toHaveBeenCalledWith('w-a'))
+    // Modal stays open; the error surfaces and the fallback is still clickable.
+    expect(screen.getByText('WORKER_DEPROVISION_FAILED')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: /delete local record only/i }))
+    await waitFor(() => expect(forceDelete).toHaveBeenCalledWith('w-a'))
+  })
 })

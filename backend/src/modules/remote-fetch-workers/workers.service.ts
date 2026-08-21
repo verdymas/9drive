@@ -429,35 +429,129 @@ export async function setDefaultWorker(userId: string, id: string) {
   return updated
 }
 
-export async function deleteWorker(userId: string, id: string) {
+export type DeleteWorkerResult = {
+  /**
+   * deleted        — remote resource removed by the provider call
+   * already_absent — remote resource was already gone (idempotent success)
+   * skipped        — no remote identity stored (dummy/never-provisioned row),
+   *                  so no provider call was made
+   * forced_local   — admin fallback: local record only, remote may remain
+   */
+  result: 'deleted' | 'already_absent' | 'skipped' | 'forced_local'
+}
+
+/** Decrypt the stored managed registration with identity striping — NULL for
+ * dummy/test/decorrupted rows so deletion can skip the provider call instead
+ * of throwing (the old decryptConfig threw and trapped undeletable rows). */
+function tryManagedIdentity(worker: RemoteFetchWorker): { accountId: string; workerName: string; apiToken: string } | null {
+  if (!worker.configEncrypted) return null
+  let parsed: { config?: Record<string, string>; credentials?: { apiToken?: string } }
+  try {
+    parsed = JSON.parse(decryptText(worker.configEncrypted)) as typeof parsed
+  } catch {
+    return null
+  }
+  const accountId = parsed.config?.accountId
+  const workerName = parsed.config?.workerName
+  const apiToken = parsed.credentials?.apiToken ?? ''
+  if (!accountId || !workerName || !apiToken) return null
+  return { accountId, workerName, apiToken }
+}
+
+async function softDeleteWorker(workerId: string) {
+  return prisma.remoteFetchWorker.update({
+    where: { id: workerId },
+    data: { deletedAt: new Date(), isEnabled: false, isDefault: false, status: 'disabled' },
+    select: WORKER_SELECT,
+  }) as unknown as RemoteFetchWorker
+}
+
+/**
+ * Delete a Worker. Idempotent: the remote deployment is removed FIRST, and the
+ * local row is soft-deleted only once the remote resource is confirmed gone or
+ * already absent. Genuine provider failures (auth, 5xx, network) preserve the
+ * local row. Rows without a stored remote identity (dummy/test/provision_failed)
+ * skip the provider call and delete cleanly. The account-level workers.dev
+ * subdomain is shared and is never touched here.
+ */
+export async function deleteWorker(userId: string, id: string): Promise<DeleteWorkerResult> {
   const worker = await findWorker(id)
   const driver = resolveDriver(worker.driver)
   const managed = driver.getMetadata().managed
 
-  // Managed: remove the remote deployment FIRST. If the provider refuses, do
-  // NOT soft-delete — the remote script would be orphaned (spec §22).
-  if (managed) {
-    const { config } = decryptConfig(worker)
-    if (!driver.deprovision) {
-      throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_DEPROVISION_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_DEPROVISION_FAILED, 400)
-    }
-    const correlationId = crypto.randomUUID().slice(0, 8)
-    console.log(`[worker:cloudflare] correlationId=${correlationId} step=deprovision started workerId=${id}`)
-    try {
-      await driver.deprovision({ config, correlationId })
-    } catch {
-      throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_DEPROVISION_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_DEPROVISION_FAILED, 400)
-    }
-    await createAuditLog(userId, 'worker.deprovisioned', 'remote_fetch_worker', worker.id, { name: worker.name, driver: worker.driver, correlationId })
+  if (!managed) {
+    // Manual (self-hosted relay) — no provider deployment to remove.
+    await softDeleteWorker(worker.id)
+    await createAuditLog(userId, 'worker.deleted', 'remote_fetch_worker', worker.id, { name: worker.name, driver: worker.driver })
+    return { result: 'deleted' }
   }
 
-  const updated = await prisma.remoteFetchWorker.update({
-    where: { id },
-    data: { deletedAt: new Date(), isEnabled: false, isDefault: false, status: 'disabled' },
-    select: WORKER_SELECT,
+  const correlationId = crypto.randomUUID().slice(0, 8)
+  const identity = tryManagedIdentity(worker)
+
+  // Dummy / never-provisioned / already-cleaned rows: no remote identity → no
+  // provider call → local delete succeeds (never trap the row).
+  if (!identity) {
+    console.log(`[worker:${worker.driver}] correlationId=${correlationId} step=deprovision workerId=${worker.id} driver=${worker.driver} remoteWorkerName=unknown status=skipped result=not_provisioned`)
+    await softDeleteWorker(worker.id)
+    await createAuditLog(userId, 'worker.deleted', 'remote_fetch_worker', worker.id, {
+      name: worker.name, driver: worker.driver, result: 'skipped', reason: 'missing_remote_identity', correlationId,
+    })
+    return { result: 'skipped' }
+  }
+
+  if (!driver.deprovision) {
+    throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_DEPROVISION_FAILED, `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_DEPROVISION_FAILED} (correlationId=${correlationId})`, 400)
+  }
+
+  console.log(`[worker:${worker.driver}] correlationId=${correlationId} step=deprovision workerId=${worker.id} driver=${worker.driver} remoteWorkerName=${identity.workerName} status=started`)
+  let outcome: 'deleted' | 'already_absent'
+  try {
+    const dep = await driver.deprovision({ config: identity, correlationId })
+    outcome = dep.result
+  } catch (error) {
+    const code = error instanceof AppError ? (error as AppError & { code: string }).code : 'WORKER_DEPROVISION_FAILED'
+    const providerStatus = (error as any)?.providerStatus ?? (error as any)?.status ?? null
+    console.error(`[worker:${worker.driver}] correlationId=${correlationId} step=deprovision workerId=${worker.id} driver=${worker.driver} remoteWorkerName=${identity.workerName} status=failed result=failed code=${code} providerStatus=${providerStatus ?? 'null'}`)
+    await createAuditLog(userId, 'worker.deprovision_failed', 'remote_fetch_worker', worker.id, {
+      name: worker.name, driver: worker.driver, remoteWorkerName: identity.workerName, code, providerStatus, correlationId,
+    })
+    throw new AppError(
+      REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_DEPROVISION_FAILED,
+      `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_DEPROVISION_FAILED} (correlationId=${correlationId})`,
+      400,
+    )
+  }
+
+  console.log(`[worker:${worker.driver}] correlationId=${correlationId} step=deprovision workerId=${worker.id} driver=${worker.driver} remoteWorkerName=${identity.workerName} status=success result=${outcome}`)
+  await softDeleteWorker(worker.id)
+  await createAuditLog(userId, 'worker.deprovisioned', 'remote_fetch_worker', worker.id, { name: worker.name, driver: worker.driver, result: outcome, correlationId })
+  await createAuditLog(userId, 'worker.deleted', 'remote_fetch_worker', worker.id, { name: worker.name, driver: worker.driver, result: outcome, correlationId })
+  return { result: outcome }
+}
+
+/**
+ * Admin fallback: delete the local record WITHOUT touching the provider.
+ * Never automatic — callers must explicitly confirm. The remote resource may
+ * remain at the provider; this is recorded in the audit trail.
+ */
+export async function forceDeleteWorkerLocal(userId: string, id: string): Promise<DeleteWorkerResult> {
+  const worker = await findWorker(id)
+  const driver = resolveDriver(worker.driver)
+  const identity = tryManagedIdentity(worker)
+  const correlationId = crypto.randomUUID().slice(0, 8)
+  console.warn(
+    `[worker:${worker.driver}] correlationId=${correlationId} step=deprovision_forced_local workerId=${worker.id} driver=${worker.driver} remoteWorkerName=${identity?.workerName ?? 'unknown'} status=forced result=forced_local WARNING=remote_provider_resource_may_remain`,
+  )
+  await softDeleteWorker(worker.id)
+  await createAuditLog(userId, 'worker.force_deleted_local', 'remote_fetch_worker', worker.id, {
+    name: worker.name,
+    driver: worker.driver,
+    remoteWorkerName: identity?.workerName ?? null,
+    warning: 'remote provider resource may remain',
+    correlationId,
   })
-  await createAuditLog(userId, 'worker.deleted', 'remote_fetch_worker', worker.id, { name: worker.name })
-  return updated as unknown as RemoteFetchWorker
+  return { result: 'forced_local' }
 }
 
 export type WorkerTestResult = {

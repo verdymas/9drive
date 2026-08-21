@@ -1,6 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AppError } from '../../utils/app-error.js'
-import { createWorker, updateWorker, serializeWorker, setDefaultWorker, disableWorker, deleteWorker, testWorkerConnection, listWorkers, getWorker } from './workers.service.js'
+import { createWorker, updateWorker, serializeWorker, setDefaultWorker, disableWorker, deleteWorker, forceDeleteWorkerLocal, testWorkerConnection, listWorkers, getWorker } from './workers.service.js'
 import { registerDriver } from './driver-registry.js'
 import { cloudflareWorkerDriver } from './drivers/cloudflare.js'
 
@@ -51,7 +51,7 @@ const h = vi.hoisted(() => {
     getMetadata: vi.fn(() => ({ key: 'cloudflare', displayName: 'Cloudflare Worker', managed: false, authTypes: ['hmac'], fields: [] })),
     provision: vi.fn(async () => ({ endpointUrl: 'https://relay.example.workers.dev', protocolVersion: '9drive-relay-v1' })),
     update: vi.fn(async () => ({ endpointUrl: undefined })),
-    deprovision: vi.fn(async () => undefined),
+    deprovision: vi.fn(async () => ({ result: 'deleted' as const })),
   }
   return {
     baseWorker, prismaMock, fakeDriver,
@@ -98,6 +98,8 @@ function resetMocks() {
   ;(h.randomSpy as ReturnType<typeof vi.fn>).mockImplementation(() => 'relay-secret-xyz')
   h.baseWorker.secretEncrypted = 'enc:secret'
   h.baseWorker.configEncrypted = null
+  h.baseWorker.endpointUrl = 'https://relay.example.workers.dev'
+  h.baseWorker.status = 'unknown'
   const tx = h.prismaMock.remoteFetchWorker
   ;(tx.create as ReturnType<typeof vi.fn>).mockImplementation(async ({ data }: { data: any }) => ({ ...h.baseWorker, ...data }))
   ;(tx.update as ReturnType<typeof vi.fn>).mockImplementation(async ({ data }: { data: any }) => ({ ...h.baseWorker, ...data }))
@@ -109,7 +111,7 @@ function resetMocks() {
   ;(h.fakeDriver.testConnection as ReturnType<typeof vi.fn>).mockResolvedValue({ status: 'healthy', protocolVersion: '9drive-relay-v1', capabilities: { streaming: true } })
   ;(h.fakeDriver.provision as ReturnType<typeof vi.fn>).mockResolvedValue({ endpointUrl: 'https://relay.example.workers.dev', protocolVersion: '9drive-relay-v1' })
   ;(h.fakeDriver.update as ReturnType<typeof vi.fn>).mockResolvedValue({ endpointUrl: undefined })
-  ;(h.fakeDriver.deprovision as ReturnType<typeof vi.fn>).mockResolvedValue(undefined)
+  ;(h.fakeDriver.deprovision as ReturnType<typeof vi.fn>).mockResolvedValue({ result: 'deleted' })
 }
 
 describe('serializeWorker', () => {
@@ -360,10 +362,11 @@ describe('setDefaultWorker / disableWorker / deleteWorker invariants', () => {
     })
     h.decryptSpy.mockImplementation((s: string) => s)
     await deleteWorker('user-1', 'worker-1')
-    expect(h.fakeDriver.deprovision).toHaveBeenCalledWith(expect.objectContaining({ config: { accountId: 'acc-1', workerName: 'relay-1' } }))
+    expect(h.fakeDriver.deprovision).toHaveBeenCalledWith(expect.objectContaining({ config: { accountId: 'acc-1', workerName: 'relay-1', apiToken: 'tok' } }))
     const data = h.prismaMock.remoteFetchWorker.update.mock.calls[0][0].data
     expect(data.deletedAt).toBeInstanceOf(Date)
     expect(h.auditSpy).toHaveBeenCalledWith('user-1', 'worker.deprovisioned', 'remote_fetch_worker', 'worker-1', expect.anything())
+    expect(h.auditSpy).toHaveBeenCalledWith('user-1', 'worker.deleted', 'remote_fetch_worker', 'worker-1', expect.objectContaining({ result: 'deleted' }))
   })
 
   it('managed delete with a failing deprovision BLOCKS the soft delete', async () => {
@@ -378,6 +381,133 @@ describe('setDefaultWorker / disableWorker / deleteWorker invariants', () => {
     ;(h.fakeDriver.deprovision as ReturnType<typeof vi.fn>).mockRejectedValue(new AppError('WORKER_PROVISION_FAILED', 'nope', 400))
     await expect(deleteWorker('user-1', 'worker-1')).rejects.toMatchObject({ code: 'WORKER_DEPROVISION_FAILED' })
     expect(h.prismaMock.remoteFetchWorker.update).not.toHaveBeenCalled()
+  })
+
+  it('managed delete with already_absent remote still deletes the local row', async () => {
+    ;(h.fakeDriver.getMetadata as ReturnType<typeof vi.fn>).mockReturnValue({ key: 'cloudflare', displayName: 'Cloudflare Worker', managed: true, authTypes: ['hmac'], fields: [] })
+    h.baseWorker.configEncrypted = JSON.stringify({
+      version: 1,
+      config: { accountId: 'acc-1', workerName: 'relay-1' },
+      credentials: { apiToken: 'tok' },
+    })
+    h.decryptSpy.mockImplementation((s: string) => s)
+    ;(h.fakeDriver.deprovision as ReturnType<typeof vi.fn>).mockResolvedValue({ result: 'already_absent' })
+    const outcome = await deleteWorker('user-1', 'worker-1')
+    expect(outcome.result).toBe('already_absent')
+    const data = h.prismaMock.remoteFetchWorker.update.mock.calls[0][0].data
+    expect(data.deletedAt).toBeInstanceOf(Date)
+    expect(h.auditSpy).toHaveBeenCalledWith('user-1', 'worker.deleted', 'remote_fetch_worker', 'worker-1', expect.objectContaining({ result: 'already_absent' }))
+  })
+
+  it('dummy worker with NO stored identity deletes WITHOUT calling the provider (skipped)', async () => {
+    ;(h.fakeDriver.getMetadata as ReturnType<typeof vi.fn>).mockReturnValue({ key: 'cloudflare', displayName: 'Cloudflare Worker', managed: true, authTypes: ['hmac'], fields: [] })
+    // provision_failed dummy rows carry no configEncrypted
+    h.baseWorker.configEncrypted = null
+    h.baseWorker.endpointUrl = null
+    h.baseWorker.status = 'provision_failed'
+    h.baseWorker.secretEncrypted = 'enc:secret'
+    const outcome = await deleteWorker('user-1', 'worker-1')
+    expect(outcome.result).toBe('skipped')
+    expect(h.fakeDriver.deprovision).not.toHaveBeenCalled()
+    const data = h.prismaMock.remoteFetchWorker.update.mock.calls[0][0].data
+    expect(data.deletedAt).toBeInstanceOf(Date)
+    expect(h.auditSpy).toHaveBeenCalledWith('user-1', 'worker.deleted', 'remote_fetch_worker', 'worker-1', expect.objectContaining({ result: 'skipped', reason: 'missing_remote_identity' }))
+  })
+
+  it('dummy worker with corrupted identity decrypts to skip (never traps the row)', async () => {
+    ;(h.fakeDriver.getMetadata as ReturnType<typeof vi.fn>).mockReturnValue({ key: 'cloudflare', displayName: 'Cloudflare Worker', managed: true, authTypes: ['hmac'], fields: [] })
+    h.baseWorker.configEncrypted = 'garbage-blob'
+    h.decryptSpy.mockImplementation(() => '{not-json')
+    const outcome = await deleteWorker('user-1', 'worker-1')
+    expect(outcome.result).toBe('skipped')
+    expect(h.fakeDriver.deprovision).not.toHaveBeenCalled()
+    expect(h.prismaMock.remoteFetchWorker.update).toHaveBeenCalled()
+  })
+
+  it('dummy worker with partial identity (no apiToken) deletes without a provider call', async () => {
+    ;(h.fakeDriver.getMetadata as ReturnType<typeof vi.fn>).mockReturnValue({ key: 'cloudflare', displayName: 'Cloudflare Worker', managed: true, authTypes: ['hmac'], fields: [] })
+    h.baseWorker.configEncrypted = JSON.stringify({
+      version: 1,
+      config: { accountId: 'acc-1', workerName: 'relay-1' },
+      credentials: {},
+    })
+    h.decryptSpy.mockImplementation((s: string) => s)
+    const outcome = await deleteWorker('user-1', 'worker-1')
+    expect(outcome.result).toBe('skipped')
+    expect(h.fakeDriver.deprovision).not.toHaveBeenCalled()
+  })
+
+  it('401/403/5xx provider failure preserves BOTH the row and the error (no fallback to direct delete)', async () => {
+    ;(h.fakeDriver.getMetadata as ReturnType<typeof vi.fn>).mockReturnValue({ key: 'cloudflare', displayName: 'Cloudflare Worker', managed: true, authTypes: ['hmac'], fields: [] })
+    h.baseWorker.configEncrypted = JSON.stringify({
+      version: 1,
+      config: { accountId: 'acc-1', workerName: 'relay-1' },
+      credentials: { apiToken: 'tok' },
+    })
+    h.decryptSpy.mockImplementation((s: string) => s)
+    for (const error of [
+      new AppError('WORKER_CREDENTIAL_INVALID', 'credential', 400),
+      new AppError('WORKER_PROVISION_FAILED', '502 from provider', 400),
+      new Error('socket hang up'),
+    ]) {
+      ;(h.fakeDriver.deprovision as ReturnType<typeof vi.fn>).mockRejectedValue(error)
+      await expect(deleteWorker('user-1', 'worker-1')).rejects.toMatchObject({ code: 'WORKER_DEPROVISION_FAILED' })
+    }
+    // update() (the soft delete) is never the deprovision path — no row delete happened.
+    expect(h.prismaMock.remoteFetchWorker.update).not.toHaveBeenCalled()
+    expect(h.auditSpy).toHaveBeenCalledWith('user-1', 'worker.deprovision_failed', 'remote_fetch_worker', 'worker-1', expect.objectContaining({ remoteWorkerName: 'relay-1' }))
+  })
+
+  it('force-local delete NEVER calls the provider, soft-deletes the row, and audits the warning', async () => {
+    ;(h.fakeDriver.getMetadata as ReturnType<typeof vi.fn>).mockReturnValue({ key: 'cloudflare', displayName: 'Cloudflare Worker', managed: true, authTypes: ['hmac'], fields: [] })
+    h.baseWorker.configEncrypted = JSON.stringify({
+      version: 1,
+      config: { accountId: 'acc-1', workerName: 'relay-1' },
+      credentials: { apiToken: 'tok' },
+    })
+    h.decryptSpy.mockImplementation((s: string) => s)
+    const outcome = await forceDeleteWorkerLocal('user-1', 'worker-1')
+    expect(outcome.result).toBe('forced_local')
+    expect(h.fakeDriver.deprovision).not.toHaveBeenCalled()
+    const data = h.prismaMock.remoteFetchWorker.update.mock.calls[0][0].data
+    expect(data.deletedAt).toBeInstanceOf(Date)
+    expect(h.auditSpy).toHaveBeenCalledWith('user-1', 'worker.force_deleted_local', 'remote_fetch_worker', 'worker-1', expect.objectContaining({ warning: 'remote provider resource may remain', remoteWorkerName: 'relay-1' }))
+  })
+
+  it('bulk cleanup: one already-missing remote does not break deleting the rest', async () => {
+    ;(h.fakeDriver.getMetadata as ReturnType<typeof vi.fn>).mockReturnValue({ key: 'cloudflare', displayName: 'Cloudflare Worker', managed: true, authTypes: ['hmac'], fields: [] })
+    h.decryptSpy.mockImplementation((s: string) => s)
+    const rows: Record<string, any> = {
+      'healthy-w1': {
+        ...h.baseWorker, id: 'healthy-w1', configEncrypted: JSON.stringify({ version: 1, config: { accountId: 'acc-1', workerName: 'relay-1' }, credentials: { apiToken: 'tok' } }),
+      },
+      'gone-w2': {
+        ...h.baseWorker, id: 'gone-w2', configEncrypted: JSON.stringify({ version: 1, config: { accountId: 'acc-1', workerName: 'relay-2' }, credentials: { apiToken: 'tok' } }),
+      },
+      'dummy-w3': { ...h.baseWorker, id: 'dummy-w3', configEncrypted: null, endpointUrl: null, status: 'provision_failed' },
+    }
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockImplementation(async ({ where }: { where: { id: string } }) => rows[where.id] ?? null)
+    // update() must mutate the row so a second deleteWorker for the same id 404s
+    ;(h.prismaMock.remoteFetchWorker.update as ReturnType<typeof vi.fn>).mockImplementation(async ({ where, data }: { where: { id: string }; data: any }) => {
+      const row = rows[where.id]
+      if (!row || row.deletedAt) throw new AppError('WORKER_NOT_FOUND', 'gone', 404)
+      Object.assign(row, data)
+      return row
+    })
+    ;(h.fakeDriver.deprovision as ReturnType<typeof vi.fn>).mockImplementation(async ({ config }: { config: { workerName: string } }) => {
+      if (config.workerName === 'relay-2') return { result: 'already_absent' as const }
+      return { result: 'deleted' as const }
+    })
+    const outcomes = []
+    for (const id of ['healthy-w1', 'gone-w2', 'dummy-w3']) {
+      outcomes.push(await deleteWorker('user-1', id))
+    }
+    expect(outcomes.map((o) => o.result)).toEqual(['deleted', 'already_absent', 'skipped'])
+    for (const id of ['healthy-w1', 'gone-w2', 'dummy-w3']) {
+      expect(rows[id].deletedAt).toBeInstanceOf(Date)
+    }
+    // No cross-contamination: the dummy row never attempted a provider call.
+    expect(h.fakeDriver.deprovision).toHaveBeenCalledTimes(2)
   })
 
   it('setting default unsets the previous default in one transaction', async () => {

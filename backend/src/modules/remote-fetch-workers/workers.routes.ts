@@ -7,6 +7,7 @@ import {
   deleteWorker,
   disableWorker,
   enableWorker,
+  forceDeleteWorkerLocal,
   getWorker,
   listWorkers,
   serializeWorker,
@@ -133,6 +134,30 @@ remoteFetchWorkerRouter.delete('/:id', requireAuth, async (req: AuthRequest, res
     await deleteWorker(req.user!.id, String(req.params.id))
     return res.status(204).end()
   } catch (error) {
+    if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
+    return next(error)
+  }
+})
+
+/**
+ * Admin fallback — delete the LOCAL record only, never the provider resource.
+ * Explicitly confirmed (`confirm: true`) and audited as
+ * `worker.force_deleted_local`; the response warns the remote relay may remain.
+ * Never reached automatically: the normal DELETE flow fails with
+ * WORKER_DEPROVISION_FAILED instead of falling back here.
+ */
+remoteFetchWorkerRouter.post('/:id/force-delete', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const body = z.object({ confirm: z.literal(true) }).parse(req.body ?? {})
+    await forceDeleteWorkerLocal(req.user!.id, String(req.params.id))
+    return res.json({
+      message: 'Local record deleted. The remote provider resource may still exist — delete it at the provider if needed.',
+      confirm: body.confirm,
+    })
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ code: 'INVALID_REQUEST', message: 'Explicit confirmation is required to delete the local record only.' })
+    }
     if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
     return next(error)
   }

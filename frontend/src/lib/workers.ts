@@ -103,6 +103,17 @@ export async function deleteWorker(id: string): Promise<void> {
   await apiFetch<void>(`/workers/${id}`, { method: 'DELETE' })
 }
 
+/**
+ * Admin fallback — explicitly confirmed, audited server-side. Removes the
+ * local record ONLY; the remote relay may remain at the provider.
+ */
+export async function forceDeleteWorkerLocal(id: string): Promise<{ message: string }> {
+  return apiFetch<{ message: string }>(`/workers/${id}/force-delete`, {
+    method: 'POST',
+    body: JSON.stringify({ confirm: true }),
+  })
+}
+
 export async function testWorker(id: string): Promise<WorkerTestResult> {
   const data = await apiFetch<{ result: WorkerTestResult }>(`/workers/${id}/test`, { method: 'POST' })
   return data.result

@@ -391,17 +391,97 @@ describe('cloudflare managed provisioning', () => {
     ).rejects.toMatchObject({ code: 'WORKER_PROVISION_CONFLICT' })
   })
 
-  it('deprovision treats 404 as success (idempotent)', async () => {
-    const { fetchMock } = setupFetch()
-    await cloudflareWorkerDriver.deprovision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } })
-    expect(fetchMock).toHaveBeenCalledWith(`${CF_BASE}/accounts/acc-1/workers/scripts/relay-1`, expect.objectContaining({ method: 'DELETE' }))
+  it('deprovision treats 404 as already_absent (idempotent)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => cfResponse(404, { success: false, errors: [{ code: 10058, message: 'script not found' }] })))
+    const result = await cloudflareWorkerDriver.deprovision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } })
+    expect(result).toEqual({ result: 'already_absent' })
   })
 
-  it('deprovision on 500 throws WORKER_DEPROVISION_FAILED', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => cfResponse(500, { errors: [{ message: 'boom' }] })))
+  it('deprovision 200 and 204 → deleted', async () => {
+    for (const status of [200, 204]) {
+      vi.stubGlobal('fetch', vi.fn(async () => cfResponse(status, { success: true })))
+      await expect(
+        cloudflareWorkerDriver.deprovision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } }),
+      ).resolves.toEqual({ result: 'deleted' })
+      // Imports reloaded between loop iterations would re-stub; the driver is stateless.
+    }
+  })
+
+  it('deprovision detects script-not-found envelope beyond HTTP 404 (cfCode 10058 on 400)', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => cfResponse(400, { success: false, errors: [{ code: 10058, message: 'script not found' }] })))
+    const result = await cloudflareWorkerDriver.deprovision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } })
+    expect(result).toEqual({ result: 'already_absent' })
+  })
+
+  it('deprovision detects script-not-found envelope by message phrase when the code is absent', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => cfResponse(400, { success: false, errors: [{ message: 'Script not found.' }] })))
+    const result = await cloudflareWorkerDriver.deprovision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } })
+    expect(result).toEqual({ result: 'already_absent' })
+  })
+
+  it('deprovision on 401 throws and does NOT retry with force', async () => {
+    const fetchMock = vi.fn(async () => cfResponse(401, { success: false, errors: [{ code: 10000, message: 'bad token' }] }))
+    vi.stubGlobal('fetch', fetchMock)
     await expect(
       cloudflareWorkerDriver.deprovision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } }),
-    ).rejects.toMatchObject({ code: 'WORKER_PROVISION_FAILED' })
+    ).rejects.toMatchObject({ code: 'WORKER_CREDENTIAL_INVALID' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const url = (fetchMock.mock.calls[0][0] as string)
+    expect(url).not.toContain('force=true')
+  })
+
+  it('deprovision on 403 throws and does NOT retry with force', async () => {
+    const fetchMock = vi.fn(async () => cfResponse(403, { success: false, errors: [{ code: 10000, message: 'forbidden' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(
+      cloudflareWorkerDriver.deprovision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } }),
+    ).rejects.toMatchObject({ code: 'WORKER_CREDENTIAL_INVALID' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('deprovision on 500 throws and does NOT retry with force', async () => {
+    const fetchMock = vi.fn(async () => cfResponse(500, { success: false, errors: [{ message: 'boom' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(
+      cloudflareWorkerDriver.deprovision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } }),
+    ).rejects.toMatchObject({ code: 'WORKER_DEPROVISION_FAILED' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('deprovision retries ONCE with force=true when deletion is dependency-blocked, then succeeds', async () => {
+    const urls: string[] = []
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      urls.push(url)
+      if (!url.includes('force=true')) {
+        return cfResponse(409, { success: false, errors: [{ code: 10056, message: 'Could not delete the Worker as it has active routes. Please remove the routes first or retry with force=true.' }] })
+      }
+      return cfResponse(204, { success: true })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await cloudflareWorkerDriver.deprovision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } })
+    expect(result).toEqual({ result: 'deleted' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(urls[0]).not.toContain('force=true')
+    expect(urls[1]).toContain('force=true')
+  })
+
+  it('deprovision keeps the provider error when the force retry also fails', async () => {
+    const fetchMock = vi.fn(async () => cfResponse(409, { success: false, errors: [{ code: 10056, message: 'cannot delete the script: dependency present' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(
+      cloudflareWorkerDriver.deprovision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } }),
+    ).rejects.toMatchObject({ code: 'WORKER_DEPROVISION_FAILED' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('deprovision does NOT force-retry a non-dependency error', async () => {
+    const fetchMock = vi.fn(async () => cfResponse(422, { success: false, errors: [{ code: 10055, message: 'something unrelated' }] }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(
+      cloudflareWorkerDriver.deprovision!({ config: { accountId: 'acc-1', apiToken: 'tok', workerName: 'relay-1' } }),
+    ).rejects.toMatchObject({ code: 'WORKER_DEPROVISION_FAILED' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   it('update with a renamed worker deploys the new script and removes the old one', async () => {

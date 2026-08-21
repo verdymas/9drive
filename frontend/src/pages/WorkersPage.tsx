@@ -24,6 +24,7 @@ import {
   deleteWorker,
   disableWorker,
   enableWorker,
+  forceDeleteWorkerLocal,
   listWorkerDrivers,
   listWorkers,
   setDefaultWorker,
@@ -224,7 +225,26 @@ export function WorkersPage() {
       setDeleteWorkerRow(null)
       await load()
     } catch (error) {
+      // Keep the modal open so the admin can choose the local-only fallback
+      // after a genuine provider failure.
       setMessage(error instanceof Error ? error.message : 'Failed to delete worker.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** Admin fallback — local record only; the remote relay may remain. */
+  async function confirmForceDeleteLocal() {
+    if (!deleteWorkerRow) return
+    setBusy(true)
+    setMessage('')
+    try {
+      const result = await forceDeleteWorkerLocal(deleteWorkerRow.id)
+      setMessage(result.message ?? `"${deleteWorkerRow.name}" deleted locally.`)
+      setDeleteWorkerRow(null)
+      await load()
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Failed to delete worker locally.')
     } finally {
       setBusy(false)
     }
@@ -555,8 +575,27 @@ export function WorkersPage() {
       </DummyModal>
 
       {/* Delete confirm */}
-      <DummyModal open={Boolean(deleteWorkerRow)} title="Delete worker?" description={driverManaged(deleteWorkerRow?.driver ?? '') ? 'This also removes the deployed relay at the provider.' : 'The worker is removed from the registry. Historical Remote Imports keep their record of it.'} onClose={() => setDeleteWorkerRow(null)}>
+      <DummyModal open={Boolean(deleteWorkerRow)} title="Delete worker?" description={driverManaged(deleteWorkerRow?.driver ?? '') ? 'This also removes the deployed relay at the provider (already-absent relays delete cleanly).' : 'The worker is removed from the registry. Historical Remote Imports keep their record of it.'} onClose={() => setDeleteWorkerRow(null)}>
         <p className="text-sm text-slate-600">Are you sure you want to delete <b>{deleteWorkerRow?.name}</b>?</p>
+        {driverManaged(deleteWorkerRow?.driver ?? '') ? (
+          <div className="mt-4 rounded-xl border border-red-200 bg-red-50 p-3">
+            <p className="text-xs font-bold text-red-700">Delete local record only?</p>
+            <p className="mt-1 text-xs text-red-600">
+              Only removes the record from 9Drive — the remote relay may still exist at the provider. Use this only when the provider
+              refuses to remove the relay (for example, a stale or dummy worker). The action is audited.
+            </p>
+            <Button
+              variant="outline"
+              type="button"
+              size="sm"
+              className="mt-2 border-red-200 text-red-700 hover:bg-red-100"
+              onClick={confirmForceDeleteLocal}
+              disabled={busy}
+            >
+              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}Delete local record only
+            </Button>
+          </div>
+        ) : null}
         <div className="mt-5 flex justify-end gap-2">
           <Button variant="outline" type="button" onClick={() => setDeleteWorkerRow(null)} disabled={busy}>Cancel</Button>
           <Button variant="danger" type="button" onClick={confirmDelete} disabled={busy}>

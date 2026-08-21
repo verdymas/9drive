@@ -195,10 +195,39 @@ Worker.
 
 ### Deleting a managed worker
 
-`driver.deprovision()` removes the remote script FIRST; if that fails, the
-delete is blocked with `WORKER_DEPROVISION_FAILED` (retry) — 9Drive never
-pretends the remote resource was removed. Success → existing soft delete;
-historical Remote Imports keep their `workerId` + `workerNameSnapshot`.
+`driver.deprovision()` removes the remote script FIRST (idempotent), then the
+local row is soft-deleted only when the remote resource is removed or already
+gone:
+
+- **200/204** → `result=deleted`, local row deleted.
+- **404 / provider "script not found" envelope** (HTTP status varies) →
+  `result=already_absent` — treated as success, local row deleted. Already-
+  absent relays never block cleanup.
+- **Dummy / never-provisioned rows** (`provision_failed`, missing or
+  unreadable stored identity, no `apiToken`) → no provider call at all
+  (`result=skipped`), local row deleted.
+- **401/403 / 5xx / network failure** → provider could not confirm removal, so
+  `WORKER_DEPROVISION_FAILED` is returned and the local row is **preserved**
+  (retry or use the admin fallback below).
+- **Dependency-blocked delete** (Cloudflare refuses because routes/subdomain
+  are attached) → ONE retry with the provider-supported `?force=true`, only
+  for that error class; never force otherwise.
+
+Only the script is deleted — the **account-level workers.dev subdomain is
+shared across the account and is never touched** by deprovision.
+
+### Admin fallback: delete local record only
+
+When a genuine provider failure blocks deletion, an admin can remove the local
+record **without** touching the provider via `POST /workers/:id/force-delete`
+with `{ "confirm": true }`. This is:
+
+- **never automatic** — a separate, explicitly confirmed endpoint; the normal
+  DELETE never falls back to it,
+- **audited** as `worker.force_deleted_local` with a
+  `remote provider resource may remain` warning + correlation id,
+- warned to the user in the response (the remote relay may still exist at the
+  provider and must be cleaned up there if needed).
 
 ## Multi-worker behavior
 
@@ -270,7 +299,8 @@ GET    /workers                  list (non-deleted)
 POST   /workers                  create (201)
 GET    /workers/:id              detail
 PATCH  /workers/:id              update (blank secret = keep)
-DELETE /workers/:id              soft delete (204)
+DELETE /workers/:id              soft delete (204) — idempotent deprovision
+POST   /workers/:id/force-delete admin local-only fallback ({ "confirm": true })
 POST   /workers/:id/test         test connection (backend → endpoint)
 POST   /workers/:id/enable
 POST   /workers/:id/disable      clears default

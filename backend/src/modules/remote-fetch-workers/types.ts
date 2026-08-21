@@ -132,6 +132,16 @@ export type WorkerDeprovisionInput = {
   correlationId?: string
 }
 
+/** Outcome of deprovisioning the remote deployment (idempotent). */
+export type WorkerDeprovisionResult = {
+  /**
+   * deleted        — the remote resource was removed by this call
+   * already_absent — the remote resource was already gone (HTTP 404 or a
+   *                  provider "script not found" envelope) — success
+   */
+  result: 'deleted' | 'already_absent'
+}
+
 /** A worker driver implementation (spec §7). */
 export interface RemoteFetchWorkerDriver {
   key: string
@@ -169,7 +179,7 @@ export interface RemoteFetchWorkerDriver {
   update?(input: WorkerUpdateInput): Promise<WorkerUpdateResult>
 
   /** Remove the remote relay deployment (managed drivers). Idempotent. */
-  deprovision?(input: WorkerDeprovisionInput): Promise<void>
+  deprovision?(input: WorkerDeprovisionInput): Promise<WorkerDeprovisionResult>
 
   /**
    * Create the byte transport for this driver. Not implemented this phase —

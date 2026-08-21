@@ -6,6 +6,7 @@ import type {
   RemoteFetchWorkerDriver,
   RemoteFetchWorkerAuthType,
   WorkerDeprovisionInput,
+  WorkerDeprovisionResult,
   WorkerHealthProbe,
   WorkerProvisionInput,
   WorkerProvisionResult,
@@ -339,6 +340,37 @@ function safeCfReason(bodyText: string): string | null {
   return CF_KNOWN_ERRORS[code] ?? null
 }
 
+/**
+ * True when Cloudflare says the script is already gone — either an HTTP 404 or
+ * an error envelope whose code/message identifies "script not found" even on a
+ * different HTTP status. Deletion treats this as success (idempotent).
+ * Cloudflare has reported this as 10058 (stable) and 10090 (older API family);
+ * the message-phrase check is a fallback for unnumbered envelopes.
+ */
+export function isScriptNotFoundEnvelope(status: number, bodyText: string): boolean {
+  if (status === 404) return true
+  const code = parseCfErrorCode(bodyText)
+  if (code === 10058 || code === 10090) return true
+  const msg = parseCfErrorMessage(bodyText)
+  return Boolean(msg && /script[_ ]?not[_ ]?found/i.test(msg))
+}
+
+/**
+ * True when a normal DELETE is refused because the script has active
+ * dependencies (routes / workers.dev subdomain / instances). Cloudflare's
+ * documented remedy is DELETE with `?force=true` — applied ONLY for this class
+ * of error, never unconditionally.
+ */
+export function isDeleteBlockedByDependencies(status: number, bodyText: string): boolean {
+  if (status !== 400 && status !== 409 && status !== 422) return false
+  const code = parseCfErrorCode(bodyText)
+  if (code === 10056) return true
+  const msg = parseCfErrorMessage(bodyText)
+  return Boolean(
+    msg && /cannot delete|cannot be deleted|instances_detected|dependency|has a subdomain|has .*rout(?:e|es)/i.test(msg),
+  )
+}
+
 /** A Cloudflare API failure with enough non-sensitive detail to act on. */
 export class CloudflareApiError extends WorkerProvisionError {
   /** Short safe description for diagnosis (e.g. "script content invalid").
@@ -366,6 +398,21 @@ export class CloudflareApiError extends WorkerProvisionError {
  * safe: surfaced as `Cloudflare error <n>` (e.g. 10053 = script already exists).
  */
 export function mapCloudflareApiError(step: string, status: number, bodyText: string, correlationId = 'unknown'): AppError {
+  // Deprovision (delete) failures are a distinct class: the local row must be
+  // preserved and the user is told the relay could not be removed — never
+  // "already exists" even when Cloudflare reports the same HTTP codes.
+  if (step === 'deprovision' && status !== 401 && status !== 403) {
+    return new WorkerProvisionError({
+      driver: 'cloudflare',
+      step,
+      providerStatus: status,
+      providerCode: parseCfErrorCode(bodyText),
+      providerMessage: safeCfReason(bodyText),
+      correlationId,
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_DEPROVISION_FAILED,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_DEPROVISION_FAILED} (step: deprovision)${status === 409 || status === 400 ? ' — the script may be in use (routes/subdomain). A provider-supported force delete was already attempted or is not applicable.' : ''} correlationId=${correlationId}`,
+    })
+  }
   if (status === 401 || status === 403) {
     return new WorkerProvisionError({
       driver: 'cloudflare',
@@ -1016,19 +1063,53 @@ export async function discoverEndpoint(accountId: string, workerName: string, ap
   }
 }
 
-/** Remove the remote script. 404 = already gone = success (idempotent). */
-async function deleteWorkerScript(accountId: string, workerName: string, apiToken: string, correlationId?: string) {
+/**
+ * Remove the remote script. Idempotent:
+ * - 2xx → result `deleted`
+ * - HTTP 404 / provider "script not found" envelope → result `already_absent` (success)
+ * - dependency-blocking error (routes/subdomain attached) → ONE retry with
+ *   `?force=true` (the provider-supported remedy; never force otherwise)
+ * - anything else → throws mapCloudflareApiError (genuine failure, caller must
+ *   preserve the local row)
+ * Only the script is deleted — the account-level workers.dev subdomain is
+ * shared across the account and is NEVER touched by deprovision.
+ */
+async function deleteWorkerScript(
+  accountId: string,
+  workerName: string,
+  apiToken: string,
+  correlationId?: string,
+  opts?: { force?: boolean },
+): Promise<WorkerDeprovisionResult['result']> {
   const cid = correlationId ?? 'unknown'
-  logStepStarted(cid, 'cleanup')
-  const { status, bodyText } = await cloudflareApi(
-    `/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}`,
-    { method: 'DELETE', apiToken, correlationId: cid, step: 'cleanup' },
-  )
-  if (status !== 404 && status >= 300) {
-    logStepFailure(cid, 'cleanup', `status=${status}`)
-    throw mapCloudflareApiError('cleanup', status, bodyText, cid)
+  const suffix = opts?.force ? '?force=true' : ''
+  const path = `/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}${suffix}`
+  logStepStarted(cid, 'deprovision', `worker=${workerName}${opts?.force ? ' force=true' : ''}`)
+  const { status, bodyText } = await cloudflareApi(path, {
+    method: 'DELETE',
+    apiToken,
+    correlationId: cid,
+    step: 'deprovision',
+  })
+
+  // Already absent (HTTP 404 or provider envelope) → success, idempotent.
+  if (isScriptNotFoundEnvelope(status, bodyText)) {
+    logStepSuccess(cid, 'deprovision', `result=already_absent status=${status}`)
+    return 'already_absent'
   }
-  logStepSuccess(cid, 'cleanup')
+  if (status >= 200 && status < 300) {
+    logStepSuccess(cid, 'deprovision', `result=deleted status=${status}`)
+    return 'deleted'
+  }
+
+  // Dependency-blocked normal delete → one provider-supported force retry.
+  if (!opts?.force && isDeleteBlockedByDependencies(status, bodyText)) {
+    logStepFailure(cid, 'deprovision', `dependency_blocked status=${status} retry_force=true`)
+    return deleteWorkerScript(accountId, workerName, apiToken, cid, { force: true })
+  }
+
+  logStepFailure(cid, 'deprovision', `status=${status}`)
+  throw mapCloudflareApiError('deprovision', status, bodyText, cid)
 }
 
 function configBlob(config: { accountId: string; workerName: string }, apiToken: string, endpointUrl: string | null | undefined): unknown {
@@ -1261,10 +1342,11 @@ async function update(input: WorkerUpdateInput): Promise<WorkerUpdateResult> {
 }
 
 /** Remove the remote script. Idempotent (404 = already gone). */
-async function deprovision(input: WorkerDeprovisionInput): Promise<void> {
+async function deprovision(input: WorkerDeprovisionInput): Promise<WorkerDeprovisionResult> {
   const { accountId, apiToken, workerName } = parseConfig(input.config)
   const correlationId = input.correlationId ?? generateCorrelationId()
-  await deleteWorkerScript(accountId, workerName, apiToken, correlationId)
+  const result = await deleteWorkerScript(accountId, workerName, apiToken, correlationId)
+  return { result }
 }
 
 /** Test connection: GET {endpoint}/health with an HMAC signature. */
