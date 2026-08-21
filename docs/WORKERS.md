@@ -285,6 +285,60 @@ map to `WORKER_CREDENTIAL_INVALID`, `WORKER_PROVISION_FAILED`,
 `WORKER_PROVISION_CONFLICT` (a script with that name already exists — rename),
 `WORKER_DEPROVISION_FAILED`.
 
+## Relay integration test (no Playwright)
+
+A development-only end-to-end harness provisions a REAL temporary 9Drive relay
+Worker through the production Cloudflare driver, then exercises the REAL stack
+against it: `CloudflareRemoteFetchTransport` (serializer + HMAC) → deployed
+`worker.mjs` → the test URL, plus the Remote Import application probe path
+(`probeRemoteUrl(workerId)` → resolver → transport) and HLS master/variant/
+segment fetches through the same Worker. It also fails the run if any
+`route=direct` request appears while a Worker is selected.
+
+Credentials are read from the environment ONLY (never committed, never printed):
+
+- `TEST_CLOUDFLARE_ACCOUNT_ID` (required)
+- `TEST_CLOUDFLARE_API_TOKEN` (required; never printed, never in any file)
+- `TEST_CLOUDFLARE_WORKER_NAME` (optional; a unique `9drive-relay-test-*` name
+  is generated when absent — the harness deletes exactly that Worker on exit)
+- `TEST_REMOTE_IMPORT_URL` (optional; defaults to the JWPlatform HLS sample)
+
+Run inside the backend container (the image bakes `src`/`scripts`, so rebuild
+first: `docker compose build backend`):
+
+```bash
+docker compose exec -T \
+  -e TEST_CLOUDFLARE_ACCOUNT_ID="<account-id>" \
+  -e TEST_CLOUDFLARE_API_TOKEN="<api-token>" \
+  -e TEST_REMOTE_IMPORT_URL="http://content.jwplatform.com/manifests/vM7nH0Kl.m3u8" \
+  backend npm run test:cloudflare-relay
+```
+
+Host fallback (backend deps installed): `cd backend && TEST_CLOUDFLARE_ACCOUNT_ID=... TEST_CLOUDFLARE_API_TOKEN=... npx tsx scripts/test-cloudflare-relay.ts`.
+
+Expected output (all PASS):
+
+```
+Cloudflare Relay Integration Test
+validate credentials ........ PASS
+provision worker ............ PASS
+health check ................ PASS
+relay HEAD .................. PASS
+relay GET ................... PASS
+relay Range GET ............. PASS
+Remote Import probe ......... PASS
+HLS master .................. PASS
+HLS variant ................. PASS
+direct-route leak ........... PASS
+cleanup ..................... PASS
+```
+
+A relay `400` carries the worker's safe reason code
+(e.g. `reason=INVALID_PROTOCOL`) plus a redeploy hint — see
+`transports/cloudflare-transport.ts`. The serializer → worker parser contract
+is guarded by `drivers/cloudflare-relay/worker-contract.test.ts` (executes the
+actual `worker.mjs` artifact with the actual serializer).
+
 ## Environment
 
 - `WORKER_TEST_TIMEOUT_SECONDS` (default 10) — health-check timeout.

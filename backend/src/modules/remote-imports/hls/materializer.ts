@@ -117,9 +117,14 @@ export async function downloadResource(
     signal?: AbortSignal
     kind?: 'segment' | 'map' | 'key' | 'playlist' | 'audio'
     requestContext?: RemoteImportRequestContext
+    fetcher?: import('../secure-fetcher.js').SecureRemoteFetcher | null
   },
 ): Promise<bigint> {
   const maxBytes = opts.maxBytes ?? BigInt(env.REMOTE_IMPORT_MAX_BYTES)
+  if (opts.fetcher) {
+    // Use generic fetcher (Direct or relay) — never raw followRemoteUrl when a fetcher is available
+    return opts.fetcher.downloadToFile(url, targetLocalPath, { maxBytes, signal: opts.signal, requestContext: opts.requestContext, sourceUrl: url, kind: opts.kind })
+  }
   let written = 0n
   await followRemoteUrl(url, {
     getHopHeaders: hopHeaderResolver(url, opts.requestContext),
@@ -167,9 +172,38 @@ export async function downloadByteRange(
   offset: number,
   length: number,
   targetLocalPath: string,
-  opts: { signal?: AbortSignal; requestContext?: RemoteImportRequestContext },
+  opts: { signal?: AbortSignal; requestContext?: RemoteImportRequestContext; fetcher?: import('../secure-fetcher.js').SecureRemoteFetcher | null },
 ): Promise<bigint> {
   const rangeHeader = `bytes=${offset}-${offset + length - 1}`
+  if (opts.fetcher) {
+    const res = await opts.fetcher.fetch({ method: 'GET', url, headers: { Range: rangeHeader }, range: rangeHeader, requestContext: opts.requestContext as any } as any)
+    if (res.status !== 206) {
+      throw new AppError(HLS_ERROR_CODES.HLS_SEGMENT_RANGE_INVALID, HLS_ERROR_MESSAGES.HLS_SEGMENT_RANGE_INVALID, 502)
+    }
+    const cr = res.headers['content-range']
+    if (!cr || !new RegExp(`^bytes ${offset}-${offset + length - 1}/`).test(cr)) {
+      throw new AppError(HLS_ERROR_CODES.HLS_SEGMENT_RANGE_INVALID, HLS_ERROR_MESSAGES.HLS_SEGMENT_RANGE_INVALID, 502)
+    }
+    let written = 0n
+    const fsp = await import('node:fs/promises')
+    const handle = await fsp.open(targetLocalPath, 'w')
+    try {
+      const iterable = typeof res.body === 'string' ? (async function* () { yield Buffer.from(res.body as string) })() : (res.body as AsyncIterable<Uint8Array>)
+      for await (const chunk of iterable) {
+        if (opts.signal?.aborted) throw new Error('ABORTED')
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
+        written += BigInt(buf.byteLength)
+        if (written > BigInt(length)) throw new AppError(HLS_ERROR_CODES.HLS_SEGMENT_RANGE_INVALID, HLS_ERROR_MESSAGES.HLS_SEGMENT_RANGE_INVALID, 502)
+        await handle.write(buf)
+      }
+    } finally {
+      await handle.close()
+    }
+    if (written !== BigInt(length)) {
+      throw new AppError(HLS_ERROR_CODES.HLS_SEGMENT_RANGE_INVALID, HLS_ERROR_MESSAGES.HLS_SEGMENT_RANGE_INVALID, 502)
+    }
+    return written
+  }
   let written = 0n
   let saw206 = false
   await followRemoteUrl(url, {

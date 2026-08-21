@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import { prisma } from '../../config/prisma.js'
 import { AppError } from '../../utils/app-error.js'
 import { createAuditLog } from '../../utils/audit.js'
@@ -6,6 +7,9 @@ import { resolveDriver } from './driver-registry.js'
 import { REMOTE_FETCH_WORKER_ERROR_CODES, REMOTE_FETCH_WORKER_ERROR_MESSAGES } from './errors.js'
 import type { RemoteFetchWorkerAuthType } from './types.js'
 import type { RemoteFetchWorker, Prisma } from '@prisma/client'
+
+// Re-export for routes that need to map errors
+export { AppError }
 
 /**
  * Safe wire shape: never the encrypted blobs, never a decrypted SECRET value.
@@ -158,15 +162,20 @@ export async function createWorker(userId: string, input: CreateWorkerInput) {
 
   // Managed registration: validate credentials → generate relay secret →
   // encrypt → persist provisioning → provision → health test → healthy.
+  const correlationId = crypto.randomUUID().slice(0, 8)
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=validate_credentials started`)
   const validated = await driver.validateConfig({
     endpointUrl: null,
     config: input.config ?? null,
+    correlationId,
   })
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=validate_credentials success`)
   const relaySecret = randomToken(32)
   const isDefault = input.isDefault ?? false
   const workerName = input.config?.workerName ?? 'Worker'
   const name = input.name?.trim() || workerName
 
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=persist_worker started`)
   const created = await prisma.$transaction(async (tx) => {
     if (isDefault) {
       await tx.remoteFetchWorker.updateMany({ where: { isDefault: true, deletedAt: null }, data: { isDefault: false } })
@@ -192,21 +201,27 @@ export async function createWorker(userId: string, input: CreateWorkerInput) {
       select: WORKER_SELECT,
     })
   })
-  await createAuditLog(userId, 'worker.provisioning_started', 'remote_fetch_worker', created.id, { name: created.name, driver: created.driver })
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=persist_worker success workerId=${created.id}`)
+  await createAuditLog(userId, 'worker.provisioning_started', 'remote_fetch_worker', created.id, { name: created.name, driver: created.driver, correlationId })
 
   try {
     if (!driver.provision) {
       throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROVISION_FAILED, 400)
     }
-    const result = await driver.provision({
+    // Pass correlationId through to driver for end-to-end tracing.
+    const result = await (driver.provision as (inp: any) => Promise<any>)({
       config: input.config ?? {},
       secret: relaySecret,
+      correlationId,
     })
+    console.log(`[worker:cloudflare] correlationId=${correlationId} step=health_check started endpoint=${result.endpointUrl}`)
     const probe = await driver.testConnection({
       endpointUrl: result.endpointUrl,
       authType: 'hmac',
       secret: relaySecret,
+      correlationId,
     })
+    console.log(`[worker:cloudflare] correlationId=${correlationId} step=health_check success protocol=${probe.protocolVersion ?? 'unknown'}`)
     const healthy = await prisma.remoteFetchWorker.update({
       where: { id: created.id },
       data: {
@@ -217,17 +232,25 @@ export async function createWorker(userId: string, input: CreateWorkerInput) {
         lastFailedAt: null,
         lastErrorCode: null,
         capabilitiesJson: probe.capabilities as Prisma.InputJsonValue,
-        metadataJson: { provider: driver.displayName, protocolVersion: probe.protocolVersion ?? result.protocolVersion ?? null } as Prisma.InputJsonValue,
+        metadataJson: { provider: driver.displayName, protocolVersion: probe.protocolVersion ?? result.protocolVersion ?? null, correlationId } as Prisma.InputJsonValue,
         configEncrypted: result.configEncryptedInput
           ? encryptText(JSON.stringify(result.configEncryptedInput))
           : undefined,
       },
       select: WORKER_SELECT,
     })
-    await createAuditLog(userId, 'worker.provisioned', 'remote_fetch_worker', created.id, { name: healthy.name, driver: healthy.driver })
+    await createAuditLog(userId, 'worker.provisioned', 'remote_fetch_worker', created.id, { name: healthy.name, driver: healthy.driver, correlationId })
+    console.log(`[worker:cloudflare] correlationId=${correlationId} provision success workerId=${created.id} endpoint=${result.endpointUrl}`)
     return healthy as unknown as RemoteFetchWorker
   } catch (error) {
-    const code = error instanceof AppError ? error.code : REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_FAILED
+    const code = error instanceof AppError ? (error as any).code : REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_FAILED
+    // Preserve correlationId and provider diagnostics in logs even though public response is generic.
+    const provErr: any = error
+    const step = provErr?.step ?? 'provision'
+    const providerStatus = provErr?.providerStatus ?? provErr?.httpStatus ?? null
+    const providerCode = provErr?.providerCode ?? provErr?.cfCode ?? null
+    const providerMessage = provErr?.providerMessage ?? provErr?.reason ?? null
+    console.error(`[worker:cloudflare] correlationId=${correlationId} provision failed step=${step} httpStatus=${providerStatus ?? 'null'} providerCode=${providerCode ?? 'null'} providerMessage="${providerMessage ?? String((error as Error)?.message ?? '')}" correlationId=${correlationId}`)
     await prisma.remoteFetchWorker.update({
       where: { id: created.id },
       data: { status: 'provision_failed', lastFailedAt: new Date(), lastErrorCode: code },
@@ -236,16 +259,33 @@ export async function createWorker(userId: string, input: CreateWorkerInput) {
     // Best-effort cleanup — the remote script may be partially deployed. Never
     // let cleanup failure mask the original provisioning error.
     try {
+      console.log(`[worker:cloudflare] correlationId=${correlationId} step=cleanup started`)
       if (driver.deprovision && input.config) {
-        await driver.deprovision({ config: input.config })
+        await driver.deprovision({ config: input.config, correlationId })
       }
-    } catch {
+      console.log(`[worker:cloudflare] correlationId=${correlationId} step=cleanup success`)
+    } catch (cleanupErr) {
+      console.error(`[worker:cloudflare] correlationId=${correlationId} step=cleanup failure ${String((cleanupErr as Error)?.message ?? cleanupErr)}`)
       // Swallow: the row already records provision_failed for retry/cleanup.
     }
     await createAuditLog(userId, 'worker.provision_failed', 'remote_fetch_worker', created.id, {
-      name: created.name, driver: created.driver, code,
+      name: created.name, driver: created.driver, code, correlationId, step,
     })
-    throw error
+    // Enrich public error with correlationId but keep original code/message.
+    if (error instanceof AppError) {
+      const enriched: any = error
+      enriched.correlationId = correlationId
+      // Ensure message contains correlationId for tracing without leaking secrets.
+      if (!String(enriched.message).includes('correlationId')) {
+        enriched.message = `${enriched.message} (correlationId=${correlationId})`
+      }
+      throw enriched
+    }
+    // For non-AppError, wrap as WorkerProvisionError-like AppError with correlationId
+    const wrapped = new AppError(code, `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROVISION_FAILED} (correlationId=${correlationId})`, 400)
+    ;(wrapped as any).correlationId = correlationId
+    ;(wrapped as any).cause = error
+    throw wrapped
   }
 }
 
@@ -310,10 +350,13 @@ export async function updateWorker(userId: string, id: string, input: UpdateWork
   if (!driver.update) {
     throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROVISION_FAILED, 400)
   }
-  const result = await driver.update({
+  const correlationId = crypto.randomUUID().slice(0, 8)
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=update started workerId=${id}`)
+  const result = await (driver.update as (inp: any) => Promise<any>)({
     config: newConfig,
     storedConfig,
     secret: relaySecret,
+    correlationId,
   })
 
   const isDefault = input.isDefault
@@ -340,6 +383,7 @@ export async function updateWorker(userId: string, id: string, input: UpdateWork
     await createAuditLog(userId, 'worker.updated', 'remote_fetch_worker', updated.id, {
       credentialUpdated: input.config?.apiToken ? Boolean(input.config.apiToken) : false,
       provisioned: true,
+      correlationId,
     })
     return updated
   }) as unknown as RemoteFetchWorker
@@ -397,12 +441,14 @@ export async function deleteWorker(userId: string, id: string) {
     if (!driver.deprovision) {
       throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_DEPROVISION_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_DEPROVISION_FAILED, 400)
     }
+    const correlationId = crypto.randomUUID().slice(0, 8)
+    console.log(`[worker:cloudflare] correlationId=${correlationId} step=deprovision started workerId=${id}`)
     try {
-      await driver.deprovision({ config })
+      await driver.deprovision({ config, correlationId })
     } catch {
       throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_DEPROVISION_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_DEPROVISION_FAILED, 400)
     }
-    await createAuditLog(userId, 'worker.deprovisioned', 'remote_fetch_worker', worker.id, { name: worker.name, driver: worker.driver })
+    await createAuditLog(userId, 'worker.deprovisioned', 'remote_fetch_worker', worker.id, { name: worker.name, driver: worker.driver, correlationId })
   }
 
   const updated = await prisma.remoteFetchWorker.update({
@@ -429,23 +475,28 @@ export async function testWorkerConnection(userId: string, id: string): Promise<
   const driver = resolveDriver(worker.driver)
   const secret = worker.secretEncrypted ? decryptText(worker.secretEncrypted) : null
   const now = new Date()
+  const correlationId = crypto.randomUUID().slice(0, 8)
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=test_connection started workerId=${id} endpoint=${worker.endpointUrl}`)
   let probe
   try {
     probe = await driver.testConnection({
       endpointUrl: worker.endpointUrl,
       authType: worker.authType as RemoteFetchWorkerAuthType,
       secret,
+      correlationId,
     })
   } catch (error) {
     const code = error instanceof AppError ? error.code : REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_UNHEALTHY
+    console.error(`[worker:cloudflare] correlationId=${correlationId} step=test_connection failed code=${code}`)
     await prisma.remoteFetchWorker.update({
       where: { id: worker.id },
       data: { status: 'unhealthy', lastHealthCheckAt: now, lastFailedAt: now, lastErrorCode: code },
       select: WORKER_SELECT,
     })
-    await createAuditLog(userId, 'worker.test_failed', 'remote_fetch_worker', worker.id, { code })
+    await createAuditLog(userId, 'worker.test_failed', 'remote_fetch_worker', worker.id, { code, correlationId })
     return { status: 'unhealthy', lastHealthCheckAt: now, lastErrorCode: code }
   }
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=test_connection success workerId=${id}`)
   await prisma.remoteFetchWorker.update({
     where: { id: worker.id },
     data: {
@@ -455,10 +506,10 @@ export async function testWorkerConnection(userId: string, id: string): Promise<
       lastFailedAt: null,
       lastErrorCode: null,
       capabilitiesJson: probe.capabilities as Prisma.InputJsonValue,
-      metadataJson: { protocolVersion: probe.protocolVersion ?? null } as Prisma.InputJsonValue,
+      metadataJson: { protocolVersion: probe.protocolVersion ?? null, correlationId } as Prisma.InputJsonValue,
     },
     select: WORKER_SELECT,
   })
-  await createAuditLog(userId, 'worker.test_succeeded', 'remote_fetch_worker', worker.id, { protocolVersion: probe.protocolVersion ?? null })
+  await createAuditLog(userId, 'worker.test_succeeded', 'remote_fetch_worker', worker.id, { protocolVersion: probe.protocolVersion ?? null, correlationId })
   return { status: 'healthy', lastHealthCheckAt: now }
 }

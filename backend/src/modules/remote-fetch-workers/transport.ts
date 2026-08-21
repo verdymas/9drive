@@ -2,6 +2,7 @@ import { AppError } from '../../utils/app-error.js'
 import type { RemoteFetchTransport, RemoteFetchWorkerAuthType } from './types.js'
 import { resolveDriver } from './driver-registry.js'
 import { REMOTE_FETCH_WORKER_ERROR_CODES, REMOTE_FETCH_WORKER_ERROR_MESSAGES } from './errors.js'
+import { DirectRemoteFetchTransport } from './transports/direct-transport.js'
 
 /**
  * Build the byte transport for a Remote Import (spec §31).
@@ -9,9 +10,7 @@ import { REMOTE_FETCH_WORKER_ERROR_CODES, REMOTE_FETCH_WORKER_ERROR_MESSAGES } f
  * - workerId null → DirectRemoteFetchTransport (the plain 9Drive downloader).
  * - workerId set → registry → driver → driver.createTransport().
  *
- * THIS PHASE: no driver implements createTransport yet, so a selected worker
- * fails the job explicitly with WORKER_TRANSPORT_NOT_IMPLEMENTED — never a
- * silent fallback to Direct (spec §30).
+ * Unsupported driver only when no registered driver exists. Direct is always available.
  */
 export function buildTransportForWorker(worker: {
   driver: string
@@ -29,4 +28,23 @@ export function buildTransportForWorker(worker: {
     authType: worker.authType,
     secretDecrypted,
   })
+}
+
+/** Direct transport factory — no worker, no registry, always available. */
+export function buildDirectTransport(opts: { requestContext?: import('../remote-imports/request-context.js').RemoteImportRequestContext | null; sourceUrl?: string } = {}): RemoteFetchTransport {
+  return new DirectRemoteFetchTransport(opts)
+}
+
+/**
+ * Resolve transport for an import: workerId null → Direct, else via registry.
+ * Generic: no `if (driver === 'cloudflare')` branching.
+ */
+export function resolveTransportForImport(
+  worker: { driver: string; endpointUrl: string; authType: RemoteFetchWorkerAuthType; secretEncrypted: string | null } | null,
+  opts: { decryptSecret: (encrypted: string) => string; requestContext?: import('../remote-imports/request-context.js').RemoteImportRequestContext | null; sourceUrl?: string },
+): RemoteFetchTransport {
+  if (!worker) {
+    return buildDirectTransport({ requestContext: opts.requestContext, sourceUrl: opts.sourceUrl })
+  }
+  return buildTransportForWorker(worker, { decryptSecret: opts.decryptSecret })
 }

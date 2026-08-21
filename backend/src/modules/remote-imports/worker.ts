@@ -1,3 +1,4 @@
+import '../remote-fetch-workers/index.js'
 import { Worker, type Job } from 'bullmq'
 import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'

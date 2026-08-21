@@ -16,6 +16,7 @@
     "seed:google-config:docker": "tsx src/scripts/seed-google-config-if-present.ts",
     "test:s3": "tsx src/scripts/test-s3-connection.ts",
     "test:api-upload": "tsx src/scripts/test-api-upload.ts",
+    "test:cloudflare-relay": "tsx scripts/test-cloudflare-relay.ts",
     "test": "vitest run",
     "test:watch": "vitest"
   },

@@ -1,0 +1,12 @@
+# Preferences
+- Treat credentials as highly sensitive: API tokens, secrets, HMAC signatures, signed URLs, cookies, auth headers must NEVER be committed to source, `.env`, fixtures, tests, or snapshots, and must never be printed/logged. Provide them only via environment variables or temporary shell env. Confidence: 1.0
+- When logging or propagating errors, never echo the URL, headers, body, secret, or signature — surface only a safe reason code/hint. Confidence: 0.9
+- Prefer backend/integration/API testing over browser automation — do NOT use Playwright or frontend E2E for backend integration tests. Use backend services, API requests, Cloudflare API, service classes, Docker, and backend logs. Confidence: 1.0
+- In tests, reuse the real production classes and code paths (serializers, transports, drivers, services) rather than reimplementing logic independently in the test. Test what actually ships. Confidence: 0.95
+- Prefer real end-to-end testing against real provisioned resources (real Worker, real upstream) over mocks alone. Confidence: 0.9
+- Write contract/regression tests that guard against drift between two sides (e.g., serializer vs parser) by feeding real output into the real counterpart, without duplicating either schema. Confidence: 0.9
+- Clean up temporary test resources in `try/finally`, and report cleanup failures separately without masking the original test result. Never delete resources you did not create. Confidence: 0.9
+- Test errors should carry a specific, safe reason code (e.g., INVALID_PROTOCOL, INVALID_JSON) distinguishing failure types rather than one generic message. Confidence: 0.8
+- Centralize shared constants/protocol definitions (protocol versions, allowed methods, canonical field names) in one place instead of duplicating magic strings across files. Confidence: 0.85
+- Avoid silent fallback behavior that defeats an explicit design choice (e.g., a selected worker silently falling back to direct fetch); fail explicitly instead. Confidence: 0.9
+- Provide compact PASS/FAIL test output and final reports; document exact commands to run and their results. Confidence: 0.75

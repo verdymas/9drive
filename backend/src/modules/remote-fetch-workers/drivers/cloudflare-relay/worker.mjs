@@ -78,22 +78,58 @@ async function handleFetch(request) {
   try {
     payload = await request.json();
   } catch {
-    return json({ error: 'invalid payload' }, 400);
+    return json({ error: 'invalid payload', reason: 'INVALID_JSON' }, 400);
   }
-  const { method, url, headers, body } = payload || {};
-  if (!ALLOWED_METHODS.has(method) || typeof url !== 'string') {
-    return json({ error: 'invalid request' }, 400);
+  const { method, url, headers, body, protocolVersion } = payload || {};
+  // Canonical 9drive-relay-v1 contract — keep in sync with backend/src/modules/remote-fetch-workers/relay-protocol.ts
+  // Validation with safe reason codes — never echo URL, headers values, or body content.
+  if (protocolVersion === undefined || protocolVersion === null) {
+    return json({ error: 'invalid payload', reason: 'MISSING_PROTOCOL' }, 400);
   }
+  if (protocolVersion !== PROTOCOL_VERSION) {
+    return json({ error: 'invalid payload', reason: 'INVALID_PROTOCOL' }, 400);
+  }
+  if (method === undefined || method === null) {
+    return json({ error: 'invalid payload', reason: 'MISSING_METHOD' }, 400);
+  }
+  if (typeof method !== 'string') {
+    return json({ error: 'invalid payload', reason: 'INVALID_METHOD' }, 400);
+  }
+  if (!ALLOWED_METHODS.has(method)) {
+    return json({ error: 'invalid payload', reason: 'UNSUPPORTED_METHOD' }, 400);
+  }
+  if (url === undefined || url === null) {
+    return json({ error: 'invalid payload', reason: 'MISSING_URL' }, 400);
+  }
+  if (typeof url !== 'string') {
+    return json({ error: 'invalid payload', reason: 'INVALID_URL' }, 400);
+  }
+  if (headers !== undefined && headers !== null && (typeof headers !== 'object' || Array.isArray(headers))) {
+    return json({ error: 'invalid payload', reason: 'INVALID_HEADERS' }, 400);
+  }
+  // Body is optional: when present must be string (not null, not number). HEAD/GET should omit it.
+  if (body !== undefined && typeof body !== 'string') {
+    return json({ error: 'invalid payload', reason: 'INVALID_BODY_TYPE' }, 400);
+  }
+  // Safe diagnostics — never log URL query, headers values, or body
+  try {
+    const targetHostForLog = new URL(url).hostname;
+    const payloadKeys = payload ? Object.keys(payload).sort().join(',') : '';
+    const bodyPresent = body !== undefined;
+    const bodyType = typeof body;
+    const headersCount = headers && typeof headers === 'object' ? Object.keys(headers).length : 0;
+    const headersType = typeof headers;
+    console.log(`[relay] protocol=${PROTOCOL_VERSION} upstreamMethod=${method} targetHost=${targetHostForLog} payloadKeys=${payloadKeys} contentType=${request.headers.get('content-type')} bodyPresent=${bodyPresent} bodyType=${bodyType} headersCount=${headersCount} headersType=${headersType}`);
+  } catch {}
   let target;
   try {
     target = new URL(url);
   } catch {
-    return json({ error: 'invalid url' }, 400);
+    return json({ error: 'invalid payload', reason: 'INVALID_URL' }, 400);
   }
   if (BLOCKED_SCHEMES.has(target.protocol) || (target.protocol !== 'http:' && target.protocol !== 'https:')) {
-    return json({ error: 'invalid url' }, 400);
+    return json({ error: 'invalid payload', reason: 'INVALID_URL' }, 400);
   }
-  if (typeof body !== 'string' && body != null) return json({ error: 'invalid body' }, 400);
 
   const outHeaders = new Headers();
   if (headers && typeof headers === 'object') {
@@ -116,12 +152,19 @@ async function handleFetch(request) {
     upstream.headers.forEach((value, key) => {
       responseHeaders[key] = value;
     });
+    // Chunked base64 to avoid call-stack / argument-length limits on large
+    // bodies (String.fromCharCode.apply with a huge Uint8Array would throw).
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < responseBody.length; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, responseBody.subarray(i, i + chunkSize));
+    }
     return json(
       {
         status: upstream.status,
         statusText: upstream.statusText,
         headers: responseHeaders,
-        body: btoa(String.fromCharCode.apply(null, responseBody)),
+        body: btoa(binary),
         protocolVersion: PROTOCOL_VERSION,
       },
       200
@@ -138,7 +181,7 @@ export default {
     }
     const url = new URL(request.url);
     if (request.method === 'GET' && url.pathname === '/health') return handleHealth();
-    if (request.method === 'POST' && url.pathname === '/fetch') return handleFetch();
+    if (request.method === 'POST' && url.pathname === '/fetch') return handleFetch(request);
     return json({ error: 'not found' }, 404);
   },
 };

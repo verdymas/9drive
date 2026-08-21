@@ -83,7 +83,12 @@ remoteFetchWorkerRouter.post('/', requireAuth, async (req: AuthRequest, res, nex
     return res.status(201).json(serializeWorker(created))
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ code: 'INVALID_REQUEST', message: error.issues[0]?.message ?? 'Invalid request.' })
-    if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
+    if (error instanceof AppError) {
+      const correlationId = (error as any).correlationId ?? (error as any).cause?.correlationId
+      const payload: Record<string, unknown> = { code: error.code, message: error.message }
+      if (correlationId) payload.correlationId = correlationId
+      return res.status(error.status).json(payload)
+    }
     return next(error)
   }
 })

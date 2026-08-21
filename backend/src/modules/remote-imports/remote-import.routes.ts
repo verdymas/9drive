@@ -66,11 +66,12 @@ remoteImportRouter.post('/probe', requireAuth, async (req: AuthRequest, res, nex
     const body = z.object({
       url: z.string().min(1).max(4096),
       requestContext: requestContextSchema,
+      workerId: z.string().nullable().optional(),
     }).parse(req.body)
 
     assertRequestContextEnabled()
     const requestContext = validateBodyContext(body.requestContext)
-    const result = await probeRemoteUrl(body.url, req.user!.id, requestContext ?? undefined)
+    const result = await probeRemoteUrl(body.url, req.user!.id, requestContext ?? undefined, { workerId: body.workerId ?? null })
     // The internal signed fetch URL must never cross the API boundary.
     return res.json({ data: probeResultForWire(result) })
   } catch (error) {

@@ -181,7 +181,23 @@ function startFakeCfApi(): Promise<string> {
         })()
         return
       }
-      if (path === '/accounts/acc-1/workers/scripts/relay-e2e/subdomain') return write(200, { success: true, result: { subdomain: 'e2e-sub' } })
+      if (path === '/accounts/acc-1/workers/scripts/relay-e2e/subdomain' && req.method === 'GET') return write(200, { success: true, result: { enabled: true, previews_enabled: false } })
+      if (path === '/accounts/acc-1/workers/subdomain' && req.method === 'GET') return write(200, { success: true, result: { subdomain: 'e2e-sub' } })
+      if (path === '/accounts/acc-1/workers/scripts/relay-e2e/subdomain' && req.method === 'POST') return write(200, { success: true, result: { enabled: true, previews_enabled: false } })
+      if (path === '/accounts/acc-1/workers/subdomain' && req.method === 'PUT') {
+        let body = ''
+        req.on('data', (chunk) => (body += chunk))
+        req.on('end', () => {
+          try {
+            const parsed = JSON.parse(body || '{}')
+            const sd = parsed.subdomain || 'e2e-sub'
+            return write(200, { success: true, result: { subdomain: sd } })
+          } catch {
+            return write(200, { success: true, result: { subdomain: 'e2e-sub' } })
+          }
+        })
+        return
+      }
       if (path === '/accounts/acc-1/workers/scripts/relay-e2e' && req.method === 'DELETE') return write(200, { success: true })
       return write(404, { success: false })
     })

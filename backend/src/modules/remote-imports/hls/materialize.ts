@@ -58,6 +58,7 @@ export type MaterializeMediaOptions = {
   /** Original import source URL — the cookie-scope anchor (spec §13). */
   sourceUrl?: string
   onProgress?: (progress: { segmentsCompleted: number; segmentsTotal: number; bytesDownloaded: bigint }) => void
+  fetcher?: import('../secure-fetcher.js').SecureRemoteFetcher | null
 }
 
 export type MaterializeMediaResult = {
@@ -152,9 +153,9 @@ export async function materializeMedia(opts: MaterializeMediaOptions): Promise<M
     if (anchorUrl) assertChildAccessible(anchorUrl, new URL(uri), requestContext)
     const map = segments.find((s) => s.map?.uri === uri)?.map as SegmentMap | undefined
     if (map?.byterange) {
-      downloadedBytes += await downloadByteRange(uri, map.byterange.offset, map.byterange.length, targetPath, { signal, requestContext })
+      downloadedBytes += await downloadByteRange(uri, map.byterange.offset, map.byterange.length, targetPath, { signal, requestContext, fetcher: opts.fetcher ?? null })
     } else {
-      downloadedBytes += await downloadResource(uri, targetPath, { maxBytes: MAX_SEGMENT_BYTES(), signal, kind: 'map', requestContext })
+      downloadedBytes += await downloadResource(uri, targetPath, { maxBytes: MAX_SEGMENT_BYTES(), signal, kind: 'map', requestContext, fetcher: opts.fetcher ?? null })
     }
   }
 
@@ -162,7 +163,7 @@ export async function materializeMedia(opts: MaterializeMediaOptions): Promise<M
     assertNotAborted(signal)
     if (anchorUrl) assertChildAccessible(anchorUrl, new URL(uri), requestContext)
     try {
-      downloadedBytes += await downloadResource(uri, targetPath, { maxBytes: MAX_KEY_BYTES(), signal, kind: 'key', requestContext })
+      downloadedBytes += await downloadResource(uri, targetPath, { maxBytes: MAX_KEY_BYTES(), signal, kind: 'key', requestContext, fetcher: opts.fetcher ?? null })
     } catch (error) {
       if (error instanceof AppError && error.code === HLS_ERROR_CODES.HLS_SEGMENT_TOO_LARGE) {
         throw new AppError(HLS_ERROR_CODES.HLS_KEY_DOWNLOAD_FAILED, HLS_ERROR_MESSAGES.HLS_KEY_DOWNLOAD_FAILED, 502)
@@ -196,9 +197,9 @@ export async function materializeMedia(opts: MaterializeMediaOptions): Promise<M
       const attemptDownload = () => {
         if (anchorUrl) assertChildAccessible(anchorUrl, new URL(segment.uri), requestContext)
         if (segment.byterange) {
-          return downloadByteRange(segment.uri, segment.byterange.offset, segment.byterange.length, target, { signal, requestContext })
+          return downloadByteRange(segment.uri, segment.byterange.offset, segment.byterange.length, target, { signal, requestContext, fetcher: opts.fetcher ?? null })
         }
-        return downloadResource(segment.uri, target, { maxBytes: MAX_SEGMENT_BYTES(), signal, kind: 'segment', requestContext })
+        return downloadResource(segment.uri, target, { maxBytes: MAX_SEGMENT_BYTES(), signal, kind: 'segment', requestContext, fetcher: opts.fetcher ?? null })
       }
 
       let lastError: unknown = null
@@ -292,7 +293,8 @@ export function buildSegmentCacheSeed(jobDir: string, segments: NormalizedSegmen
 export async function fetchMediaPlaylistSegments(
   playlistUrl: string,
   requestContext?: RemoteImportRequestContext,
+  fetcher?: import('../secure-fetcher.js').SecureRemoteFetcher | null,
 ): Promise<{ segments: NormalizedSegment[]; body: string }> {
-  const { body, finalUrl } = await fetchManifest(playlistUrl, env.REMOTE_IMPORT_HLS_MAX_MANIFEST_BYTES, requestContext)
+  const { body, finalUrl } = await fetchManifest(playlistUrl, env.REMOTE_IMPORT_HLS_MAX_MANIFEST_BYTES, requestContext, fetcher ?? null)
   return { segments: (await parseMediaPlaylist(body, finalUrl)).segments, body }
 }

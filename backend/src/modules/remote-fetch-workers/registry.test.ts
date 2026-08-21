@@ -66,20 +66,52 @@ describe('driver registry', () => {
   })
 
   it('fails explicitly with WORKER_TRANSPORT_NOT_IMPLEMENTED when the driver has no transport', () => {
-    // cloudflare driver (registered in app) has no createTransport this phase.
+    const noTransportDriver: RemoteFetchWorkerDriver = {
+      key: 'no-transport',
+      displayName: 'No Transport',
+      validateConfig: async () => ({ endpointUrl: 'https://relay.example' }),
+      testConnection: async () => ({ status: 'healthy' }),
+      getMetadata: () => ({ key: 'no-transport', displayName: 'No Transport', managed: false, authTypes: ['none'], fields: [] }),
+    }
+    registerDriver(noTransportDriver)
     expect(() =>
       buildTransportForWorker(
-        { driver: DEFAULT_KEY, endpointUrl: 'https://relay.example', authType: 'hmac', secretEncrypted: null },
+        { driver: 'no-transport', endpointUrl: 'https://relay.example', authType: 'none', secretEncrypted: null },
         { decryptSecret: (s) => s },
       ),
     ).toThrowError(AppError)
     try {
       buildTransportForWorker(
-        { driver: DEFAULT_KEY, endpointUrl: 'https://relay.example', authType: 'hmac', secretEncrypted: null },
+        { driver: 'no-transport', endpointUrl: 'https://relay.example', authType: 'none', secretEncrypted: null },
         { decryptSecret: (s) => s },
       )
     } catch (error) {
       expect((error as AppError).code).toBe('WORKER_TRANSPORT_NOT_IMPLEMENTED')
     }
+  })
+
+  it('cloudflare transport requires secret and valid endpoint', () => {
+    // Missing secret → auth failed, not not-implemented
+    expect(() =>
+      buildTransportForWorker(
+        { driver: DEFAULT_KEY, endpointUrl: 'https://relay.example.workers.dev', authType: 'hmac', secretEncrypted: null },
+        { decryptSecret: (s) => s },
+      ),
+    ).toThrowError(AppError)
+    try {
+      buildTransportForWorker(
+        { driver: DEFAULT_KEY, endpointUrl: 'https://relay.example.workers.dev', authType: 'hmac', secretEncrypted: null },
+        { decryptSecret: (s) => s },
+      )
+    } catch (error) {
+      expect((error as AppError).code).toBe('WORKER_AUTH_FAILED')
+    }
+    // With secret, it succeeds
+    const transport = buildTransportForWorker(
+      { driver: DEFAULT_KEY, endpointUrl: 'https://relay.example.workers.dev', authType: 'hmac', secretEncrypted: 'enc-secret' },
+      { decryptSecret: (s) => 'decrypted-secret' },
+    )
+    expect(transport).toBeDefined()
+    expect(transport.request).toBeInstanceOf(Function)
   })
 })

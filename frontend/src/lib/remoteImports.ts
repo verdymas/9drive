@@ -180,12 +180,13 @@ export type ProbeResult = {
  * never contacts the remote host). `signal` lets the caller cancel a
  * superseded probe; an aborted fetch rejects with an AbortError which the
  * modal ignores. `requestContext` carries the access headers a protected
- * source needs; they never leave the backend.
+ * source needs; they never leave the backend. `workerId` selects the
+ * relay transport — null/undefined = Direct.
  */
-export function probeRemoteUrl(url: string, signal?: AbortSignal, requestContext?: RequestContextInput) {
+export function probeRemoteUrl(url: string, signal?: AbortSignal, requestContext?: RequestContextInput, workerId?: string | null) {
   return apiFetch<{ data: ProbeResult }>('/remote-imports/probe', {
     method: 'POST',
-    body: JSON.stringify({ url, ...(requestContext ? { requestContext } : {}) }),
+    body: JSON.stringify({ url, ...(requestContext ? { requestContext } : {}), ...(workerId ? { workerId } : {}) }),
     signal,
   })
 }

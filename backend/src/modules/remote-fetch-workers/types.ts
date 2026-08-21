@@ -95,6 +95,8 @@ export type WorkerProvisionInput = {
   config: Record<string, string>
   /** Generated relay secret — deployed as a binding, never user-supplied. */
   secret: string
+  /** Correlation id for this provisioning attempt (tracing). */
+  correlationId?: string
 }
 
 /** Result of a successful provision — the service persists these. */
@@ -113,6 +115,8 @@ export type WorkerUpdateInput = {
   storedConfig: Record<string, string>
   /** The relay secret currently bound to the deployed script. */
   secret: string
+  /** Correlation id for this provisioning attempt (tracing). */
+  correlationId?: string
 }
 
 /** Result of a managed update. */
@@ -124,6 +128,8 @@ export type WorkerUpdateResult = {
 /** Input for deprovisioning (delete / cleanup after failed provision). */
 export type WorkerDeprovisionInput = {
   config: Record<string, string>
+  /** Correlation id for this provisioning attempt (tracing). */
+  correlationId?: string
 }
 
 /** A worker driver implementation (spec §7). */
@@ -143,10 +149,11 @@ export interface RemoteFetchWorkerDriver {
     authType?: RemoteFetchWorkerAuthType
     secret?: string | null
     config?: Record<string, string> | null
+    correlationId?: string
   }): Promise<{ endpointUrl?: string | null; configEncryptedInput?: unknown }>
 
   /** Test connectivity + protocol identity against the relay endpoint. */
-  testConnection(input: { endpointUrl: string; authType: RemoteFetchWorkerAuthType; secret?: string | null }): Promise<WorkerHealthProbe>
+  testConnection(input: { endpointUrl: string; authType: RemoteFetchWorkerAuthType; secret?: string | null; correlationId?: string }): Promise<WorkerHealthProbe>
 
   /** Safe capabilities metadata for the UI form. */
   getMetadata(): WorkerDriverMetadata

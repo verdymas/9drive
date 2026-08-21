@@ -20,8 +20,9 @@ import { hlsJobDir, readResumeMarker, removeJobDir, removeResumeMarker, writeRes
 import type { ContainerChoice } from './hls/output.js'
 import { ensureJobDir } from './hls/materializer.js'
 import { verifyOutput } from './hls/verify.js'
-import { hasDriver } from '../remote-fetch-workers/driver-registry.js'
+import { hasDriver, resolveDriver } from '../remote-fetch-workers/driver-registry.js'
 import { REMOTE_FETCH_WORKER_ERROR_CODES } from '../remote-fetch-workers/errors.js'
+import { createSecureFetcherForWorkerId, type SecureRemoteFetcher } from './secure-fetcher.js'
 
 const STAGES = {
   PROBING: 'probing',
@@ -45,9 +46,8 @@ function isHlsRecord(record: { sourceType?: string | null }): boolean {
 
 /**
  * Execution-time worker guard (spec §29-§31). The selected worker must still
- * exist, be enabled, and use a supported driver. THIS PHASE has no relay
- * transport yet — a selected worker fails the job explicitly with
- * WORKER_TRANSPORT_NOT_IMPLEMENTED instead of silently fetching Direct.
+ * exist, be enabled, and use a supported driver. Transport is resolved
+ * generically via the driver registry — no `if (driver === 'cloudflare')`.
  */
 async function assertWorkerUsable(record: { workerId: string | null }) {
   if (!record.workerId) return
@@ -65,8 +65,11 @@ async function assertWorkerUsable(record: { workerId: string | null }) {
   if (!worker.endpointUrl) {
     throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_UNAVAILABLE, 'The selected network worker is no longer available.', 409)
   }
-  // No driver implements createTransport this phase.
-  throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_TRANSPORT_NOT_IMPLEMENTED, 'Relay transport for this worker is not implemented yet. Switch this import to Direct or choose a different worker.', 501)
+  // Generic transport check: unsupported only when driver has no createTransport
+  const driver = resolveDriver(worker.driver)
+  if (!driver.createTransport) {
+    throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_TRANSPORT_NOT_IMPLEMENTED, 'Relay transport for this worker is not implemented yet. Switch this import to Direct or choose a different worker.', 501)
+  }
 }
 
 /**
@@ -135,12 +138,48 @@ async function downloadToTemp(
   startUrl: string,
   maxBytes: bigint,
   requestContext?: RemoteImportRequestContext,
+  fetcher?: SecureRemoteFetcher | null,
 ): Promise<{ finalUrl: string; tempPartPath: string; contentLength: bigint | null; supportsRange: boolean }> {
   const partPath = await createTempPartFile(importId)
   let supportsRange = false
   let contentLength: bigint | null = null
   let finalUrl = startUrl
   let totalBytes = 0n
+
+  if (fetcher) {
+    const res = await fetcher.fetch({ method: 'GET', url: startUrl, requestContext: requestContext as any } as any)
+    const rawLength = res.headers['content-length']
+    if (rawLength) contentLength = BigInt(rawLength)
+    supportsRange = res.headers['accept-ranges'] === 'bytes' || res.status === 206
+    if (res.status >= 400) {
+      throw new AppError('DOWNLOAD_HTTP_ERROR', `Remote server responded ${res.status}.`, 502)
+    }
+    finalUrl = (res as any).finalUrl ?? startUrl
+    const fileStream = appendStreamToTemp(partPath)
+    const writeProgress = throttledProgressUpdater(importId, STAGES.DOWNLOADING)
+    try {
+      const iterable = typeof res.body === 'string' ? (async function* () { yield Buffer.from(res.body as string) })() : (res.body as AsyncIterable<Uint8Array>)
+      for await (const chunk of iterable) {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
+        totalBytes += BigInt(buf.byteLength)
+        if (totalBytes > maxBytes) {
+          fileStream.destroy()
+          throw new AppError('DOWNLOAD_TOO_LARGE', 'The remote file exceeds the maximum allowed size.', 413)
+        }
+        if (!fileStream.write(buf)) {
+          await new Promise<void>((resolve) => fileStream.once('drain', resolve))
+        }
+        await writeProgress({ downloadedBytes: totalBytes.toString() })
+      }
+      await updateStage(importId, STAGES.DOWNLOADING, { downloadedBytes: totalBytes.toString() })
+      await new Promise<void>((resolve, reject) => fileStream.end((err: Error | null) => (err ? reject(err) : resolve())))
+    } catch (error) {
+      fileStream.destroy()
+      throw error
+    }
+    await updateStage(importId, STAGES.VERIFYING, { downloadedBytes: totalBytes.toString() })
+    return { finalUrl, tempPartPath: partPath, contentLength, supportsRange }
+  }
 
   await followRemoteUrl(startUrl, {
     getHopHeaders: hopHeaderResolver(startUrl, requestContext),
@@ -316,6 +355,7 @@ async function processHlsImport(
     fileId: string | null
     retryFromStage?: string | null
   },
+  outerFetcher?: SecureRemoteFetcher | null,
 ) {
   const importId = record.id
   const userId = record.userId
@@ -333,6 +373,7 @@ async function processHlsImport(
   // Worker guard lives at the top of the HLS path too (the direct path guards
   // in processRemoteImportJob; HLS may also be reached via retry-convert).
   await assertWorkerUsable(record)
+  const fetcher = outerFetcher ?? (await createSecureFetcherForWorkerId(record.workerId, { requestContext, sourceUrl }))
 
   const jobDir = hlsJobDir(userId, importId)
   await ensureJobDir(jobDir)
@@ -438,6 +479,7 @@ async function processHlsImport(
         jobDir,
         sourceUrl,
         requestContext,
+        fetcher,
         isLive: Boolean(record.hlsIsLive),
         recordingDurationSeconds: record.hlsRecordingDurationSeconds ?? undefined,
         selection: {
@@ -625,12 +667,13 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
     }
 
     // ── Selected worker guard: a worker-backed import must still be usable, and
-//    relay transport is not implemented this phase (no silent Direct). ──────
+    // relay transport is resolved generically via registry.
     await assertWorkerUsable(record)
+    const fetcher = await createSecureFetcherForWorkerId(record.workerId, { requestContext, sourceUrl })
 
     // ── HLS imports skip the direct-download path entirely. ─────────────────
     if (isHlsRecord(record)) {
-      const result = await processHlsImport(job, record)
+      const result = await processHlsImport(job, record, fetcher)
       if (result) return
       // processHlsImport already finalized status on failure; just return.
       return
@@ -657,35 +700,29 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
       return
     }
 
-    // Probe the URL: follow redirects with SSRF validation, get size/range.
-    // A ranged GET (`bytes=0-0`) keeps the probe cheap; servers that ignore
-    // the range still answer 200 with a full body, which we abort after the
-    // first chunk (we only need headers + content-length).
+    // Probe the URL: via SecureRemoteFetcher (Direct or relay) — never raw followRemoteUrl
     let finalUrl: string
     try {
-      const probe = await followRemoteUrl(sourceUrl, {
-        headers: { Range: 'bytes=0-0' },
-        getHopHeaders: hopHeaderResolver(sourceUrl, requestContext),
-        onResponse: async (res) => {
-          const length = res.headers['content-length']
-          const supportsRange = res.headers['accept-ranges'] === 'bytes' || res.statusCode === 206
-          if (typeof (res.body as { on?: unknown }).on === 'function') {
-            (res.body as unknown as { on: (event: 'error', listener: () => void) => void }).on('error', () => undefined)
-          }
-          const reader = res.body[Symbol.asyncIterator]()
+      const probeRes = await fetcher.fetch({ method: 'GET', url: sourceUrl, headers: { Range: 'bytes=0-0' }, range: 'bytes=0-0', requestContext: requestContext as any } as any)
+      const length = probeRes.headers['content-length']
+      const supportsRange = probeRes.headers['accept-ranges'] === 'bytes' || probeRes.status === 206
+      // Drain first chunk to keep probe cheap (server may ignore Range)
+      if (probeRes.body) {
+        const body = probeRes.body as AsyncIterable<Uint8Array> | string
+        if (typeof body !== 'string') {
+          const reader = (body as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]()
           await reader.next().catch(() => undefined)
-          await reader.return?.().catch(() => undefined)
-          return { length, supportsRange }
-        },
-      })
-      finalUrl = probe.finalUrl
-      if (probe.result.length) {
-        const declared = BigInt(probe.result.length)
+          await (reader as any).return?.().catch(() => undefined)
+        }
+      }
+      finalUrl = (probeRes as any).finalUrl ?? sourceUrl
+      if (length) {
+        const declared = BigInt(length)
         if (declared > maxBytes) {
           await markFailed(importId, 'DOWNLOAD_TOO_LARGE', 'The remote file exceeds the maximum allowed size.')
           return
         }
-        await prisma.remoteImport.update({ where: { id: importId }, data: { totalBytes: declared, sourceRangeSupported: probe.result.supportsRange } })
+        await prisma.remoteImport.update({ where: { id: importId }, data: { totalBytes: declared, sourceRangeSupported: supportsRange } })
       }
     } catch (error) {
       if (error instanceof AppError && error.code === 'DOWNLOAD_TOO_LARGE') {
@@ -695,7 +732,7 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
       throw error
     }
 
-    const downloaded = await downloadToTemp(importId, finalUrl, maxBytes, requestContext)
+    const downloaded = await downloadToTemp(importId, finalUrl, maxBytes, requestContext, fetcher)
     finalUrl = downloaded.finalUrl
 
     assertWithinTimeout()

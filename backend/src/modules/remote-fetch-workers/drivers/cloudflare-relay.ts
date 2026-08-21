@@ -8,10 +8,16 @@
  * or endpoints. The relay secret travels only as a `secret_text` binding.
  */
 import { readFileSync } from 'node:fs'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { AppError } from '../../../utils/app-error.js'
 import { REMOTE_FETCH_WORKER_ERROR_CODES, REMOTE_FETCH_WORKER_ERROR_MESSAGES } from '../errors.js'
+
+const execFileAsync = promisify(execFile)
 
 /** Canonical entry module name — multipart part name and filename MUST equal `metadata.main_module`. */
 export const RELAY_MODULE_NAME = 'worker.mjs'
@@ -26,6 +32,16 @@ export const RELAY_SECRET_BINDING = 'RELAY_SECRET'
  * past date; bump it deliberately with a relay feature change.
  */
 export const RELAY_COMPATIBILITY_DATE = '2026-06-01'
+
+/** Content-Type for the module part per Workers Scripts API contract. */
+export const RELAY_MODULE_CONTENT_TYPE = 'application/javascript+module'
+
+/** Debug artifact directory inside backend container (non-production only). */
+export const RELAY_DEBUG_DIR = '/tmp/9drive-cloudflare-debug'
+
+/** Debug artifact paths. */
+export const RELAY_DEBUG_ARTIFACT_PATH = join(RELAY_DEBUG_DIR, RELAY_MODULE_NAME)
+export const RELAY_DEBUG_METADATA_PATH = join(RELAY_DEBUG_DIR, 'upload-metadata.json')
 
 // CommonJS build (no "type":"module"): __dirname is the module's own
 // directory. tsx (dev) resolves it to src/.../cloudflare-relay/worker.mjs;
@@ -61,8 +77,19 @@ export function loadRelaySource(): string {
  * a broken template literal or a missing/default-less entrypoint fails BEFORE
  * any Cloudflare API request is made. The source is static and side-effect
  * free, so executing it is safe.
+ *
+ * Additionally runs `node --check` via a temp file when available for a
+ * second parser signal. Failure at this stage → WORKER_RELAY_BUILD_FAILED,
+ * never a provider call.
  */
 export async function validateRelaySource(source: string): Promise<void> {
+  // Quick TypeScript leftover guard: the artifact must be plain JS.
+  if (/\binterface\s+\w+/.test(source) || /^\s*type\s+\w+\s*=/m.test(source) || source.includes('process.env') || source.includes('require(') || source.includes('__dirname') || source.includes('__filename')) {
+    const detail = 'artifact contains TypeScript or Node-only syntax'
+    console.error(`[worker:cloudflare] step=preflight_relay preflight validation failed: ${detail}`)
+    throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_RELAY_BUILD_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_RELAY_BUILD_FAILED, 400)
+  }
+  // Primary: data: import parse. Catches syntax errors, broken imports, etc.
   try {
     const mod = await import(`data:text/javascript;base64,${Buffer.from(source, 'utf8').toString('base64')}`)
     if (typeof mod.default?.fetch !== 'function') {
@@ -72,8 +99,59 @@ export async function validateRelaySource(source: string): Promise<void> {
     // Parse detail stays in backend logs only (the source is static and
     // contains no secrets): the user-facing error is the generic build code.
     const detail = error && typeof error === 'object' && 'message' in error ? String((error as { message: unknown }).message) : String(error)
-    console.error(`[worker:cloudflare] step=build relay preflight validation failed: ${detail}`)
+    console.error(`[worker:cloudflare] step=preflight_relay preflight validation failed: ${detail}`)
     throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_RELAY_BUILD_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_RELAY_BUILD_FAILED, 400)
+  }
+  // Secondary: node --check via temp file (best-effort, never blocks on failure to spawn).
+  // This mirrors what a developer would run: `node --check worker.mjs`.
+  try {
+    const tf = join(tmpdir(), `9drive-preflight-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.mjs`)
+    const { writeFile: wf, unlink } = await import('node:fs/promises')
+    await wf(tf, source, 'utf8')
+    try {
+      await execFileAsync(process.execPath, ['--check', tf])
+    } finally {
+      await unlink(tf).catch(() => {})
+    }
+  } catch (error) {
+    const detail = error && typeof error === 'object' && 'message' in error ? String((error as { message: unknown }).message) : String(error)
+    // Only treat explicit syntax failures as build failure; ENOENT / spawn
+    // issues are ignored (the data: import already validated).
+    if (detail.includes('SyntaxError') || detail.toLowerCase().includes('syntax')) {
+      console.error(`[worker:cloudflare] step=preflight_relay node --check failed: ${detail}`)
+      throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_RELAY_BUILD_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_RELAY_BUILD_FAILED, 400)
+    }
+    // Otherwise log but do not fail (e.g., node --check unavailable).
+  }
+}
+
+/**
+ * Dump the exact final artifact bytes and safe metadata to the debug directory
+ * (non-production only). Uses the actual Buffer that will be sent to Cloudflare.
+ * Secrets are NEVER written.
+ */
+export async function dumpRelayArtifacts(source: string, metadata: string): Promise<void> {
+  if (process.env.NODE_ENV === 'production') return
+  try {
+    const moduleBytes = Buffer.from(source, 'utf8')
+    await mkdir(RELAY_DEBUG_DIR, { recursive: true })
+    await writeFile(RELAY_DEBUG_ARTIFACT_PATH, moduleBytes)
+    const parsedMeta = JSON.parse(metadata) as { main_module?: string; compatibility_date?: string; bindings?: Array<{ name?: string }> }
+    const bindingNames = Array.isArray(parsedMeta.bindings) ? parsedMeta.bindings.map((b) => b.name).filter(Boolean) : []
+    const diag = {
+      moduleName: RELAY_MODULE_NAME,
+      mainModule: parsedMeta.main_module ?? RELAY_MODULE_NAME,
+      moduleBytes: moduleBytes.length,
+      moduleSha256: relaySourceSha256(source),
+      moduleContentType: RELAY_MODULE_CONTENT_TYPE,
+      compatibilityDate: parsedMeta.compatibility_date ?? RELAY_COMPATIBILITY_DATE,
+      bindingNames,
+    }
+    await writeFile(RELAY_DEBUG_METADATA_PATH, JSON.stringify(diag, null, 2), 'utf8')
+    console.log(`[worker:cloudflare] debug artifacts written moduleBytes=${diag.moduleBytes} sha256=${diag.moduleSha256} path=${RELAY_DEBUG_ARTIFACT_PATH}`)
+  } catch (error) {
+    const detail = error && typeof error === 'object' && 'message' in error ? String((error as { message: unknown }).message) : String(error)
+    console.error(`[worker:cloudflare] debug artifact dump failed: ${detail}`)
   }
 }
 
@@ -92,6 +170,23 @@ export function buildCloudflareRelay(relaySecret: string): RelayBuild {
   // The uploaded multipart part is named RELAY_MODULE_NAME; main_module must
   // reference exactly that part or Cloudflare's parser cannot resolve the
   // entry module (error 10021).
+  if (JSON.parse(metadata).main_module !== RELAY_MODULE_NAME) {
+    throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_RELAY_BUILD_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_RELAY_BUILD_FAILED, 400)
+  }
+  return { source, moduleName: RELAY_MODULE_NAME, metadata }
+}
+
+/**
+ * Build relay artifact WITHOUT secret binding. Used for the initial
+ * upload_script step so failures are unambiguously module/multipart (not secret
+ * binding). Secret is configured separately via configureRelaySecret.
+ */
+export function buildCloudflareRelayWithoutSecret(): RelayBuild {
+  const source = loadRelaySource()
+  const metadata = JSON.stringify({
+    main_module: RELAY_MODULE_NAME,
+    compatibility_date: RELAY_COMPATIBILITY_DATE,
+  })
   if (JSON.parse(metadata).main_module !== RELAY_MODULE_NAME) {
     throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_RELAY_BUILD_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_RELAY_BUILD_FAILED, 400)
   }

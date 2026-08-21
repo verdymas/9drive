@@ -301,6 +301,7 @@ export function RemoteImportModal({
   // Ref mirror of the request context for the same reason — the probe fires
   // 500ms after the last keystroke and must see the current field values.
   const contextRef = useRef<RequestContextInput>({})
+  const workerIdRef = useRef('')
 
   function updateContext(patch: Partial<RequestContextInput>) {
     const next = { ...contextRef.current, ...patch }
@@ -321,7 +322,9 @@ export function RemoteImportModal({
       setContext({})
       setFolderId(defaultFolderId ?? '')
       setAccountId('')
-      setWorkerId(workers.find((worker) => worker.isDefault)?.id ?? '')
+      const defaultWorkerId = workers.find((worker) => worker.isDefault)?.id ?? ''
+      setWorkerId(defaultWorkerId)
+      workerIdRef.current = defaultWorkerId
       setFileName('')
       setError('')
       setProbe({ status: 'idle' })
@@ -354,9 +357,8 @@ export function RemoteImportModal({
     setProbe({ status: 'detecting' })
     setError('')
     try {
-      // Pass the currently-entered request context (read from a ref so the
-      // debounced closure never captures stale state).
-      const { data } = await probeRemoteUrl(targetUrl, controller.signal, contextRef.current)
+      // Pass the currently-entered request context and selected worker (generic transport)
+      const { data } = await probeRemoteUrl(targetUrl, controller.signal, contextRef.current, workerIdRef.current || null)
       if (token !== probeTokenRef.current) return // stale — a newer run started
       setProbe({ status: 'detected', result: data })
       setDetectedFileName(data.fileName)
@@ -411,14 +413,34 @@ export function RemoteImportModal({
       if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error()
     } catch {
       probeTokenRef.current += 1
+      abortRef.current?.abort()
+      abortRef.current = null
       setProbe({ status: 'idle' })
       return
     }
+    // Invalidate any previous probe and abort it so a route change (direct→worker)
+    // never leaves a direct source request in flight while the debounced worker
+    // probe is pending. The new probe will read the current workerIdRef at execution time.
+    probeTokenRef.current += 1
+    abortRef.current?.abort()
+    abortRef.current = null
     const token = probeTokenRef.current
     debounceRef.current = setTimeout(() => {
       void runProbe(trimmed, token)
     }, PROBE_DEBOUNCE_MS)
   }
+
+  // Keep workerId ref in sync and re-probe when Network Route changes (generic transport switch)
+  // The selected transport must be used from the first probe, not only during download.
+  // No hard-coded driver checks — the backend resolves workerId → driver → transport.
+  // handleUrlChange aborts any in-flight probe and invalidates its token, so a
+  // direct→worker switch never leaves a direct source request in flight.
+  useEffect(() => {
+    workerIdRef.current = workerId
+    if (open && mode === 'url' && url.trim()) {
+      handleUrlChange(url)
+    }
+  }, [workerId, open, mode, url])
 
   function handleFileNameChange(value: string) {
     setFileName(value)

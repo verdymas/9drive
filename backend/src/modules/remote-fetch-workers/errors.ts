@@ -29,6 +29,14 @@ export const REMOTE_FETCH_WORKER_ERROR_CODES = {
   // Local relay build/preflight failure — the artifact is invalid, so no
   // provider request is made (the provider would only reject it).
   WORKER_RELAY_BUILD_FAILED: 'WORKER_RELAY_BUILD_FAILED',
+  // Endpoint discovery / workers.dev subdomain lifecycle (Cloudflare managed)
+  WORKER_SUBDOMAIN_STATE_FAILED: 'WORKER_SUBDOMAIN_STATE_FAILED',
+  WORKER_SUBDOMAIN_ENABLE_FAILED: 'WORKER_SUBDOMAIN_ENABLE_FAILED',
+  WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND: 'WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND',
+  WORKER_ACCOUNT_SUBDOMAIN_CREATE_FAILED: 'WORKER_ACCOUNT_SUBDOMAIN_CREATE_FAILED',
+  WORKER_ENDPOINT_BUILD_FAILED: 'WORKER_ENDPOINT_BUILD_FAILED',
+  WORKER_HEALTH_CHECK_FAILED: 'WORKER_HEALTH_CHECK_FAILED',
+  WORKER_RELAY_PROTOCOL_ERROR: 'WORKER_RELAY_PROTOCOL_ERROR',
   // Remote Import selection / execution
   REMOTE_IMPORT_WORKER_INVALID: 'REMOTE_IMPORT_WORKER_INVALID',
   REMOTE_IMPORT_WORKER_DISABLED: 'REMOTE_IMPORT_WORKER_DISABLED',
@@ -60,6 +68,13 @@ export const REMOTE_FETCH_WORKER_ERROR_MESSAGES: Record<RemoteFetchWorkerErrorCo
   WORKER_PROVISION_CONFLICT: 'A relay with this name already exists at the provider. Choose a different name.',
   WORKER_DEPROVISION_FAILED: 'The remote relay could not be removed. The worker was not deleted — retry or clean it up at the provider.',
   WORKER_RELAY_BUILD_FAILED: 'The relay could not be built locally. No changes were made at the provider.',
+  WORKER_SUBDOMAIN_STATE_FAILED: 'The workers.dev subdomain state could not be determined.',
+  WORKER_SUBDOMAIN_ENABLE_FAILED: 'The workers.dev route could not be enabled for the deployed script.',
+  WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND: 'No workers.dev subdomain is configured for this account.',
+  WORKER_ACCOUNT_SUBDOMAIN_CREATE_FAILED: 'The workers.dev subdomain could not be created for this account.',
+  WORKER_ENDPOINT_BUILD_FAILED: 'The relay endpoint could not be constructed.',
+  WORKER_HEALTH_CHECK_FAILED: 'The relay endpoint did not respond as a healthy 9Drive relay.',
+  WORKER_RELAY_PROTOCOL_ERROR: 'The relay received an invalid request.',
   REMOTE_IMPORT_WORKER_INVALID: 'The selected network worker does not exist.',
   REMOTE_IMPORT_WORKER_DISABLED: 'The selected network worker is disabled.',
   REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED: 'The selected network worker uses an unsupported service.',

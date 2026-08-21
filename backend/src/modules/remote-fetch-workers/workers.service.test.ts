@@ -220,8 +220,8 @@ describe('createWorker (managed driver — provisioning flow)', () => {
       credentials: { apiToken: 'tok-1' },
     })
 
-    expect(h.fakeDriver.provision).toHaveBeenCalledWith({ config: { accountId: 'acc-1', apiToken: 'tok-1', workerName: 'relay-1' }, secret: 'relay-secret-xyz' })
-    expect(h.fakeDriver.testConnection).toHaveBeenCalledWith({ endpointUrl: 'https://relay.example.workers.dev', authType: 'hmac', secret: 'relay-secret-xyz' })
+    expect(h.fakeDriver.provision).toHaveBeenCalledWith(expect.objectContaining({ config: { accountId: 'acc-1', apiToken: 'tok-1', workerName: 'relay-1' }, secret: 'relay-secret-xyz' }))
+    expect(h.fakeDriver.testConnection).toHaveBeenCalledWith(expect.objectContaining({ endpointUrl: 'https://relay.example.workers.dev', authType: 'hmac', secret: 'relay-secret-xyz' }))
 
     const healthyUpdate = h.prismaMock.remoteFetchWorker.update.mock.calls[0][0].data
     expect(healthyUpdate).toMatchObject({ status: 'healthy', endpointUrl: 'https://relay.example.workers.dev' })
@@ -249,7 +249,7 @@ describe('createWorker (managed driver — provisioning flow)', () => {
 
     const failUpdate = h.prismaMock.remoteFetchWorker.update.mock.calls[0][0].data
     expect(failUpdate).toMatchObject({ status: 'provision_failed', lastErrorCode: 'WORKER_PROVISION_FAILED' })
-    expect(h.fakeDriver.deprovision).toHaveBeenCalledWith({ config: { accountId: 'acc-1', apiToken: 'tok-1', workerName: 'relay-1' } })
+    expect(h.fakeDriver.deprovision).toHaveBeenCalledWith(expect.objectContaining({ config: { accountId: 'acc-1', apiToken: 'tok-1', workerName: 'relay-1' } }))
     expect(h.auditSpy).toHaveBeenCalledWith('user-1', 'worker.provision_failed', 'remote_fetch_worker', 'worker-1', expect.anything())
   })
 
@@ -360,7 +360,7 @@ describe('setDefaultWorker / disableWorker / deleteWorker invariants', () => {
     })
     h.decryptSpy.mockImplementation((s: string) => s)
     await deleteWorker('user-1', 'worker-1')
-    expect(h.fakeDriver.deprovision).toHaveBeenCalledWith({ config: { accountId: 'acc-1', workerName: 'relay-1' } })
+    expect(h.fakeDriver.deprovision).toHaveBeenCalledWith(expect.objectContaining({ config: { accountId: 'acc-1', workerName: 'relay-1' } }))
     const data = h.prismaMock.remoteFetchWorker.update.mock.calls[0][0].data
     expect(data.deletedAt).toBeInstanceOf(Date)
     expect(h.auditSpy).toHaveBeenCalledWith('user-1', 'worker.deprovisioned', 'remote_fetch_worker', 'worker-1', expect.anything())
@@ -412,11 +412,13 @@ describe('testWorkerConnection', () => {
   it('decrypts the secret internally, drives the driver, persists healthy state', async () => {
     const result = await testWorkerConnection('user-1', 'worker-1')
     expect(h.decryptSpy).toHaveBeenCalledWith('enc:secret')
-    expect(h.fakeDriver.testConnection).toHaveBeenCalledWith({
-      endpointUrl: 'https://relay.example.workers.dev',
-      authType: 'hmac',
-      secret: 'enc:secret',
-    })
+    expect(h.fakeDriver.testConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        endpointUrl: 'https://relay.example.workers.dev',
+        authType: 'hmac',
+        secret: 'enc:secret',
+      }),
+    )
     expect(result).toMatchObject({ status: 'healthy' })
     const updateData = h.prismaMock.remoteFetchWorker.update.mock.calls[0][0].data
     expect(updateData).toMatchObject({ status: 'healthy', lastErrorCode: null, lastFailedAt: null })

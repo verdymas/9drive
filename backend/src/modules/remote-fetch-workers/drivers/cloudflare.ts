@@ -14,7 +14,19 @@ import type {
   WorkerDriverMetadata,
 } from '../types.js'
 import { REMOTE_FETCH_WORKER_ERROR_CODES, REMOTE_FETCH_WORKER_ERROR_MESSAGES } from '../errors.js'
-import { RELAY_MODULE_NAME, RELAY_SECRET_BINDING, RELAY_COMPATIBILITY_DATE, buildCloudflareRelay, validateRelaySource, relaySourceSha256 } from './cloudflare-relay.js'
+import {
+  RELAY_MODULE_NAME,
+  RELAY_SECRET_BINDING,
+  RELAY_COMPATIBILITY_DATE,
+  RELAY_MODULE_CONTENT_TYPE,
+  buildCloudflareRelay,
+  buildCloudflareRelayWithoutSecret,
+  validateRelaySource,
+  relaySourceSha256,
+  dumpRelayArtifacts as dumpRelayArtifactsToDisk,
+} from './cloudflare-relay.js'
+import { CloudflareRemoteFetchTransport } from '../transports/cloudflare-transport.js'
+import { RELAY_PROTOCOL_VERSION as CANONICAL_RELAY_PROTOCOL_VERSION } from '../relay-protocol.js'
 
 /**
  * Cloudflare Worker relay driver.
@@ -29,7 +41,8 @@ import { RELAY_MODULE_NAME, RELAY_SECRET_BINDING, RELAY_COMPATIBILITY_DATE, buil
 
 /** Relay protocol identity the health endpoint must report. */
 export const RELAY_SERVICE_IDENTITY = '9drive-relay'
-export const RELAY_PROTOCOL_VERSION = '9drive-relay-v1'
+// Canonical protocol version — single source of truth is relay-protocol.ts
+export const RELAY_PROTOCOL_VERSION = CANONICAL_RELAY_PROTOCOL_VERSION
 
 /** Cloudflare binding name that carries the relay secret to the deployed script. */
 export { RELAY_SECRET_BINDING }
@@ -47,6 +60,116 @@ const registrationSchema = z.object({
   apiToken: z.string().min(1).max(256),
   workerName: z.string().regex(WORKER_NAME_PATTERN, 'Worker Name must be 1-63 characters: letters, digits, _ or -.'),
 })
+
+/** Workers.dev account subdomain rules: 1-63 chars, lower alphanum and hyphen, cannot start/end with hyphen. */
+export const WORKERS_SUBDOMAIN_PATTERN = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/
+const ACCOUNT_SUBDOMAIN_MAX = 63
+
+/** Deterministic candidate for accounts lacking a workers.dev subdomain. Avoids exposing raw accountId. */
+export function generateCandidateSubdomain(accountId: string): string {
+  const hash = crypto.createHash('sha256').update(accountId, 'utf8').digest('hex').slice(0, 8).toLowerCase()
+  const candidate = `9drive-${hash}`
+  // Ensure candidate respects pattern and length (always does: 9drive- + 8 hex)
+  if (!WORKERS_SUBDOMAIN_PATTERN.test(candidate) || candidate.length > ACCOUNT_SUBDOMAIN_MAX) {
+    // Fallback: short random suffix if hash edge-case fails (should never happen)
+    return `9drive-${crypto.randomUUID().slice(0, 8).toLowerCase().replace(/[^a-z0-9]/g, 'a')}`
+  }
+  return candidate
+}
+
+export function isValidWorkersSubdomain(subdomain: string): boolean {
+  return WORKERS_SUBDOMAIN_PATTERN.test(subdomain) && subdomain.length >= 1 && subdomain.length <= ACCOUNT_SUBDOMAIN_MAX
+}
+
+// Zod schemas for robust Cloudflare response parsing
+const scriptSubdomainStateSchema = z.object({
+  success: z.boolean().optional(),
+  result: z
+    .object({
+      enabled: z.boolean(),
+      previews_enabled: z.boolean().optional(),
+    })
+    .optional()
+    .nullable(),
+  errors: z.array(z.object({ code: z.number().optional(), message: z.string().optional() })).optional(),
+})
+
+const accountSubdomainResponseSchema = z.object({
+  success: z.boolean().optional(),
+  result: z
+    .object({
+      subdomain: z.string().optional().nullable(),
+    })
+    .optional()
+    .nullable(),
+  errors: z.array(z.object({ code: z.number().optional(), message: z.string().optional() })).optional(),
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// Correlation + staged logging
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Generate a short correlationId for one provisioning attempt. */
+export function generateCorrelationId(): string {
+  return crypto.randomUUID().slice(0, 8)
+}
+
+function logStage(correlationId: string, step: string, status: 'started' | 'success' | 'failure', extra?: string) {
+  const suffix = extra ? ` ${extra}` : ''
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=${step} ${status}${suffix}`)
+}
+
+function logStepStarted(correlationId: string, step: string, extra?: string) {
+  logStage(correlationId, step, 'started', extra)
+}
+function logStepSuccess(correlationId: string, step: string, extra?: string) {
+  logStage(correlationId, step, 'success', extra)
+}
+function logStepFailure(correlationId: string, step: string, extra?: string) {
+  console.error(`[worker:cloudflare] correlationId=${correlationId} step=${step} failure${extra ? ` ${extra}` : ''}`)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Typed provisioning error preserving provider diagnostics
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Typed error preserving full provider diagnostics. Public API still returns
+ * WORKER_PROVISION_FAILED with a generic message + correlationId, but backend
+ * logs MUST preserve driver/step/HTTP status/provider code/message.
+ */
+export class WorkerProvisionError extends AppError {
+  driver: string
+  step: string
+  providerStatus: number | null
+  providerCode: number | null
+  providerMessage: string | null
+  correlationId: string
+  cause?: unknown
+
+  constructor(opts: {
+    driver?: string
+    step: string
+    providerStatus?: number | null
+    providerCode?: number | null
+    providerMessage?: string | null
+    correlationId: string
+    code?: string
+    message?: string
+    cause?: unknown
+  }) {
+    const code = opts.code ?? REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_FAILED
+    const message = opts.message ?? REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROVISION_FAILED
+    super(code, message, 400)
+    this.driver = opts.driver ?? 'cloudflare'
+    this.step = opts.step
+    this.providerStatus = opts.providerStatus ?? null
+    this.providerCode = opts.providerCode ?? null
+    this.providerMessage = opts.providerMessage ?? null
+    this.correlationId = opts.correlationId
+    this.cause = opts.cause
+  }
+}
 
 /**
  * Build the HMAC-SHA256 signature header value for a health probe.
@@ -175,10 +298,20 @@ function apiTimeout() {
  * (when present in the body) is safe to surface — it is just an integer that
  * Cloudflare documents publicly, never sensitive request data.
  */
-function parseCfErrorCode(bodyText: string): number | null {
+export function parseCfErrorCode(bodyText: string): number | null {
   try {
     const parsed = JSON.parse(bodyText) as { errors?: Array<{ code?: number }> }
     return parsed.errors?.[0]?.code ?? null
+  } catch {
+    return null
+  }
+}
+
+export function parseCfErrorMessage(bodyText: string): string | null {
+  try {
+    const parsed = JSON.parse(bodyText) as { errors?: Array<{ message?: string }> }
+    const msg = parsed.errors?.[0]?.message
+    return typeof msg === 'string' && msg.length > 0 ? msg : null
   } catch {
     return null
   }
@@ -207,25 +340,21 @@ function safeCfReason(bodyText: string): string | null {
 }
 
 /** A Cloudflare API failure with enough non-sensitive detail to act on. */
-export class CloudflareApiError extends AppError {
-  /** Which provisioning step failed: token_verify | upload | subdomain | delete. */
-  step: string
-  /** Safe numeric Cloudflare error code, or null. Never the provider message. */
-  cfCode: number | null
-  httpStatus: number
+export class CloudflareApiError extends WorkerProvisionError {
   /** Short safe description for diagnosis (e.g. "script content invalid").
    * Stripped of anything that could echo request data. */
   reason: string | null
 
-  constructor(step: string, httpStatus: number, cfCode: number | null, reason: string | null) {
-    super(
-      REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_FAILED,
-      `The relay could not be provisioned by the provider. (step: ${step})${cfCode !== null ? ` (Cloudflare error ${cfCode})` : ''}${reason ? ` — ${reason}` : ''}`,
-      400,
-    )
-    this.step = step
-    this.cfCode = cfCode
-    this.httpStatus = httpStatus
+  constructor(step: string, httpStatus: number, cfCode: number | null, reason: string | null, correlationId: string) {
+    super({
+      driver: 'cloudflare',
+      step,
+      providerStatus: httpStatus,
+      providerCode: cfCode,
+      providerMessage: reason,
+      correlationId,
+      message: `The relay could not be provisioned by the provider. (step: ${step})${cfCode !== null ? ` (Cloudflare error ${cfCode})` : ''}${reason ? ` — ${reason}` : ''} correlationId=${correlationId}`,
+    })
     this.reason = reason
   }
 }
@@ -236,28 +365,62 @@ export class CloudflareApiError extends AppError {
  * message ever reach the caller. The numeric CF error code (when present) is
  * safe: surfaced as `Cloudflare error <n>` (e.g. 10053 = script already exists).
  */
-export function mapCloudflareApiError(step: string, status: number, bodyText: string): AppError {
+export function mapCloudflareApiError(step: string, status: number, bodyText: string, correlationId = 'unknown'): AppError {
   if (status === 401 || status === 403) {
-    return new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_CREDENTIAL_INVALID, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_CREDENTIAL_INVALID, 400)
+    return new WorkerProvisionError({
+      driver: 'cloudflare',
+      step,
+      providerStatus: status,
+      providerCode: parseCfErrorCode(bodyText),
+      providerMessage: safeCfReason(bodyText),
+      correlationId,
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_CREDENTIAL_INVALID,
+      message: REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_CREDENTIAL_INVALID + ` (correlationId=${correlationId})`,
+    })
   }
   if (status === 409) {
-    return new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_CONFLICT, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROVISION_CONFLICT, 400)
+    return new WorkerProvisionError({
+      driver: 'cloudflare',
+      step,
+      providerStatus: status,
+      providerCode: parseCfErrorCode(bodyText),
+      providerMessage: safeCfReason(bodyText),
+      correlationId,
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_CONFLICT,
+      message: REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROVISION_CONFLICT + ` (correlationId=${correlationId})`,
+    })
   }
   // CF error codes for an already-existing script (from a 400 too — the API
   // returns 400 with code 10053 rather than 409 for duplicate names).
   if (status === 400) {
     const code = parseCfErrorCode(bodyText)
     if (code === 10053 || code === 10058 || code === 11005) {
-      return new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_CONFLICT, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROVISION_CONFLICT, 400)
+      return new WorkerProvisionError({
+        driver: 'cloudflare',
+        step,
+        providerStatus: status,
+        providerCode: code,
+        providerMessage: safeCfReason(bodyText),
+        correlationId,
+        code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_CONFLICT,
+        message: REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROVISION_CONFLICT + ` (correlationId=${correlationId})`,
+      })
     }
   }
-  return new CloudflareApiError(step, status, parseCfErrorCode(bodyText), safeCfReason(bodyText))
+  return new CloudflareApiError(step, status, parseCfErrorCode(bodyText), safeCfReason(bodyText), correlationId)
 }
 
-async function cloudflareApi(path: string, options: { method?: string; apiToken: string; body?: BodyInit | null; contentType?: string }): Promise<{ status: number; bodyText: string }> {
+async function cloudflareApi(
+  path: string,
+  options: { method?: string; apiToken: string; body?: BodyInit | null; contentType?: string; correlationId?: string; step?: string },
+): Promise<{ status: number; bodyText: string }> {
+  const correlationId = options.correlationId ?? 'unknown'
+  const step = options.step ?? 'unknown'
+  const url = `${apiBase()}${path}`
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=${step} request_started ${options.method ?? 'GET'} ${path}`)
   let response: Response
   try {
-    response = await fetch(`${apiBase()}${path}`, {
+    response = await fetch(url, {
       method: options.method ?? 'GET',
       headers: {
         authorization: `Bearer ${options.apiToken}`,
@@ -270,18 +433,109 @@ async function cloudflareApi(path: string, options: { method?: string; apiToken:
       signal: AbortSignal.timeout(apiTimeout()),
     })
   } catch (error) {
+    console.error(`[worker:cloudflare] correlationId=${correlationId} step=${step} transport_error ${String((error as Error)?.message ?? error)}`)
     throw mapFetchFailure(error)
   }
   const bodyText = await response.text()
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=${step} response_received status=${response.status}`)
+  const cfCode = parseCfErrorCode(bodyText)
+  const cfMsg = safeCfReason(bodyText)
+  if (response.status >= 300) {
+    console.error(
+      `[worker:cloudflare] correlationId=${correlationId} step=${step} rejected providerCode=${cfCode ?? 'null'} providerMessage="${cfMsg ?? 'null'}" httpStatus=${response.status}`,
+    )
+  } else {
+    console.log(`[worker:cloudflare] correlationId=${correlationId} step=${step} success status=${response.status}`)
+  }
   return { status: response.status, bodyText }
 }
 
 /** Verify the API token works at all (GET /user/tokens/verify). Any non-2xx
  * (401 typical, 400 for a malformed token) means the credential is invalid. */
-async function validateApiToken(apiToken: string) {
-  const { status } = await cloudflareApi('/user/tokens/verify', { apiToken })
+async function validateApiToken(apiToken: string, correlationId: string) {
+  logStepStarted(correlationId, 'validate_credentials')
+  const { status, bodyText } = await cloudflareApi('/user/tokens/verify', { apiToken, correlationId, step: 'validate_credentials' })
   if (status >= 300) {
-    throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_CREDENTIAL_INVALID, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_CREDENTIAL_INVALID, 400)
+    logStepFailure(correlationId, 'validate_credentials', `status=${status}`)
+    throw mapCloudflareApiError('validate_credentials', status, bodyText, correlationId)
+  }
+  logStepSuccess(correlationId, 'validate_credentials')
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Relay artifact helpers
+// ────────────────────────────────────────────────────────────────────────────
+
+export interface BuiltRelayArtifact {
+  source: string
+  moduleName: string
+  metadata: string
+  moduleBytes: number
+  moduleSha256: string
+}
+
+/**
+ * Build relay artifact WITHOUT secret (initial upload). Validates locally,
+ * dumps debug artifacts, and returns safe metadata for logging.
+ */
+export async function buildRelayArtifact(correlationId: string): Promise<BuiltRelayArtifact> {
+  logStepStarted(correlationId, 'build_relay')
+  let artifact: BuiltRelayArtifact
+  try {
+    const { source, moduleName, metadata } = buildCloudflareRelayWithoutSecret()
+    const moduleBytes = Buffer.byteLength(source, 'utf8')
+    const moduleSha256 = relaySourceSha256(source)
+    artifact = { source, moduleName, metadata, moduleBytes, moduleSha256 }
+    console.log(
+      `[worker:cloudflare] correlationId=${correlationId} step=build_relay success moduleBytes=${moduleBytes} moduleSha256=${moduleSha256} module=${moduleName} mainModule=${moduleName} contentType=${RELAY_MODULE_CONTENT_TYPE}`,
+    )
+    logStepSuccess(correlationId, 'build_relay', `moduleBytes=${moduleBytes}`)
+  } catch (error) {
+    logStepFailure(correlationId, 'build_relay', String((error as Error)?.message ?? error))
+    if (error instanceof AppError) throw error
+    throw new WorkerProvisionError({
+      step: 'build_relay',
+      correlationId,
+      providerMessage: String((error as Error)?.message ?? error),
+    })
+  }
+  // Dump artifacts (non-production only)
+  await dumpRelayStage(artifact.source, artifact.metadata, correlationId)
+  // Preflight validation
+  await preflightRelay(artifact.source, correlationId)
+  return artifact
+}
+
+/**
+ * Build relay artifact WITH secret (for configure_secret step). The source is
+ * identical — secret travels only in metadata bindings.
+ */
+export function buildRelayArtifactWithSecret(relaySecret: string): BuiltRelayArtifact {
+  const { source, moduleName, metadata } = buildCloudflareRelay(relaySecret)
+  const moduleBytes = Buffer.byteLength(source, 'utf8')
+  const moduleSha256 = relaySourceSha256(source)
+  return { source, moduleName, metadata, moduleBytes, moduleSha256 }
+}
+
+async function dumpRelayStage(source: string, metadata: string, correlationId: string): Promise<void> {
+  logStepStarted(correlationId, 'dump_artifacts')
+  try {
+    await dumpRelayArtifactsToDisk(source, metadata)
+    logStepSuccess(correlationId, 'dump_artifacts')
+  } catch (error) {
+    logStepFailure(correlationId, 'dump_artifacts', String((error as Error)?.message ?? error))
+    // Dump failures are non-fatal (the artifact is still valid); log only.
+  }
+}
+
+async function preflightRelay(source: string, correlationId: string): Promise<void> {
+  logStepStarted(correlationId, 'preflight_relay')
+  try {
+    await validateRelaySource(source)
+    logStepSuccess(correlationId, 'preflight_relay')
+  } catch (error) {
+    logStepFailure(correlationId, 'preflight_relay', String((error as Error)?.message ?? error))
+    throw error
   }
 }
 
@@ -298,82 +552,483 @@ async function validateApiToken(apiToken: string) {
  * Built with native FormData/Blob (not manual string framing) so the runtime
  * generates the multipart container, boundary and per-part framing correctly.
  */
-function multipartScriptUpload(script: string, metadata: string): { body: FormData; contentType: undefined } {
+export function multipartScriptUpload(script: string, metadata: string): { body: FormData; contentType: undefined } {
+  // Assertion: main_module must match the actual part name.
+  const parsed = JSON.parse(metadata) as { main_module?: string }
+  if (parsed.main_module !== RELAY_MODULE_NAME) {
+    throw new AppError(
+      REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_RELAY_BUILD_FAILED,
+      `metadata.main_module must be ${RELAY_MODULE_NAME}`,
+      400,
+    )
+  }
   const form = new FormData()
   const metadataPart = new Blob([metadata], { type: 'application/json' })
-  const modulePart = new Blob([script], { type: 'application/javascript+module' })
+  const modulePart = new Blob([script], { type: RELAY_MODULE_CONTENT_TYPE })
   form.append('metadata', metadataPart)
   form.append(RELAY_MODULE_NAME, modulePart, RELAY_MODULE_NAME)
   return { body: form, contentType: undefined }
 }
 
 /**
- * Upload the relay artifact + its secret binding in ONE multipart PUT (the
- * modern Workers Scripts API): `worker.mjs` module part (identical to
- * metadata.main_module) + `metadata` part (JSON with main_module /
- * compatibility_date / bindings, including the secret_text binding carrying
- * the generated relay secret — never interpolated into the source).
- *
- * Preflight: the canonical relay source is locally parsed (validateRelaySource)
- * before any Cloudflare API request, so a known-invalid artifact fails as
- * WORKER_RELAY_BUILD_FAILED instead of a doomed provider call.
+ * Upload the relay script WITHOUT secret binding. This makes failures
+ * unambiguous: if upload still returns 10021, the problem is module/multipart
+ * not secret binding.
  */
-async function uploadWorkerScript(accountId: string, workerName: string, apiToken: string, relaySecret: string) {
-  const { source, moduleName, metadata } = buildCloudflareRelay(relaySecret)
-  await validateRelaySource(source)
+export async function uploadWorkerScript(
+  accountId: string,
+  workerName: string,
+  apiToken: string,
+  correlationId: string,
+): Promise<void> {
+  logStepStarted(correlationId, 'upload_script')
+  // Build artifact without secret for initial upload
+  const artifact = await buildRelayArtifact(correlationId)
   console.log(
-    `[worker:cloudflare] step=upload worker=${workerName} module=${moduleName} mainModule=${moduleName} ` +
-      `contentType=application/javascript+module moduleBytes=${Buffer.byteLength(source, 'utf8')} ` +
-      `moduleSha256=${relaySourceSha256(source)} compatibilityDate=${RELAY_COMPATIBILITY_DATE} bindings=${RELAY_SECRET_BINDING}`,
+    `[worker:cloudflare] correlationId=${correlationId} step=upload_script worker=${workerName} module=${artifact.moduleName} mainModule=${artifact.moduleName} ` +
+      `contentType=${RELAY_MODULE_CONTENT_TYPE} moduleBytes=${artifact.moduleBytes} ` +
+      `moduleSha256=${artifact.moduleSha256} compatibilityDate=${RELAY_COMPATIBILITY_DATE} bindings=none`,
   )
-  const { body, contentType } = multipartScriptUpload(source, metadata)
+  const { body, contentType } = multipartScriptUpload(artifact.source, artifact.metadata)
   const { status, bodyText } = await cloudflareApi(
     `/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}`,
-    { method: 'PUT', apiToken, body, contentType }
+    { method: 'PUT', apiToken, body, contentType, correlationId, step: 'upload_script' },
   )
   if (status >= 300) {
     const code = parseCfErrorCode(bodyText)
-    console.error(`[worker:cloudflare] step=upload status=${status}${code !== null ? ` cloudflareCode=${code}` : ''}`)
-    throw mapCloudflareApiError('upload', status, bodyText)
+    console.error(`[worker:cloudflare] correlationId=${correlationId} step=upload_script status=${status}${code !== null ? ` cloudflareCode=${code}` : ''}`)
+    logStepFailure(correlationId, 'upload_script', `status=${status} providerCode=${code ?? 'null'}`)
+    throw mapCloudflareApiError('upload_script', status, bodyText, correlationId)
   }
+  logStepSuccess(correlationId, 'upload_script')
 }
 
-/** Discover the deployed workers.dev subdomain for a script. */
-async function getWorkerSubdomain(accountId: string, workerName: string, apiToken: string): Promise<string | null> {
-  const scriptSub = await cloudflareApi(
-    `/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}/subdomain`,
-    { apiToken }
+/**
+ * Configure the relay secret as a secret_text binding via a second multipart
+ * PUT that includes the binding. This is a distinct traceable step after
+ * upload_script so secret-binding issues are isolated from module parse issues.
+ */
+export async function configureRelaySecret(
+  accountId: string,
+  workerName: string,
+  apiToken: string,
+  relaySecret: string,
+  correlationId: string,
+): Promise<void> {
+  logStepStarted(correlationId, 'configure_secret')
+  const artifact = buildRelayArtifactWithSecret(relaySecret)
+  // Re-validate before second upload (cheap, ensures artifact still valid)
+  await validateRelaySource(artifact.source)
+  // Dump the WITH-secret metadata for debugging (bindingNames only, no values)
+  if (process.env.NODE_ENV !== 'production') {
+    // The dump helper already writes module + metadata; for secret step we
+    // ensure the metadata written reflects the WITH-secret binding names.
+    await dumpRelayArtifactsToDisk(artifact.source, artifact.metadata)
+  }
+  console.log(
+    `[worker:cloudflare] correlationId=${correlationId} step=configure_secret worker=${workerName} module=${artifact.moduleName} ` +
+      `bindings=${RELAY_SECRET_BINDING} moduleBytes=${artifact.moduleBytes} sha256=${artifact.moduleSha256}`,
   )
-  if (scriptSub.status >= 300) {
-    const accountSub = await cloudflareApi(`/accounts/${encodeURIComponent(accountId)}/workers/subdomain`, { apiToken })
-    // A 404 here means the account has no workers.dev subdomain provisioned —
-    // which is itself a useful failure to surface rather than a silent null.
-    if (accountSub.status === 404) {
-      throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_FAILED, 'The relay could not be provisioned by the provider. (step: subdomain — no workers.dev subdomain configured for this account)', 400)
+  const { body, contentType } = multipartScriptUpload(artifact.source, artifact.metadata)
+  const { status, bodyText } = await cloudflareApi(
+    `/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}`,
+    { method: 'PUT', apiToken, body, contentType, correlationId, step: 'configure_secret' },
+  )
+  if (status >= 300) {
+    const code = parseCfErrorCode(bodyText)
+    console.error(`[worker:cloudflare] correlationId=${correlationId} step=configure_secret status=${status}${code !== null ? ` cloudflareCode=${code}` : ''}`)
+    logStepFailure(correlationId, 'configure_secret', `status=${status} providerCode=${code ?? 'null'}`)
+    throw mapCloudflareApiError('configure_secret', status, bodyText, correlationId)
+  }
+  logStepSuccess(correlationId, 'configure_secret')
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Explicit endpoint-discovery steps (replaces ambiguous discover_endpoint)
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A. Script-level workers.dev state: GET /accounts/{accountId}/workers/scripts/{workerName}/subdomain
+ * Returns { enabled, previews_enabled } — NEVER the account subdomain string.
+ */
+export async function getScriptSubdomainState(
+  accountId: string,
+  workerName: string,
+  apiToken: string,
+  correlationId: string,
+): Promise<{ enabled: boolean; previews_enabled?: boolean }> {
+  logStepStarted(correlationId, 'get_script_subdomain_state')
+  const { status, bodyText } = await cloudflareApi(`/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}/subdomain`, {
+    apiToken,
+    correlationId,
+    step: 'get_script_subdomain_state',
+  })
+  if (status === 401 || status === 403) {
+    logStepFailure(correlationId, 'get_script_subdomain_state', `status=${status}`)
+    throw mapCloudflareApiError('get_script_subdomain_state', status, bodyText, correlationId)
+  }
+  if (status >= 300) {
+    logStepFailure(correlationId, 'get_script_subdomain_state', `status=${status}`)
+    throw new WorkerProvisionError({
+      step: 'get_script_subdomain_state',
+      correlationId,
+      providerStatus: status,
+      providerCode: parseCfErrorCode(bodyText),
+      providerMessage: safeCfReason(bodyText),
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_SUBDOMAIN_STATE_FAILED,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_SUBDOMAIN_STATE_FAILED} (step: get_script_subdomain_state) correlationId=${correlationId}`,
+    })
+  }
+  // Robust parsing: verify HTTP success, Cloudflare success flag, result shape
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(bodyText)
+  } catch {
+    logStepFailure(correlationId, 'get_script_subdomain_state', 'invalid json')
+    throw new WorkerProvisionError({
+      step: 'get_script_subdomain_state',
+      correlationId,
+      providerStatus: status,
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_SUBDOMAIN_STATE_FAILED,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_SUBDOMAIN_STATE_FAILED} (unexpected provider response) correlationId=${correlationId}`,
+    })
+  }
+  const validation = scriptSubdomainStateSchema.safeParse(parsed)
+  if (!validation.success) {
+    logStepFailure(correlationId, 'get_script_subdomain_state', 'unexpected provider response shape')
+    throw new WorkerProvisionError({
+      step: 'get_script_subdomain_state',
+      correlationId,
+      providerStatus: status,
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_SUBDOMAIN_STATE_FAILED,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_SUBDOMAIN_STATE_FAILED} (unexpected provider response) correlationId=${correlationId}`,
+    })
+  }
+  const data = validation.data
+  if (data.success === false) {
+    logStepFailure(correlationId, 'get_script_subdomain_state', 'provider success=false')
+    throw new WorkerProvisionError({
+      step: 'get_script_subdomain_state',
+      correlationId,
+      providerStatus: status,
+      providerCode: parseCfErrorCode(bodyText),
+      providerMessage: safeCfReason(bodyText),
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_SUBDOMAIN_STATE_FAILED,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_SUBDOMAIN_STATE_FAILED} correlationId=${correlationId}`,
+    })
+  }
+  if (!data.result || typeof data.result.enabled !== 'boolean') {
+    logStepFailure(correlationId, 'get_script_subdomain_state', 'missing enabled field')
+    throw new WorkerProvisionError({
+      step: 'get_script_subdomain_state',
+      correlationId,
+      providerStatus: status,
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_SUBDOMAIN_STATE_FAILED,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_SUBDOMAIN_STATE_FAILED} (missing enabled) correlationId=${correlationId}`,
+    })
+  }
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=get_script_subdomain_state response_received status=${status} enabled=${data.result.enabled}`)
+  logStepSuccess(correlationId, 'get_script_subdomain_state', `enabled=${data.result.enabled}`)
+  return { enabled: data.result.enabled, previews_enabled: data.result.previews_enabled }
+}
+
+/** Enable workers.dev for the deployed script if disabled. */
+export async function enableScriptSubdomain(accountId: string, workerName: string, apiToken: string, correlationId: string): Promise<void> {
+  logStepStarted(correlationId, 'enable_script_subdomain')
+  const body = JSON.stringify({ enabled: true, previews_enabled: false })
+  const { status, bodyText } = await cloudflareApi(`/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}/subdomain`, {
+    method: 'POST',
+    apiToken,
+    body,
+    contentType: 'application/json',
+    correlationId,
+    step: 'enable_script_subdomain',
+  })
+  if (status === 401 || status === 403) {
+    logStepFailure(correlationId, 'enable_script_subdomain', `status=${status}`)
+    throw mapCloudflareApiError('enable_script_subdomain', status, bodyText, correlationId)
+  }
+  if (status >= 300) {
+    logStepFailure(correlationId, 'enable_script_subdomain', `status=${status}`)
+    throw new WorkerProvisionError({
+      step: 'enable_script_subdomain',
+      correlationId,
+      providerStatus: status,
+      providerCode: parseCfErrorCode(bodyText),
+      providerMessage: safeCfReason(bodyText),
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_SUBDOMAIN_ENABLE_FAILED,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_SUBDOMAIN_ENABLE_FAILED} (step: enable_script_subdomain) correlationId=${correlationId}`,
+    })
+  }
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=enable_script_subdomain response_received status=${status} enabled=true`)
+  logStepSuccess(correlationId, 'enable_script_subdomain')
+}
+
+/**
+ * B. Account-level workers.dev subdomain: GET /accounts/{accountId}/workers/subdomain
+ * Returns { subdomain: "example-name" } — this is the account workers.dev subdomain.
+ */
+export async function getAccountSubdomain(accountId: string, apiToken: string, correlationId: string): Promise<string | null> {
+  logStepStarted(correlationId, 'get_account_subdomain')
+  const { status, bodyText } = await cloudflareApi(`/accounts/${encodeURIComponent(accountId)}/workers/subdomain`, {
+    apiToken,
+    correlationId,
+    step: 'get_account_subdomain',
+  })
+  // 404 = account has no workers.dev subdomain provisioned — not an error yet, triggers create path
+  if (status === 404) {
+    console.log(`[worker:cloudflare] correlationId=${correlationId} step=get_account_subdomain response_received status=404 hasSubdomain=false`)
+    logStepSuccess(correlationId, 'get_account_subdomain', 'hasSubdomain=false')
+    return null
+  }
+  if (status === 401 || status === 403) {
+    logStepFailure(correlationId, 'get_account_subdomain', `status=${status}`)
+    throw mapCloudflareApiError('get_account_subdomain', status, bodyText, correlationId)
+  }
+  if (status >= 300) {
+    logStepFailure(correlationId, 'get_account_subdomain', `status=${status}`)
+    throw new WorkerProvisionError({
+      step: 'get_account_subdomain',
+      correlationId,
+      providerStatus: status,
+      providerCode: parseCfErrorCode(bodyText),
+      providerMessage: safeCfReason(bodyText),
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND} (step: get_account_subdomain) correlationId=${correlationId}`,
+    })
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(bodyText)
+  } catch {
+    logStepFailure(correlationId, 'get_account_subdomain', 'invalid json')
+    throw new WorkerProvisionError({
+      step: 'get_account_subdomain',
+      correlationId,
+      providerStatus: status,
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND} (unexpected provider response) correlationId=${correlationId}`,
+    })
+  }
+  const validation = accountSubdomainResponseSchema.safeParse(parsed)
+  if (!validation.success) {
+    logStepFailure(correlationId, 'get_account_subdomain', 'unexpected provider response shape')
+    throw new WorkerProvisionError({
+      step: 'get_account_subdomain',
+      correlationId,
+      providerStatus: status,
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND} (unexpected provider response) correlationId=${correlationId}`,
+    })
+  }
+  const data = validation.data
+  if (data.success === false) {
+    // Cloudflare can return success:false with errors array — treat as API error, not missing
+    logStepFailure(correlationId, 'get_account_subdomain', 'provider success=false')
+    throw new WorkerProvisionError({
+      step: 'get_account_subdomain',
+      correlationId,
+      providerStatus: status,
+      providerCode: parseCfErrorCode(bodyText),
+      providerMessage: safeCfReason(bodyText),
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND} correlationId=${correlationId}`,
+    })
+  }
+  const subdomain = data.result?.subdomain ?? null
+  // Distinguish permission error vs missing configuration: 401/403 already handled, so null here is genuine missing
+  if (!subdomain || typeof subdomain !== 'string' || subdomain.trim().length === 0) {
+    console.log(`[worker:cloudflare] correlationId=${correlationId} step=get_account_subdomain response_received status=${status} hasSubdomain=false`)
+    logStepSuccess(correlationId, 'get_account_subdomain', 'hasSubdomain=false')
+    return null
+  }
+  const normalized = subdomain.trim().toLowerCase()
+  if (!isValidWorkersSubdomain(normalized)) {
+    logStepFailure(correlationId, 'get_account_subdomain', `invalid subdomain format subdomain=${normalized}`)
+    throw new WorkerProvisionError({
+      step: 'get_account_subdomain',
+      correlationId,
+      providerStatus: status,
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND} (invalid subdomain) correlationId=${correlationId}`,
+    })
+  }
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=get_account_subdomain response_received status=${status} hasSubdomain=true`)
+  logStepSuccess(correlationId, 'get_account_subdomain', 'hasSubdomain=true')
+  return normalized
+}
+
+/** Create account workers.dev subdomain via PUT: only if genuinely absent, never overwrites existing. */
+export async function createAccountSubdomain(accountId: string, apiToken: string, correlationId: string, candidate?: string): Promise<string> {
+  const subdomainCandidate = (candidate ?? generateCandidateSubdomain(accountId)).toLowerCase()
+  if (!isValidWorkersSubdomain(subdomainCandidate)) {
+    throw new WorkerProvisionError({
+      step: 'create_account_subdomain',
+      correlationId,
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ACCOUNT_SUBDOMAIN_CREATE_FAILED,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_ACCOUNT_SUBDOMAIN_CREATE_FAILED} (invalid candidate) correlationId=${correlationId}`,
+    })
+  }
+  logStepStarted(correlationId, 'create_account_subdomain', `candidate=${subdomainCandidate}`)
+  const body = JSON.stringify({ subdomain: subdomainCandidate })
+  const { status, bodyText } = await cloudflareApi(`/accounts/${encodeURIComponent(accountId)}/workers/subdomain`, {
+    method: 'PUT',
+    apiToken,
+    body,
+    contentType: 'application/json',
+    correlationId,
+    step: 'create_account_subdomain',
+  })
+  if (status === 401 || status === 403) {
+    logStepFailure(correlationId, 'create_account_subdomain', `status=${status}`)
+    throw mapCloudflareApiError('create_account_subdomain', status, bodyText, correlationId)
+  }
+  if (status === 409) {
+    logStepFailure(correlationId, 'create_account_subdomain', `conflict status=409`)
+    throw new WorkerProvisionError({
+      step: 'create_account_subdomain',
+      correlationId,
+      providerStatus: status,
+      providerCode: parseCfErrorCode(bodyText),
+      providerMessage: safeCfReason(bodyText),
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ACCOUNT_SUBDOMAIN_CREATE_FAILED,
+      message: `The workers.dev subdomain name is already taken or the account subdomain already exists. Please configure a subdomain manually in the Cloudflare dashboard. (correlationId=${correlationId})`,
+    })
+  }
+  if (status >= 300) {
+    logStepFailure(correlationId, 'create_account_subdomain', `status=${status}`)
+    throw new WorkerProvisionError({
+      step: 'create_account_subdomain',
+      correlationId,
+      providerStatus: status,
+      providerCode: parseCfErrorCode(bodyText),
+      providerMessage: safeCfReason(bodyText),
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ACCOUNT_SUBDOMAIN_CREATE_FAILED,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_ACCOUNT_SUBDOMAIN_CREATE_FAILED} (step: create_account_subdomain) correlationId=${correlationId}`,
+    })
+  }
+  // Verify response contains the created subdomain
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(bodyText)
+  } catch {
+    // If body not JSON but status 2xx, assume candidate was accepted
+    console.log(`[worker:cloudflare] correlationId=${correlationId} step=create_account_subdomain response_received status=${status} subdomain=${subdomainCandidate}`)
+    logStepSuccess(correlationId, 'create_account_subdomain', `subdomain=${subdomainCandidate}`)
+    return subdomainCandidate
+  }
+  const validation = accountSubdomainResponseSchema.safeParse(parsed)
+  const created = validation.success ? (validation.data.result?.subdomain ?? subdomainCandidate) : subdomainCandidate
+  const normalized = String(created).toLowerCase()
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=create_account_subdomain response_received status=${status} subdomain=${normalized}`)
+  logStepSuccess(correlationId, 'create_account_subdomain', `subdomain=${normalized}`)
+  return normalized
+}
+
+/** Build endpoint only after both prerequisites are valid. */
+export function buildEndpointUrl(workerName: string, accountSubdomain: string, correlationId: string): string {
+  logStepStarted(correlationId, 'build_endpoint')
+  if (!workerName || !accountSubdomain) {
+    logStepFailure(correlationId, 'build_endpoint', 'missing workerName or subdomain')
+    throw new WorkerProvisionError({
+      step: 'build_endpoint',
+      correlationId,
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ENDPOINT_BUILD_FAILED,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_ENDPOINT_BUILD_FAILED} correlationId=${correlationId}`,
+    })
+  }
+  const normalizedWorker = workerName.toLowerCase()
+  const normalizedSub = accountSubdomain.toLowerCase()
+  if (!isValidWorkersSubdomain(normalizedSub)) {
+    logStepFailure(correlationId, 'build_endpoint', `invalid subdomain subdomain=${normalizedSub}`)
+    throw new WorkerProvisionError({
+      step: 'build_endpoint',
+      correlationId,
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ENDPOINT_BUILD_FAILED,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_ENDPOINT_BUILD_FAILED} (invalid subdomain) correlationId=${correlationId}`,
+    })
+  }
+  const endpointUrl = `https://${normalizedWorker}.${normalizedSub}.workers.dev`
+  let normalized: string
+  try {
+    normalized = normalizeEndpointUrl(endpointUrl)
+  } catch (error) {
+    logStepFailure(correlationId, 'build_endpoint', String((error as Error)?.message ?? error))
+    throw new WorkerProvisionError({
+      step: 'build_endpoint',
+      correlationId,
+      code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ENDPOINT_BUILD_FAILED,
+      message: `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_ENDPOINT_BUILD_FAILED} (invalid endpoint) correlationId=${correlationId}`,
+      cause: error,
+    })
+  }
+  console.log(`[worker:cloudflare] correlationId=${correlationId} step=build_endpoint success host=${new URL(normalized).host}`)
+  logStepSuccess(correlationId, 'build_endpoint', `host=${new URL(normalized).host}`)
+  return normalized
+}
+
+/**
+ * Discover the deployed workers.dev subdomain — legacy wrapper.
+ * Uses correct separation: script state + account subdomain.
+ * Kept for backward compat; new code should call explicit steps.
+ */
+export async function discoverEndpoint(accountId: string, workerName: string, apiToken: string, correlationId: string): Promise<string | null> {
+  logStepStarted(correlationId, 'discover_endpoint')
+  try {
+    const state = await getScriptSubdomainState(accountId, workerName, apiToken, correlationId)
+    if (!state.enabled) {
+      await enableScriptSubdomain(accountId, workerName, apiToken, correlationId)
+    } else {
+      console.log(`[worker:cloudflare] correlationId=${correlationId} step=enable_script_subdomain skipped enabled=true`)
     }
-    if (accountSub.status >= 300) return null
-    try {
-      const parsed = JSON.parse(accountSub.bodyText) as { result?: { subdomain?: string } }
-      return parsed.result?.subdomain ?? null
-    } catch {
+    let accountSubdomain = await getAccountSubdomain(accountId, apiToken, correlationId)
+    if (!accountSubdomain) {
+      try {
+        accountSubdomain = await createAccountSubdomain(accountId, apiToken, correlationId)
+      } catch (createErr) {
+        // If creation fails due to permission, surface actionable error rather than generic null
+        if (createErr instanceof WorkerProvisionError && (createErr.providerStatus === 401 || createErr.providerStatus === 403)) {
+          throw new WorkerProvisionError({
+            step: 'discover_endpoint',
+            correlationId,
+            providerStatus: createErr.providerStatus,
+            providerCode: createErr.providerCode,
+            providerMessage: createErr.providerMessage,
+            code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ACCOUNT_SUBDOMAIN_CREATE_FAILED,
+            message: `The workers.dev subdomain is not configured and automatic creation is not permitted. Please create a workers.dev subdomain manually in the Cloudflare dashboard. (correlationId=${correlationId})`,
+            cause: createErr,
+          })
+        }
+        throw createErr
+      }
+    }
+    if (!accountSubdomain) {
+      logStepFailure(correlationId, 'discover_endpoint', 'subdomain null')
       return null
     }
-  }
-  try {
-    const parsed = JSON.parse(scriptSub.bodyText) as { result?: { subdomain?: string } }
-    return parsed.result?.subdomain ?? null
-  } catch {
+    const endpointUrl = buildEndpointUrl(workerName, accountSubdomain, correlationId)
+    logStepSuccess(correlationId, 'discover_endpoint', `subdomain=${accountSubdomain}`)
+    return endpointUrl
+  } catch (error) {
+    if (error instanceof WorkerProvisionError) throw error
+    logStepFailure(correlationId, 'discover_endpoint', String((error as Error)?.message ?? error))
     return null
   }
 }
 
 /** Remove the remote script. 404 = already gone = success (idempotent). */
-async function deleteWorkerScript(accountId: string, workerName: string, apiToken: string) {
+async function deleteWorkerScript(accountId: string, workerName: string, apiToken: string, correlationId?: string) {
+  const cid = correlationId ?? 'unknown'
+  logStepStarted(cid, 'cleanup')
   const { status, bodyText } = await cloudflareApi(
     `/accounts/${encodeURIComponent(accountId)}/workers/scripts/${encodeURIComponent(workerName)}`,
-    { method: 'DELETE', apiToken }
+    { method: 'DELETE', apiToken, correlationId: cid, step: 'cleanup' },
   )
-  if (status !== 404 && status >= 300) throw mapCloudflareApiError('delete', status, bodyText)
+  if (status !== 404 && status >= 300) {
+    logStepFailure(cid, 'cleanup', `status=${status}`)
+    throw mapCloudflareApiError('cleanup', status, bodyText, cid)
+  }
+  logStepSuccess(cid, 'cleanup')
 }
 
 function configBlob(config: { accountId: string; workerName: string }, apiToken: string, endpointUrl: string | null | undefined): unknown {
@@ -406,28 +1061,121 @@ function parseConfig(raw: Record<string, string>): { accountId: string; apiToken
 async function validateConfig(input: {
   endpointUrl?: string | null
   config?: Record<string, string> | null
+  correlationId?: string
 }): Promise<{ endpointUrl?: string | null; configEncryptedInput?: unknown }> {
   if (input.endpointUrl) {
     throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_DRIVER_CONFIG_INVALID, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_DRIVER_CONFIG_INVALID + ' Endpoint URL is managed by 9Drive for this service.', 400)
   }
   const { accountId, apiToken, workerName } = parseConfig(input.config ?? {})
-  await validateApiToken(apiToken)
+  const correlationId = input.correlationId ?? generateCorrelationId()
+  await validateApiToken(apiToken, correlationId)
   return { endpointUrl: null, configEncryptedInput: configBlob({ accountId, workerName }, apiToken, null) }
 }
 
-/** Provision: deploy relay script (+ secret binding) → discover endpoint. */
+/**
+ * Provision: deploy relay script → configure secret → discover endpoint.
+ * Explicit staged sequence for traceability.
+ */
 async function provision(input: WorkerProvisionInput): Promise<WorkerProvisionResult> {
+  const correlationId = input.correlationId ?? generateCorrelationId()
+  console.log(`[worker:cloudflare] correlationId=${correlationId} provision started worker=${input.config.workerName}`)
   const { accountId, apiToken, workerName } = parseConfig(input.config)
-  await uploadWorkerScript(accountId, workerName, apiToken, input.secret)
-  const subdomain = await getWorkerSubdomain(accountId, workerName, apiToken)
-  if (!subdomain) {
-    throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROVISION_FAILED, 400)
-  }
-  const endpointUrl = `https://${workerName}.${subdomain}.workers.dev`
-  return {
-    endpointUrl,
-    protocolVersion: RELAY_PROTOCOL_VERSION,
-    configEncryptedInput: configBlob({ accountId, workerName }, apiToken, endpointUrl),
+  try {
+    // Stage: validate_credentials (token already validated in service, but re-validate for standalone calls)
+    logStepStarted(correlationId, 'validate_credentials')
+    await validateApiToken(apiToken, correlationId)
+    logStepSuccess(correlationId, 'validate_credentials')
+
+    // Stage: upload_script (includes build_relay + preflight_relay + dump)
+    await uploadWorkerScript(accountId, workerName, apiToken, correlationId)
+
+    // Stage: configure_secret (distinct)
+    await configureRelaySecret(accountId, workerName, apiToken, input.secret, correlationId)
+
+    // Stage: get_script_subdomain_state → enable_script_subdomain
+    const scriptState = await getScriptSubdomainState(accountId, workerName, apiToken, correlationId)
+    if (!scriptState.enabled) {
+      await enableScriptSubdomain(accountId, workerName, apiToken, correlationId)
+    } else {
+      console.log(`[worker:cloudflare] correlationId=${correlationId} step=enable_script_subdomain skipped enabled=true`)
+    }
+
+    // Stage: get_account_subdomain → create_account_subdomain if needed
+    let accountSubdomain = await getAccountSubdomain(accountId, apiToken, correlationId)
+    if (!accountSubdomain) {
+      try {
+        accountSubdomain = await createAccountSubdomain(accountId, apiToken, correlationId)
+      } catch (createErr) {
+        if (createErr instanceof WorkerProvisionError && (createErr.providerStatus === 401 || createErr.providerStatus === 403)) {
+          throw new WorkerProvisionError({
+            step: 'create_account_subdomain',
+            correlationId,
+            providerStatus: createErr.providerStatus,
+            providerCode: createErr.providerCode,
+            providerMessage: createErr.providerMessage,
+            code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ACCOUNT_SUBDOMAIN_CREATE_FAILED,
+            message: `The workers.dev subdomain is not configured for this account and the API token lacks permission to create it. Please create a workers.dev subdomain manually in the Cloudflare dashboard, or use a token with Account Settings edit permission. (correlationId=${correlationId})`,
+            cause: createErr,
+          })
+        }
+        throw createErr
+      }
+    } else {
+      console.log(`[worker:cloudflare] correlationId=${correlationId} step=create_account_subdomain skipped exists=true subdomain=${accountSubdomain}`)
+    }
+
+    if (!accountSubdomain) {
+      logStepFailure(correlationId, 'get_account_subdomain', 'subdomain null after create attempt')
+      throw new WorkerProvisionError({
+        step: 'get_account_subdomain',
+        correlationId,
+        code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND,
+        message: `No workers.dev subdomain is configured for this account. Please enable workers.dev in the Cloudflare dashboard (correlationId=${correlationId})`,
+      })
+    }
+
+    // Stage: build_endpoint
+    const endpointUrl = buildEndpointUrl(workerName, accountSubdomain, correlationId)
+    logStepSuccess(correlationId, 'persist_worker', `endpoint=${endpointUrl}`)
+    console.log(`[worker:cloudflare] correlationId=${correlationId} provision success endpoint=${endpointUrl}`)
+    return {
+      endpointUrl,
+      protocolVersion: RELAY_PROTOCOL_VERSION,
+      configEncryptedInput: configBlob({ accountId, workerName }, apiToken, endpointUrl),
+    }
+  } catch (error) {
+    const safeCode = error instanceof AppError ? error.code : REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_FAILED
+    const safeMessage = error instanceof AppError ? error.message : REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROVISION_FAILED
+    const providerStatus = error instanceof WorkerProvisionError ? error.providerStatus : null
+    const providerCode = error instanceof WorkerProvisionError ? error.providerCode : parseCfErrorCode(String((error as Error)?.message ?? ''))
+    const step = error instanceof WorkerProvisionError ? error.step : 'provision'
+    console.error(
+      `[worker:cloudflare] correlationId=${correlationId} provision failed step=${step} httpStatus=${providerStatus ?? 'null'} providerCode=${providerCode ?? 'null'} providerMessage="${safeMessage}" correlationId=${correlationId}`,
+    )
+    // Enrich error with correlationId if not already
+    if (error instanceof WorkerProvisionError) {
+      throw error
+    }
+    if (error instanceof AppError) {
+      // Preserve original code but wrap with correlation and step
+      throw new WorkerProvisionError({
+        step,
+        correlationId,
+        providerStatus,
+        providerCode,
+        providerMessage: safeMessage,
+        code: safeCode,
+        message: safeMessage + ` (correlationId=${correlationId})`,
+        cause: error,
+      })
+    }
+    throw new WorkerProvisionError({
+      step: 'provision',
+      correlationId,
+      providerMessage: safeMessage,
+      message: `The relay could not be provisioned by the provider. (correlationId=${correlationId})`,
+      cause: error,
+    })
   }
 }
 
@@ -439,6 +1187,7 @@ async function provision(input: WorkerProvisionInput): Promise<WorkerProvisionRe
  * - apiToken-only change → nothing to redeploy (token is API-only).
  */
 async function update(input: WorkerUpdateInput): Promise<WorkerUpdateResult> {
+  const correlationId = input.correlationId ?? generateCorrelationId()
   const newConfig = parseConfig({ ...input.storedConfig, ...input.config })
   const stored = parseConfig(input.storedConfig)
   const accountChanged = newConfig.accountId !== stored.accountId
@@ -447,21 +1196,55 @@ async function update(input: WorkerUpdateInput): Promise<WorkerUpdateResult> {
   const effectiveWorkerName = nameChanged ? newConfig.workerName : stored.workerName
 
   if (nameChanged) {
-    await uploadWorkerScript(newConfig.accountId, newConfig.workerName, newConfig.apiToken, input.secret)
+    await uploadWorkerScript(newConfig.accountId, newConfig.workerName, newConfig.apiToken, correlationId)
+    await configureRelaySecret(newConfig.accountId, newConfig.workerName, newConfig.apiToken, input.secret, correlationId)
   } else if (accountChanged) {
-    await uploadWorkerScript(effectiveAccountId, effectiveWorkerName, newConfig.apiToken, input.secret)
+    await uploadWorkerScript(effectiveAccountId, effectiveWorkerName, newConfig.apiToken, correlationId)
+    await configureRelaySecret(effectiveAccountId, effectiveWorkerName, newConfig.apiToken, input.secret, correlationId)
   }
 
   if (nameChanged || accountChanged) {
-    const subdomain = await getWorkerSubdomain(effectiveAccountId, effectiveWorkerName, newConfig.apiToken)
-    if (!subdomain) {
-      throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROVISION_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROVISION_FAILED, 400)
+    const scriptState = await getScriptSubdomainState(effectiveAccountId, effectiveWorkerName, newConfig.apiToken, correlationId)
+    if (!scriptState.enabled) {
+      await enableScriptSubdomain(effectiveAccountId, effectiveWorkerName, newConfig.apiToken, correlationId)
+    } else {
+      console.log(`[worker:cloudflare] correlationId=${correlationId} step=enable_script_subdomain skipped enabled=true`)
     }
-    const endpointUrl = `https://${effectiveWorkerName}.${subdomain}.workers.dev`
+    let accountSubdomain = await getAccountSubdomain(effectiveAccountId, newConfig.apiToken, correlationId)
+    if (!accountSubdomain) {
+      try {
+        accountSubdomain = await createAccountSubdomain(effectiveAccountId, newConfig.apiToken, correlationId)
+      } catch (createErr) {
+        if (createErr instanceof WorkerProvisionError && (createErr.providerStatus === 401 || createErr.providerStatus === 403)) {
+          throw new WorkerProvisionError({
+            step: 'create_account_subdomain',
+            correlationId,
+            providerStatus: createErr.providerStatus,
+            providerCode: createErr.providerCode,
+            providerMessage: createErr.providerMessage,
+            code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ACCOUNT_SUBDOMAIN_CREATE_FAILED,
+            message: `The workers.dev subdomain is not configured and automatic creation is not permitted. Please create a workers.dev subdomain manually in the Cloudflare dashboard. (correlationId=${correlationId})`,
+            cause: createErr,
+          })
+        }
+        throw createErr
+      }
+    } else {
+      console.log(`[worker:cloudflare] correlationId=${correlationId} step=create_account_subdomain skipped exists=true subdomain=${accountSubdomain}`)
+    }
+    if (!accountSubdomain) {
+      throw new WorkerProvisionError({
+        step: 'get_account_subdomain',
+        correlationId,
+        code: REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_ACCOUNT_SUBDOMAIN_NOT_FOUND,
+        message: `No workers.dev subdomain is configured for this account. Please enable workers.dev in the Cloudflare dashboard (correlationId=${correlationId})`,
+      })
+    }
+    const endpointUrl = buildEndpointUrl(effectiveWorkerName, accountSubdomain, correlationId)
     // Old script cleanup (best-effort; the rename is already live at the new name).
     if (nameChanged && (stored.accountId !== newConfig.accountId || stored.workerName !== newConfig.workerName)) {
       try {
-        await deleteWorkerScript(stored.accountId, stored.workerName, stored.apiToken)
+        await deleteWorkerScript(stored.accountId, stored.workerName, stored.apiToken, correlationId)
       } catch {
         // Old script may be gone or unreachable — the new one is verified.
       }
@@ -480,7 +1263,8 @@ async function update(input: WorkerUpdateInput): Promise<WorkerUpdateResult> {
 /** Remove the remote script. Idempotent (404 = already gone). */
 async function deprovision(input: WorkerDeprovisionInput): Promise<void> {
   const { accountId, apiToken, workerName } = parseConfig(input.config)
-  await deleteWorkerScript(accountId, workerName, apiToken)
+  const correlationId = input.correlationId ?? generateCorrelationId()
+  await deleteWorkerScript(accountId, workerName, apiToken, correlationId)
 }
 
 /** Test connection: GET {endpoint}/health with an HMAC signature. */
@@ -488,7 +1272,10 @@ async function testConnection(input: {
   endpointUrl: string
   authType: RemoteFetchWorkerAuthType
   secret?: string | null
+  correlationId?: string
 }): Promise<WorkerHealthProbe> {
+  const correlationId = input.correlationId ?? generateCorrelationId()
+  logStepStarted(correlationId, 'health_check', `endpoint=${input.endpointUrl}`)
   const endpointUrl = normalizeEndpointUrl(input.endpointUrl)
   const pathWithQuery = '/health'
   const headers: Record<string, string> = { accept: 'application/json' }
@@ -500,28 +1287,41 @@ async function testConnection(input: {
   const timeoutMs = env.WORKER_TEST_TIMEOUT_SECONDS * 1000
   let response: Response
   try {
+    console.log(`[worker:cloudflare] correlationId=${correlationId} step=health_check request_started GET ${endpointUrl}${pathWithQuery}`)
     response = await fetch(endpointUrl + pathWithQuery, {
       method: 'GET',
       headers,
       signal: AbortSignal.timeout(timeoutMs),
       redirect: 'follow',
     })
+    console.log(`[worker:cloudflare] correlationId=${correlationId} step=health_check response_received status=${response.status}`)
   } catch (error) {
+    logStepFailure(correlationId, 'health_check', `transport_error ${String((error as Error)?.message ?? error)}`)
     throw mapFetchFailure(error)
   }
   if (response.status === 401 || response.status === 403) {
+    logStepFailure(correlationId, 'health_check', `auth_failed status=${response.status}`)
     throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_AUTH_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_AUTH_FAILED, 400)
   }
   if (!response.ok) {
+    logStepFailure(correlationId, 'health_check', `unhealthy status=${response.status}`)
     throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_UNHEALTHY, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_UNHEALTHY, 400)
   }
   let body: unknown
   try {
     body = await response.json()
   } catch {
+    logStepFailure(correlationId, 'health_check', 'protocol_invalid json parse')
     throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROTOCOL_INVALID, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROTOCOL_INVALID, 400)
   }
-  return validateHealthPayload(body)
+  try {
+    const probe = validateHealthPayload(body)
+    logStepSuccess(correlationId, 'health_check', `protocol=${probe.protocolVersion ?? 'unknown'}`)
+    return probe
+  } catch (error) {
+    logStepFailure(correlationId, 'health_check', String((error as AppError)?.code ?? error))
+    throw error
+  }
 }
 
 const metadata: WorkerDriverMetadata = {
@@ -556,6 +1356,21 @@ const metadata: WorkerDriverMetadata = {
   ],
 }
 
+function createTransport(worker: { endpointUrl: string; authType: RemoteFetchWorkerAuthType; secretDecrypted?: string | null }): import('../types.js').RemoteFetchTransport {
+  if (worker.authType !== 'hmac') {
+    throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_PROTOCOL_INVALID, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_PROTOCOL_INVALID, 400)
+  }
+  if (!worker.secretDecrypted) {
+    throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_AUTH_FAILED, REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_AUTH_FAILED, 400)
+  }
+  const normalized = normalizeEndpointUrl(worker.endpointUrl)
+  return new CloudflareRemoteFetchTransport({
+    endpointUrl: normalized,
+    secret: worker.secretDecrypted,
+    driver: 'cloudflare',
+  })
+}
+
 export const cloudflareWorkerDriver: RemoteFetchWorkerDriver = {
   key: 'cloudflare',
   displayName: 'Cloudflare Worker',
@@ -564,5 +1379,6 @@ export const cloudflareWorkerDriver: RemoteFetchWorkerDriver = {
   update,
   deprovision,
   testConnection,
+  createTransport,
   getMetadata: () => metadata,
 }

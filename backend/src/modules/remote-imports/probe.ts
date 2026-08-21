@@ -49,6 +49,7 @@ import { validateRemoteUrl } from './ssrf.js'
 import { followRemoteUrl } from './url-downloader.js'
 import { hopHeaderResolver, type RemoteImportRequestContext } from './request-context.js'
 import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './hls/errors.js'
+import { createSecureFetcherForWorkerId, type SecureRemoteFetcher } from './secure-fetcher.js'
 
 export type HlsProbeSummary = {
   sourceType: 'hls_master' | 'hls_media'
@@ -147,14 +148,33 @@ const PROBE_MANIFEST_HEADERS: Record<string, string> = {
  * classification. `requestContext` (user-supplied referer/origin/user-agent/
  * cookie) is applied to every probe request through the centralized policy.
  * Throws `AppError` for validation / SSRF / network failures.
+ *
+ * Transport is resolved generically: workerId null → Direct, else via registry.
+ * The selected transport is used for HEAD, ranged GET and HLS manifest — never
+ * raw `followRemoteUrl` when a fetcher is available.
  */
-export async function probeRemoteUrl(rawUrl: string, correlationId: string, requestContext?: RemoteImportRequestContext): Promise<ProbeResult> {
+export async function probeRemoteUrl(
+  rawUrl: string,
+  correlationId: string,
+  requestContext?: RemoteImportRequestContext,
+  opts: { workerId?: string | null; fetcher?: SecureRemoteFetcher } = {},
+): Promise<ProbeResult> {
   const originalUrl = await validateRemoteUrl(rawUrl)
   const originalUrlHref = originalUrl.href
   const log = (message: string, extra: Record<string, string | number | boolean> = {}) => {
     console.log(
       `[remote-import:probe] ${correlationId} ${message} ${Object.entries(extra).map(([k, v]) => `${k}=${String(v)}`).join(' ')}`.trim(),
     )
+  }
+
+  // Resolve fetcher generically: opts.fetcher wins, else workerId → registry, else Direct
+  let fetcher: SecureRemoteFetcher | null = opts.fetcher ?? null
+  if (!fetcher && opts.workerId !== undefined) {
+    fetcher = await createSecureFetcherForWorkerId(opts.workerId ?? null, { requestContext, sourceUrl: originalUrlHref })
+  }
+  // Fallback to direct fetcher for tests / when no workerId provided and no fetcher supplied
+  if (!fetcher) {
+    fetcher = await createSecureFetcherForWorkerId(null, { requestContext, sourceUrl: originalUrlHref })
   }
 
   // ── Phase 1: HEAD (cheap; most servers answer it). ──────────────────────
@@ -164,17 +184,16 @@ export async function probeRemoteUrl(rawUrl: string, correlationId: string, requ
   let headRedirects = 0
   let headResult: ProbeResult | null = null
   try {
-    const head = await followRemoteUrl(originalUrlHref, {
-      method: 'HEAD',
-      getHopHeaders: hopHeaderResolver(originalUrlHref, requestContext),
-      onResponse: async (res, finalUrl) => {
-        headStatus = res.statusCode
-        return buildProbeResult(originalUrlHref, finalUrl, res, null)
-      },
-    })
-    headRedirects = head.redirectCount
-    headResult = head.result
+    // Use fetcher for HEAD when available; fallback to followRemoteUrl for direct tests that mock ssrf
+    const headRes = await fetcher.fetch({ method: 'HEAD', url: originalUrlHref, requestContext: requestContext as any } as any)
+    headStatus = headRes.status
+    headRedirects = (headRes as any).redirectCount ?? 0
+    const finalUrl = (headRes as any).finalUrl ?? originalUrlHref
+    // HEAD has no body; headers are already lowercased
+    headResult = buildProbeResult(originalUrlHref, finalUrl, { statusCode: headStatus, headers: headRes.headers }, null)
   } catch (headError) {
+    // Fallback: if fetcher fails due to not implemented or network, try direct followRemoteUrl for compatibility with tests that mock ssrf
+    // But we already have a fetcher that should handle direct, so this catch is for error logging
     log('head_failed', { code: headError instanceof AppError ? headError.code : 'network' })
     headResult = null
   }
@@ -187,7 +206,7 @@ export async function probeRemoteUrl(rawUrl: string, correlationId: string, requ
     // A successful HEAD with a server-supplied filename and no HLS hint is a
     // complete probe — no body fetch is needed.
     if (headHasCdFilename && !hlsHint(headResult, null)) {
-      return finalizeProbe(headResult, null, log, requestContext)
+      return finalizeProbe(headResult, null, log, requestContext, fetcher)
     }
   } else {
     log('head_rejected', { status: headStatus, redirects: headRedirects, host: headResult ? hostOf(headResult.finalUrl) : '' })
@@ -195,9 +214,9 @@ export async function probeRemoteUrl(rawUrl: string, correlationId: string, requ
 
   // ── Phase 2: probable HLS? → one bounded manifest GET; else ranged GET. ──
   if (headResult && hlsHint(headResult, null)) {
-    return finalizeProbe(headResult, null, log, requestContext)
+    return finalizeProbe(headResult, null, log, requestContext, fetcher)
   }
-  return getProbe(originalUrlHref, log, requestContext)
+  return getProbe(originalUrlHref, log, requestContext, fetcher)
 }
 
 /** Hostname of a (redacted) URL — the only URL data ever logged. */
@@ -207,6 +226,19 @@ function hostOf(url: string): string {
   } catch {
     return ''
   }
+}
+
+function isManifestTimeoutError(error: unknown): boolean {
+  if (error instanceof AppError) return false
+  const name = error instanceof Error ? error.name : ''
+  return (
+    name.includes('HeadersTimeout') ||
+    name.includes('BodyTimeout') ||
+    name.includes('ConnectTimeout') ||
+    name.includes('Timeout') ||
+    name.includes('SocketError') ||
+    name.includes('UND_ERR')
+  )
 }
 
 /**
@@ -219,31 +251,56 @@ async function getProbe(
   originalUrlHref: string,
   log: (message: string, extra?: Record<string, string | number | boolean>) => void,
   requestContext?: RemoteImportRequestContext,
+  fetcher?: SecureRemoteFetcher | null,
 ): Promise<ProbeResult> {
   let sampledPrefix = ''
   try {
-    const ranged = await followRemoteUrl(originalUrlHref, {
-      method: 'GET',
-      headers: { Range: 'bytes=0-0' },
-      getHopHeaders: hopHeaderResolver(originalUrlHref, requestContext),
-      onResponse: async (res, finalUrl) => {
-        // Servers that ignore the Range and stream a 200 with the whole body
-        // are aborted once we have a small prefix — we only need headers.
-        const bodyError = res.body as { on?: unknown }
-        if (typeof bodyError.on === 'function') {
-          (bodyError as { on: (event: 'error', listener: () => void) => void }).on('error', () => undefined)
-        }
-        const reader = res.body[Symbol.asyncIterator]()
+    let rangedResult: ProbeResult
+    let redirectCount = 0
+    let finalUrlForResult = originalUrlHref
+    if (fetcher) {
+      const res = await fetcher.fetch({ method: 'GET', url: originalUrlHref, range: 'bytes=0-0', headers: { Range: 'bytes=0-0' }, requestContext: requestContext as any } as any)
+      const finalUrl = (res as any).finalUrl ?? originalUrlHref
+      redirectCount = (res as any).redirectCount ?? 0
+      finalUrlForResult = finalUrl
+      // Sample first chunk
+      const body = res.body as AsyncIterable<Uint8Array> | string
+      if (typeof body === 'string') {
+        sampledPrefix = body.slice(0, 8192)
+      } else {
+        const reader = (body as AsyncIterable<Uint8Array>)[Symbol.asyncIterator]()
         const first = await reader.next().catch(() => undefined)
         if (first && !first.done && first.value) {
           sampledPrefix = Buffer.from(first.value).toString('utf8').slice(0, 8192)
         }
-        await reader.return?.().catch(() => undefined)
-        return buildProbeResult(originalUrlHref, finalUrl, res, sampledPrefix)
-      },
-    })
-    log('ranged GET ok', { redirects: ranged.redirectCount })
-    return await finalizeProbe(ranged.result, sampledPrefix, log, requestContext)
+        await (reader as any).return?.().catch(() => undefined)
+      }
+      rangedResult = buildProbeResult(originalUrlHref, finalUrl, { statusCode: res.status, headers: res.headers }, sampledPrefix)
+    } else {
+      const ranged = await followRemoteUrl(originalUrlHref, {
+        method: 'GET',
+        headers: { Range: 'bytes=0-0' },
+        getHopHeaders: hopHeaderResolver(originalUrlHref, requestContext),
+        onResponse: async (res, finalUrl) => {
+          const bodyError = res.body as { on?: unknown }
+          if (typeof bodyError.on === 'function') {
+            (bodyError as { on: (event: 'error', listener: () => void) => void }).on('error', () => undefined)
+          }
+          const reader = res.body[Symbol.asyncIterator]()
+          const first = await reader.next().catch(() => undefined)
+          if (first && !first.done && first.value) {
+            sampledPrefix = Buffer.from(first.value).toString('utf8').slice(0, 8192)
+          }
+          await reader.return?.().catch(() => undefined)
+          return buildProbeResult(originalUrlHref, finalUrl, res, sampledPrefix)
+        },
+      })
+      rangedResult = ranged.result
+      redirectCount = ranged.redirectCount
+      finalUrlForResult = ranged.finalUrl
+    }
+    log('ranged GET ok', { redirects: redirectCount })
+    return await finalizeProbe(rangedResult, sampledPrefix, log, requestContext, fetcher)
   } catch (getError) {
     log('ranged GET rejected', { code: getError instanceof AppError ? getError.code : 'network' })
     if (getError instanceof AppError) throw getError
@@ -303,6 +360,7 @@ async function finalizeProbe(
   sampledPrefix: string | null,
   log: (message: string, extra?: Record<string, string | number | boolean>) => void,
   requestContext?: RemoteImportRequestContext,
+  fetcher?: SecureRemoteFetcher | null,
 ): Promise<ProbeResult> {
   const hint = hlsHint(base, sampledPrefix)
   if (!hint) return base
@@ -313,8 +371,28 @@ async function finalizeProbe(
   // so the probe route returns the normal structured error envelope.
   let fetch: { body: string; finalUrl: string }
   try {
-    fetch = await fetchManifestForProbe(base.sourceUrlForFetch, { requestContext })
+    if (fetcher) {
+      const res = await fetcher.boundedGet(base.sourceUrlForFetch, { requestContext, maxBytes: 1024 * 1024, sourceUrl: base.sourceUrlForFetch })
+      if (res.status >= 400) {
+        // Map status to typed error (mirrors fetchManifestForProbe logic)
+        const hasCtx = Boolean(requestContext)
+        if (hasCtx && (res.status === 401 || res.status === 403)) {
+          throw new AppError(HLS_ERROR_CODES.REMOTE_SOURCE_ACCESS_EXPIRED, HLS_ERROR_MESSAGES.REMOTE_SOURCE_ACCESS_EXPIRED, res.status)
+        }
+        if (res.status === 401) throw new AppError(HLS_ERROR_CODES.REMOTE_SOURCE_AUTHENTICATION_REQUIRED, HLS_ERROR_MESSAGES.REMOTE_SOURCE_AUTHENTICATION_REQUIRED, 401)
+        if (res.status === 403) throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_FORBIDDEN, HLS_ERROR_MESSAGES.HLS_MANIFEST_FORBIDDEN, 403)
+        if (res.status === 404) throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_NOT_FOUND, HLS_ERROR_MESSAGES.HLS_MANIFEST_NOT_FOUND, 404)
+        throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_FETCH_FAILED, HLS_ERROR_MESSAGES.HLS_MANIFEST_FETCH_FAILED, 502)
+      }
+      fetch = { body: res.body, finalUrl: res.finalUrl }
+    } else {
+      fetch = await fetchManifestForProbe(base.sourceUrlForFetch, { requestContext })
+    }
   } catch (manifestError) {
+    if (isManifestTimeoutError(manifestError)) {
+      log('manifest GET rejected', { code: HLS_ERROR_CODES.HLS_MANIFEST_TIMEOUT, host: hostOf(base.finalUrl) })
+      throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_TIMEOUT, HLS_ERROR_MESSAGES.HLS_MANIFEST_TIMEOUT, 504)
+    }
     if (manifestError instanceof AppError) {
       log('manifest GET rejected', { code: manifestError.code, host: hostOf(base.finalUrl) })
       throw manifestError

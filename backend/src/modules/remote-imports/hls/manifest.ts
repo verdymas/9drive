@@ -200,9 +200,31 @@ function contextAwareStatusError(statusCode: number, hasContext: boolean): AppEr
  */
 export async function fetchManifestForProbe(
   url: string,
-  opts: { maxBytes?: number; signal?: AbortSignal; requestContext?: RemoteImportRequestContext } = {},
+  opts: { maxBytes?: number; signal?: AbortSignal; requestContext?: RemoteImportRequestContext; fetcher?: import('../secure-fetcher.js').SecureRemoteFetcher | null } = {},
 ): Promise<{ body: string; finalUrl: string }> {
   const maxBytes = opts.maxBytes ?? env.REMOTE_IMPORT_HLS_MAX_MANIFEST_BYTES
+  if (opts.fetcher) {
+    const res = await opts.fetcher.fetch({ method: 'GET', url, headers: HLS_MANIFEST_PROFILE_HEADERS, requestContext: opts.requestContext as any, maxBytes } as any)
+    if (res.status >= 400) {
+      throw contextAwareStatusError(res.status, Boolean(opts.requestContext))
+    }
+    let body = ''
+    let collected = 0
+    const iterable = typeof res.body === 'string' ? (async function* () { yield Buffer.from(res.body as string) })() : (res.body as AsyncIterable<Uint8Array>)
+    for await (const chunk of iterable) {
+      if (opts.signal?.aborted) {
+        const err = new AppError('ABORTED', 'The import was cancelled.', 499)
+        err.name = 'AbortError'
+        throw err
+      }
+      collected += chunk.byteLength
+      if (collected > maxBytes || body.length > maxBytes) {
+        throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_TOO_LARGE, HLS_ERROR_MESSAGES.HLS_MANIFEST_TOO_LARGE, 413)
+      }
+      body += Buffer.from(chunk as Uint8Array).toString('utf8')
+    }
+    return { body, finalUrl: (res as any).finalUrl ?? url }
+  }
   let collected = 0
   let body = ''
   try {
@@ -265,7 +287,28 @@ export async function fetchManifest(
   url: string,
   maxBytes: number = env.REMOTE_IMPORT_HLS_MAX_MANIFEST_BYTES,
   requestContext?: RemoteImportRequestContext,
+  fetcher?: import('../secure-fetcher.js').SecureRemoteFetcher | null,
 ): Promise<{ body: string; finalUrl: string }> {
+  if (fetcher) {
+    const res = await fetcher.fetch({ method: 'GET', url, requestContext: requestContext as any, maxBytes } as any)
+    if (res.status >= 400) {
+      if (requestContext && (res.status === 401 || res.status === 403)) {
+        throw new AppError(HLS_ERROR_CODES.REMOTE_SOURCE_ACCESS_EXPIRED, HLS_ERROR_MESSAGES.REMOTE_SOURCE_ACCESS_EXPIRED, res.status)
+      }
+      throw new AppError('DOWNLOAD_HTTP_ERROR', `Remote server responded ${res.status}.`, 502)
+    }
+    let body = ''
+    let collected = 0
+    const iterable = typeof res.body === 'string' ? (async function* () { yield Buffer.from(res.body as string) })() : (res.body as AsyncIterable<Uint8Array>)
+    for await (const chunk of iterable) {
+      collected += (chunk as Uint8Array).byteLength
+      if (collected > maxBytes || body.length > maxBytes) {
+        throw new AppError(HLS_ERROR_CODES.HLS_MANIFEST_TOO_LARGE, HLS_ERROR_MESSAGES.HLS_MANIFEST_TOO_LARGE, 413)
+      }
+      body += Buffer.from(chunk as Uint8Array).toString('utf8')
+    }
+    return { body, finalUrl: (res as any).finalUrl ?? url }
+  }
   let collected = 0
   let body = ''
   const result = await followRemoteUrl(url, {

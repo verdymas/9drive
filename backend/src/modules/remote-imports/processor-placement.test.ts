@@ -146,9 +146,80 @@ vi.mock('../../utils/audit.js', () => ({
   createAuditLog: (...args: unknown[]) => h.audit(...args),
 }))
 
-vi.mock('../remote-fetch-workers/driver-registry.js', () => ({
-  hasDriver: (key: string) => key === 'cloudflare' || key === 'test-relay',
+vi.mock('./secure-fetcher.js', () => ({
+  createSecureFetcherForWorkerId: vi.fn(async (workerId: string | null) => {
+    // Mock fetcher that simulates direct/relay fetch without hitting network
+    // For the purpose of placement tests, all fetches succeed with 3-byte body
+    const mockFetcher = {
+      fetch: vi.fn(async (input: any) => {
+        const url = input.url as string
+        if (input.method === 'HEAD') {
+          return {
+            status: 200,
+            headers: { 'content-length': '1000', 'accept-ranges': 'bytes', 'content-type': 'video/x-matroska' },
+            body: (async function* () {})(),
+            finalUrl: url,
+            redirectCount: 0,
+          }
+        }
+        return {
+          status: 200,
+          headers: { 'content-length': '1000', 'accept-ranges': 'bytes', 'content-type': 'video/x-matroska' },
+          body: (async function* () {
+            yield new Uint8Array([1, 2, 3])
+          })(),
+          finalUrl: url,
+          redirectCount: 0,
+        }
+      }),
+      boundedGet: vi.fn(async (url: string) => ({ status: 200, headers: {}, body: '#EXTM3U\n#EXT-X-VERSION:3\n', finalUrl: url })),
+      downloadToFile: vi.fn(async (url: string, targetPath: string) => {
+        const fsp = await import('node:fs/promises')
+        await fsp.writeFile(targetPath, Buffer.from([1, 2, 3]))
+        return 3n
+      }),
+    }
+    return mockFetcher
+  }),
+  createSecureFetcherForWorker: vi.fn((worker: any) => ({
+    fetch: vi.fn(async (input: any) => ({
+      status: 200,
+      headers: { 'content-length': '1000', 'accept-ranges': 'bytes' },
+      body: (async function* () {
+        yield new Uint8Array([1, 2, 3])
+      })(),
+      finalUrl: input.url,
+      redirectCount: 0,
+    })),
+  })),
+  SecureRemoteFetcher: class {
+    fetch = vi.fn(async () => ({ status: 200, headers: {}, body: (async function* () {})(), finalUrl: 'https://example.com', redirectCount: 0 }))
+  },
 }))
+
+vi.mock('../remote-fetch-workers/driver-registry.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../remote-fetch-workers/driver-registry.js')>()
+  return {
+    ...actual,
+    hasDriver: (key: string) => key === 'cloudflare' || key === 'test-relay' || key === 'no-transport',
+    resolveDriver: (key: string) => {
+      if (key === 'no-transport') {
+        return {
+          key: 'no-transport',
+          displayName: 'No Transport',
+          managed: false,
+          authTypes: ['none'],
+          fields: [],
+          getMetadata: () => ({ key: 'no-transport', displayName: 'No Transport', managed: false, authTypes: ['none' as const], fields: [] }),
+          validateConfig: async () => ({ endpointUrl: 'https://relay.example' }),
+          testConnection: async () => ({ status: 'healthy' as const }),
+          // No createTransport → will trigger WORKER_TRANSPORT_NOT_IMPLEMENTED
+        } as any
+      }
+      return actual.resolveDriver(key)
+    },
+  }
+})
 
 vi.mock('../google/google.service.js', () => ({
   ensureGoogleAppFolder: vi.fn(async () => 'app-folder'),
@@ -370,16 +441,17 @@ describe('processRemoteImportJob — placement routing (direct)', () => {
     expect(createCalls[0][0].data.name).toBe('My Movie.mkv')
   })
 
-  it('fails the job with WORKER_TRANSPORT_NOT_IMPLEMENTED when a worker is selected (no silent Direct)', async () => {
-    // A selected worker whose driver has no transport (this phase) must fail
-    // the job explicitly — the source must NEVER be fetched via Direct.
-    h.rows.set('import-1', h.baseRow({ workerId: 'worker-1', workerNameSnapshot: 'Cloudflare SG #1' }))
+  it('fails the job with WORKER_TRANSPORT_NOT_IMPLEMENTED when a worker driver has no transport (no silent Direct)', async () => {
+    // A selected worker whose driver has no transport must fail the job explicitly — the source must NEVER be fetched via Direct.
+    h.rows.set('import-1', h.baseRow({ workerId: 'worker-1', workerNameSnapshot: 'No Transport' }))
     ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
       id: 'worker-1',
-      name: 'Cloudflare SG #1',
-      driver: 'cloudflare',
+      name: 'No Transport Worker',
+      driver: 'no-transport',
       endpointUrl: 'https://relay.example.workers.dev',
       isEnabled: true,
+      authType: 'none',
+      secretEncrypted: null,
     })
     await processRemoteImportJob(job())
     const row = h.rows.get('import-1')
