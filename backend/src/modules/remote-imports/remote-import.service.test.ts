@@ -69,6 +69,8 @@ const h = vi.hoisted(() => {
     },
     /** The row most recently installed by `withRow` (used by the CAS re-read stub). */
     currentRow: baseRow,
+    /** Controllable stand-in for `validateRemoteUrl` (ssrf.js is mocked below). */
+    validateUrlSpy: vi.fn(async (rawUrl: string) => new URL(rawUrl)),
   }
 })
 
@@ -95,9 +97,10 @@ vi.mock('../../utils/crypto.js', () => ({
 }))
 
 // Never hit real DNS from a unit test: `validateRemoteUrl` is a network call
-// the service's create path performs for every URL.
+// the service's create path performs for every URL. The controllable
+// validateUrlSpy lets tests assert the resolveDns routing (Direct vs relay).
 vi.mock('./ssrf.js', () => ({
-  validateRemoteUrl: async (rawUrl: string) => new URL(rawUrl),
+  validateRemoteUrl: (...args: unknown[]) => h.validateUrlSpy(...args),
 }))
 
 vi.mock('./temp-storage.js', () => ({
@@ -136,6 +139,7 @@ import { retryRemoteConvert, retryRemoteImport } from './remote-import.service.j
  *  clear and replay into the next test. */
 function resetMocks() {
   vi.resetAllMocks()
+  ;(h.validateUrlSpy as ReturnType<typeof vi.fn>).mockImplementation(async (rawUrl: string) => new URL(rawUrl))
   ;(h.enqueueSpy as ReturnType<typeof vi.fn>).mockResolvedValue('import-1~2')
   ;(h.prismaMock.remoteImport.updateMany as ReturnType<typeof vi.fn>).mockResolvedValue({ count: 1 })
   ;(h.prismaMock.remoteImport.update as ReturnType<typeof vi.fn>).mockImplementation(async ({ data }: { data: any }) => ({ ...h.baseRow, ...data }))
@@ -678,6 +682,68 @@ describe('createRemoteImport', () => {
         workerId: 'worker-fut',
       }),
     ).rejects.toMatchObject({ code: 'REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED', status: 400 })
+  })
+
+  it('skips backend DNS for the target when a Worker is selected (relay mode)', async () => {
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'worker-A',
+      name: 'Cloudflare SG #1',
+      driver: 'cloudflare',
+      isEnabled: true,
+    })
+    // Simulate the strict-firewall case: backend DNS fails (would throw
+    // SSRF_DNS_FAILED) — but the relay never needs it.
+    ;(h.validateUrlSpy as ReturnType<typeof vi.fn>).mockImplementation(async (rawUrl: string, opts?: { resolveDns?: boolean }) => {
+      if (opts?.resolveDns !== false) {
+        throw Object.assign(new Error('dns failed'), { code: 'SSRF_DNS_FAILED' })
+      }
+      return new URL(rawUrl)
+    })
+    const created = await createRemoteImport({
+      userId: 'user-1',
+      sourceUrl: 'https://cdn.example/stream',
+      workerId: 'worker-A',
+      detectedFileName: 'Stream',
+    })
+    expect(created).toBeDefined()
+    // The URL gate ran with resolveDns:false — syntax/policy only.
+    expect(h.validateUrlSpy).toHaveBeenCalledWith('https://cdn.example/stream', { resolveDns: false })
+    expect(h.enqueueSpy).toHaveBeenCalled()
+  })
+
+  it('Direct mode still requires backend DNS (unresolvable host fails)', async () => {
+    ;(h.validateUrlSpy as ReturnType<typeof vi.fn>).mockImplementation(async (_rawUrl: string, opts?: { resolveDns?: boolean }) => {
+      if (opts?.resolveDns !== false) {
+        throw Object.assign(new Error('dns failed'), { code: 'SSRF_DNS_FAILED' })
+      }
+      return new URL('https://cdn.example/stream')
+    })
+    await expect(
+      createRemoteImport({
+        userId: 'user-1',
+        sourceUrl: 'https://cdn.example/stream',
+        detectedFileName: 'Stream',
+      }),
+    ).rejects.toMatchObject({ code: 'SSRF_DNS_FAILED' })
+    expect(h.enqueueSpy).not.toHaveBeenCalled()
+  })
+
+  it('worker validation errors surface BEFORE any URL/DNS validation', async () => {
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'worker-off',
+      name: 'Off',
+      driver: 'cloudflare',
+      isEnabled: false,
+    })
+    await expect(
+      createRemoteImport({
+        userId: 'user-1',
+        sourceUrl: 'https://cdn.example/file.mp4',
+        workerId: 'worker-off',
+      }),
+    ).rejects.toMatchObject({ code: 'REMOTE_IMPORT_WORKER_DISABLED', status: 400 })
+    // No URL validation ran at all (worker error won before any DNS work).
+    expect(h.validateUrlSpy).not.toHaveBeenCalled()
   })
 
   it('does not leave the row queued when enqueuing fails', async () => {

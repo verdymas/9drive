@@ -65,7 +65,26 @@ export type CreateRemoteImportInput = {
 export async function createRemoteImport(input: CreateRemoteImportInput) {
   if (!env.REMOTE_IMPORT_ENABLED) throw new AppError('REMOTE_IMPORT_DISABLED', 'Remote import is disabled.', 403)
 
-  await validateRemoteUrl(input.sourceUrl)
+  // Network Route: validate the selected Remote Fetch Worker FIRST (spec §28)
+  // — worker errors (missing / disabled / unsupported) surface before any URL
+  // or DNS work, and the URL gate below can then skip backend DNS for relay
+  // mode. The worker must exist, be enabled, and use a driver installed in
+  // the registry. Network Worker and destination Storage Account are separate.
+  let workerId = input.workerId ?? null
+  let workerNameSnapshot: string | null = null
+  if (workerId) {
+    const worker = await prisma.remoteFetchWorker.findFirst({ where: { id: workerId, deletedAt: null } })
+    if (!worker) throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_INVALID, 'The selected network worker does not exist.', 400)
+    if (!worker.isEnabled) throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_DISABLED, 'The selected network worker is disabled.', 400)
+    if (!hasDriver(worker.driver)) throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED, 'The selected network worker uses an unsupported service.', 400)
+    workerNameSnapshot = worker.name
+  }
+
+  // URL validation: syntax/policy checks always; backend DNS ONLY in Direct
+  // mode. In relay mode the backend must not resolve hostnames it never
+  // connects to — a strict-firewall host may be unresolvable from the backend
+  // even though the relay can reach it (the relay edge enforces host → IP).
+  await validateRemoteUrl(input.sourceUrl, { resolveDns: !workerId })
 
   let folderId = input.folderId ?? null
   if (folderId) {
@@ -77,19 +96,6 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
   if (connectedAccountId) {
     const account = await prisma.connectedAccount.findFirst({ where: { id: connectedAccountId, userId: input.userId, status: 'connected' } })
     if (!account) throw new AppError('ACCOUNT_NOT_FOUND', 'The storage account does not exist.', 404)
-  }
-
-  // Network Route: validate the selected Remote Fetch Worker (spec §28). The
-  // worker must exist, be enabled, and use a driver installed in the registry.
-  // Network Worker and destination Storage Account are separate concepts.
-  let workerId = input.workerId ?? null
-  let workerNameSnapshot: string | null = null
-  if (workerId) {
-    const worker = await prisma.remoteFetchWorker.findFirst({ where: { id: workerId, deletedAt: null } })
-    if (!worker) throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_INVALID, 'The selected network worker does not exist.', 400)
-    if (!worker.isEnabled) throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_DISABLED, 'The selected network worker is disabled.', 400)
-    if (!hasDriver(worker.driver)) throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED, 'The selected network worker uses an unsupported service.', 400)
-    workerNameSnapshot = worker.name
   }
 
   // Filename precedence: an explicitly user-supplied name always wins over a
