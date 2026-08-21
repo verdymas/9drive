@@ -37,6 +37,10 @@ export const REMOTE_FETCH_WORKER_ERROR_CODES = {
   WORKER_ENDPOINT_BUILD_FAILED: 'WORKER_ENDPOINT_BUILD_FAILED',
   WORKER_HEALTH_CHECK_FAILED: 'WORKER_HEALTH_CHECK_FAILED',
   WORKER_RELAY_PROTOCOL_ERROR: 'WORKER_RELAY_PROTOCOL_ERROR',
+  // The relay is HEALTHY and reachable, but its upstream fetch of the target
+  // failed/errored (e.g. 502 {"error":"upstream fetch failed"} envelope).
+  // Distinct from WORKER_UNHEALTHY, which means the RELAY itself is the problem.
+  WORKER_UPSTREAM_FETCH_FAILED: 'WORKER_UPSTREAM_FETCH_FAILED',
   // Remote Import selection / execution
   REMOTE_IMPORT_WORKER_INVALID: 'REMOTE_IMPORT_WORKER_INVALID',
   REMOTE_IMPORT_WORKER_DISABLED: 'REMOTE_IMPORT_WORKER_DISABLED',
@@ -75,6 +79,7 @@ export const REMOTE_FETCH_WORKER_ERROR_MESSAGES: Record<RemoteFetchWorkerErrorCo
   WORKER_ENDPOINT_BUILD_FAILED: 'The relay endpoint could not be constructed.',
   WORKER_HEALTH_CHECK_FAILED: 'The relay endpoint did not respond as a healthy 9Drive relay.',
   WORKER_RELAY_PROTOCOL_ERROR: 'The relay received an invalid request.',
+  WORKER_UPSTREAM_FETCH_FAILED: 'The relay could not fetch the source. The source may be temporarily unavailable or blocked.',
   REMOTE_IMPORT_WORKER_INVALID: 'The selected network worker does not exist.',
   REMOTE_IMPORT_WORKER_DISABLED: 'The selected network worker is disabled.',
   REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED: 'The selected network worker uses an unsupported service.',

@@ -149,6 +149,26 @@ describe('serializer → worker.mjs parser (real artifact, real serializer)', ()
     expect(upstreamHits.some((site) => site.url === '/redirect-to-final')).toBe(true)
   })
 
+  it('upstream fetch exception → structured 502 envelope with code UPSTREAM_FETCH_EXCEPTION', async () => {
+    // Port 1 is closed: the worker's upstream fetch rejects → the relay (still
+    // healthy) must report the failure as a structured envelope, never as an
+    // unhealthy relay.
+    const payload = {
+      protocolVersion: RELAY_PROTOCOL_VERSION,
+      url: 'http://127.0.0.1:1/unreachable',
+      method: 'GET' as const,
+      headers: { Range: 'bytes=0-0' },
+    }
+    const res = await worker.fetch(buildRequest(payload), { RELAY_SECRET: SECRET })
+    expect(res.status).toBe(502)
+    const json = (await res.json()) as { error: string; code?: string }
+    expect(json.error).toBe('upstream fetch failed')
+    expect(json.code).toBe('UPSTREAM_FETCH_EXCEPTION')
+    // The envelope never echoes the target URL or the secret.
+    expect(JSON.stringify(json)).not.toContain('127.0.0.1')
+    expect(JSON.stringify(json)).not.toContain(SECRET)
+  })
+
   it('rejects a wrong protocol version with reason INVALID_PROTOCOL (never the URL/secret)', async () => {
     const payload = { protocolVersion: '9drive-relay-v0', url: `${upstreamUrl}/sample.m3u8`, method: 'GET' as const, headers: {} }
     const res = await worker.fetch(buildRawRequest(payload), { RELAY_SECRET: SECRET })

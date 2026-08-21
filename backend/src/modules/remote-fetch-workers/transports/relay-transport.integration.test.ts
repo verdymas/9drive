@@ -150,6 +150,13 @@ describe('CloudflareRemoteFetchTransport via mock relay', () => {
   // Track upstream hits
   let upstreamHits: Array<{ method: string; url: string; headers: Record<string, string> }> = []
   let upstreamBody = 'hello world'
+  /** Serve 206 + partial body when the upstream request carries Range. */
+  let upstreamRangeAware = false
+  /** Relay /fetch failure modes (simulate worker.mjs upstream-failure envelope). */
+  let relayFailMode: 'none' | 'envelope-once' | 'envelope-always' = 'none'
+  let relayEnvelopeUsed = false
+  /** Parsed relay /fetch payloads (headers shape only — never values in logs). */
+  let relayPayloads: Array<{ method: string; url: string; headers: Record<string, string>; range?: string | null }> = []
 
   beforeAll(async () => {
     // Upstream that serves manifests/segments
@@ -160,6 +167,21 @@ describe('CloudflareRemoteFetchTransport via mock relay', () => {
         else if (Array.isArray(v)) headers[k.toLowerCase()] = v.join(', ')
       }
       upstreamHits.push({ method: req.method ?? 'GET', url: req.url ?? '/', headers })
+      if (req.url?.includes('forbidden')) {
+        res.writeHead(403, { 'content-type': 'text/plain', 'content-length': '9' })
+        res.end('forbidden')
+        return
+      }
+      if (req.headers.range && upstreamRangeAware) {
+        res.writeHead(206, {
+          'content-type': 'video/mp4',
+          'content-range': `bytes 0-${Math.max(0, upstreamBody.length - 1)}/${Buffer.byteLength(upstreamBody)}`,
+          'content-length': String(upstreamBody.length),
+          'accept-ranges': 'bytes',
+        })
+        res.end(upstreamBody)
+        return
+      }
       if (req.url?.includes('manifest.m3u8')) {
         res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl', 'content-length': String('#EXTM3U\n#EXT-X-VERSION:3\n'.length) })
         res.end('#EXTM3U\n#EXT-X-VERSION:3\n')
@@ -255,6 +277,28 @@ describe('CloudflareRemoteFetchTransport via mock relay', () => {
           res.end(JSON.stringify({ error: 'invalid payload', reason: 'INVALID_HEADERS' }))
           return
         }
+        // Capture the parsed payload (headers SHAPE only — never values) so
+        // tests can assert Range/context preservation across retries.
+        relayPayloads.push({
+          method: method as string,
+          url: targetUrl as string,
+          headers: (headers ?? {}) as Record<string, string>,
+          ...(headers && typeof headers === 'object' && Object.keys(headers).some((k) => String(k).toLowerCase() === 'range')
+            ? { range: (headers as Record<string, string>)[Object.keys(headers).find((k) => String(k).toLowerCase() === 'range') as string] }
+            : {}),
+        })
+        // Simulate worker.mjs upstream-fetch failure envelope on demand.
+        if (relayFailMode === 'envelope-once' && !relayEnvelopeUsed) {
+          relayEnvelopeUsed = true
+          res.writeHead(502, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION' }))
+          return
+        }
+        if (relayFailMode === 'envelope-always') {
+          res.writeHead(502, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION' }))
+          return
+        }
         // Simulate upstream fetch
         try {
           const upstreamRes = await fetch(targetUrl, {
@@ -292,6 +336,10 @@ describe('CloudflareRemoteFetchTransport via mock relay', () => {
 
   beforeEach(() => {
     upstreamHits = []
+    relayPayloads = []
+    relayFailMode = 'none'
+    relayEnvelopeUsed = false
+    upstreamRangeAware = false
     validationSpy.validateRemoteUrl.mockReset()
     validationSpy.resolveAndValidateHost.mockReset()
     validationSpy.validateRemoteUrl.mockImplementation(async (raw: string) => new URL(raw))
@@ -416,11 +464,112 @@ describe('CloudflareRemoteFetchTransport via mock relay', () => {
     vi.stubGlobal('fetch', originalFetch)
   })
 
-  it('relay unreachable is classified as WORKER_CONNECTION_REFUSED', async () => {
+  it('relay unreachable is classified as WORKER_UNHEALTHY (relay problem, retried then thrown)', async () => {
     const transport = new CloudflareRemoteFetchTransport({ endpointUrl: 'http://127.0.0.1:1', secret: SECRET })
     await expect(transport.request({ method: 'GET', url: `${upstreamUrl}/test`, headers: {} })).rejects.toMatchObject({
-      code: expect.stringMatching(/WORKER_CONNECTION_REFUSED|WORKER_CONNECTION_TIMEOUT/),
+      code: 'WORKER_UNHEALTHY',
     })
+  })
+
+  it('relay GET with Range → 206 success through the relay', async () => {
+    upstreamRangeAware = true
+    const transport = new CloudflareRemoteFetchTransport({ endpointUrl: relayUrl, secret: SECRET, workerId: 'w1', driver: 'cloudflare' })
+    const res = await transport.request({ method: 'GET', url: `${upstreamUrl}/video.mp4`, headers: {}, range: 'bytes=0-99' })
+    expect(res.status).toBe(206)
+    expect((res as { finalUrl?: string }).finalUrl).toBe(`${upstreamUrl}/video.mp4`)
+    // The Range header was forwarded to the relay payload.
+    expect(relayPayloads[0].range).toBe('bytes=0-99')
+  })
+
+  it('transient upstream 502 envelope is retried then succeeds (Range + context preserved)', async () => {
+    relayFailMode = 'envelope-once'
+    const transport = new CloudflareRemoteFetchTransport({ endpointUrl: relayUrl, secret: SECRET, workerId: 'w1', driver: 'cloudflare' })
+    const res = await transport.request({
+      method: 'GET',
+      url: `${upstreamUrl}/segment-1.ts`,
+      range: 'bytes=0-1023',
+      requestContext: {
+        referer: 'https://site.example/watch/1',
+        origin: 'https://site.example',
+        cookie: 'session=abc',
+        userAgent: 'CustomAgent',
+      },
+    } as never)
+    expect(res.status).toBe(200)
+    // The failed attempt + the successful retry — the SAME serialized payload.
+    expect(relayPayloads.length).toBe(2)
+    for (const p of relayPayloads) {
+      expect(p.range).toBe('bytes=0-1023')
+      expect(p.headers.Referer).toBe('https://site.example/watch/1')
+      expect(p.headers.Origin).toBe('https://site.example')
+      expect(p.headers.Cookie).toBe('session=abc')
+      expect(p.headers['User-Agent']).toBe('CustomAgent')
+      expect(p.url).toBe(`${upstreamUrl}/segment-1.ts`)
+    }
+  })
+
+  it('upstream 403 is returned as status, NOT retried as transient', async () => {
+    const transport = new CloudflareRemoteFetchTransport({ endpointUrl: relayUrl, secret: SECRET, workerId: 'w1', driver: 'cloudflare' })
+    const res = await transport.request({ method: 'GET', url: `${upstreamUrl}/forbidden`, headers: {} })
+    expect(res.status).toBe(403)
+    // Only ONE relay attempt — a 403 through the relay is an upstream answer.
+    expect(relayPayloads.length).toBe(1)
+  })
+
+  it('persistent upstream-failure envelope → WORKER_UPSTREAM_FETCH_FAILED after retries (never WORKER_UNHEALTHY)', async () => {
+    relayFailMode = 'envelope-always'
+    const transport = new CloudflareRemoteFetchTransport({ endpointUrl: relayUrl, secret: SECRET, workerId: 'w1', driver: 'cloudflare' })
+    await expect(
+      transport.request({ method: 'GET', url: `${upstreamUrl}/video.mp4`, headers: {}, range: 'bytes=0-0' }),
+    ).rejects.toMatchObject({ code: 'WORKER_UPSTREAM_FETCH_FAILED' })
+    // 1 initial + 2 retries, all with the same Range payload.
+    expect(relayPayloads.length).toBe(3)
+    for (const p of relayPayloads) expect(p.range).toBe('bytes=0-0')
+  })
+
+  it('transient relay 503 is retried and then succeeds', async () => {
+    let calls = 0
+    const originalFetch = globalThis.fetch
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : (input as Request).url
+        if (String(url).startsWith(relayUrl)) {
+          calls += 1
+          if (calls === 1) {
+            return { status: 503, ok: false, text: async () => 'unavailable', headers: new Headers() } as unknown as Response
+          }
+        }
+        return originalFetch(input, init)
+      }),
+    )
+    try {
+      const transport = new CloudflareRemoteFetchTransport({ endpointUrl: relayUrl, secret: SECRET, workerId: 'w1', driver: 'cloudflare' })
+      const res = await transport.request({ method: 'GET', url: `${upstreamUrl}/test`, headers: {} })
+      expect(res.status).toBe(200)
+      expect(calls).toBeGreaterThanOrEqual(2)
+    } finally {
+      vi.stubGlobal('fetch', originalFetch)
+    }
+  })
+
+  it('logs safe header-name diagnostics (never values)', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined)
+    try {
+      const transport = new CloudflareRemoteFetchTransport({ endpointUrl: relayUrl, secret: SECRET, workerId: 'w1', driver: 'cloudflare' })
+      await transport.request({ method: 'GET', url: `${upstreamUrl}/test`, headers: {}, range: 'bytes=0-0' })
+      const lines = logSpy.mock.calls.map((c) => String(c[0]))
+      const diag = lines.find((l) => l.includes('headerNames='))
+      expect(diag).toBeTruthy()
+      expect(diag).toContain('hasRange=true')
+      expect(diag).toContain('hasReferer=false')
+      expect(diag).toContain('hasOrigin=false')
+      expect(diag).toContain('hasCookie=false')
+      // The diagnostics log header NAMES only — the Range VALUE never appears.
+      expect(diag).not.toContain('bytes=0-0')
+    } finally {
+      logSpy.mockRestore()
+    }
   })
 
   it('Direct transport does not use relay (and Cloudflare does)', async () => {

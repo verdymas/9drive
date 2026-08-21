@@ -112,14 +112,19 @@ async function handleFetch(request) {
     return json({ error: 'invalid payload', reason: 'INVALID_BODY_TYPE' }, 400);
   }
   // Safe diagnostics — never log URL query, headers values, or body
+  let targetHostForLog = '';
+  let hasRange = false;
   try {
-    const targetHostForLog = new URL(url).hostname;
+    targetHostForLog = new URL(url).hostname;
     const payloadKeys = payload ? Object.keys(payload).sort().join(',') : '';
     const bodyPresent = body !== undefined;
     const bodyType = typeof body;
     const headersCount = headers && typeof headers === 'object' ? Object.keys(headers).length : 0;
     const headersType = typeof headers;
-    console.log(`[relay] protocol=${PROTOCOL_VERSION} upstreamMethod=${method} targetHost=${targetHostForLog} payloadKeys=${payloadKeys} contentType=${request.headers.get('content-type')} bodyPresent=${bodyPresent} bodyType=${bodyType} headersCount=${headersCount} headersType=${headersType}`);
+    hasRange = headers && typeof headers === 'object'
+      ? Object.keys(headers).some((k) => String(k).toLowerCase() === 'range')
+      : false;
+    console.log(`[relay] protocol=${PROTOCOL_VERSION} upstreamMethod=${method} targetHost=${targetHostForLog} payloadKeys=${payloadKeys} contentType=${request.headers.get('content-type')} bodyPresent=${bodyPresent} bodyType=${bodyType} headersCount=${headersCount} headersType=${headersType} hasRange=${hasRange}`);
   } catch {}
   let target;
   try {
@@ -170,8 +175,15 @@ async function handleFetch(request) {
       },
       200
     );
-  } catch {
-    return json({ error: 'upstream fetch failed' }, 502);
+  } catch (error) {
+    // The relay itself is healthy — the UPSTREAM fetch failed (DNS/TLS/
+    // connect error, or the runtime blocked the destination). Log only safe
+    // metadata — never the URL, query, header values, or body.
+    try {
+      const errorName = error && typeof error === 'object' && error.name ? String(error.name) : 'Unknown';
+      console.log(`[relay] event=upstream_fetch_failed upstreamMethod=${method} targetHost=${targetHostForLog} hasRange=${hasRange} errorName=${errorName}`);
+    } catch {}
+    return json({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION' }, 502);
   }
 }
 
