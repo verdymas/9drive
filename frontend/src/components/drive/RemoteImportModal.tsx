@@ -555,6 +555,7 @@ export function RemoteImportModal({
           workerId: workerId || undefined,
           fileName: fileName.trim() || null,
           detectedFileName: detectedFileName || null,
+          mimeType: probe.status === 'detected' ? probe.result.mimeType : null,
           hls: hlsOptions ?? undefined,
         })
       } else {
@@ -567,6 +568,9 @@ export function RemoteImportModal({
           workerId: workerId || undefined,
           fileName: fileName.trim() || null,
           detectedFileName: detectedFileName || null,
+          // Server-side: a known Content-Type gives an extensionless direct
+          // file its extension when the remote supplied none.
+          mimeType: probe.status === 'detected' ? probe.result.mimeType : null,
           // Direct files send no `hls` field at all (the backend schema accepts
           // `null` too, but the wire must not carry it for non-HLS sources).
           hls: hlsOptions ?? undefined,

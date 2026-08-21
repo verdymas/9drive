@@ -549,6 +549,48 @@ describe('createRemoteImport', () => {
     expect(created.fileName).toBe('Detected Name.mp4')
   })
 
+  it('appends a known MIME extension to an extensionless detected name at creation', async () => {
+    const created = await createRemoteImport({
+      userId: 'user-1',
+      sourceUrl: 'https://cdn.example/stream',
+      detectedFileName: 'Stream123',
+      mimeType: 'video/mp4',
+    })
+    expect(created.fileName).toBe('Stream123.mp4')
+  })
+
+  it('never duplicates an explicit extension when mimeType is supplied', async () => {
+    const created = await createRemoteImport({
+      userId: 'user-1',
+      sourceUrl: 'https://cdn.example/stream',
+      detectedFileName: 'Movie.mp4',
+      mimeType: 'video/mp4',
+    })
+    expect(created.fileName).toBe('Movie.mp4')
+    expect(created.fileName).not.toBe('Movie.mp4.mp4')
+  })
+
+  it('leaves unknown MIME types unextended (no guessing)', async () => {
+    const created = await createRemoteImport({
+      userId: 'user-1',
+      sourceUrl: 'https://cdn.example/stream',
+      detectedFileName: 'clip',
+      mimeType: 'application/octet-stream',
+    })
+    expect(created.fileName).toBe('clip')
+  })
+
+  it('HLS imports keep the container-derived extension regardless of mimeType', async () => {
+    const created = await createRemoteImport({
+      userId: 'user-1',
+      sourceUrl: 'https://cdn.example/playlist.m3u8',
+      fileName: 'My Movie',
+      mimeType: 'application/vnd.apple.mpegurl',
+      hls: { sourceType: 'hls_media', outputContainer: 'mkv' },
+    })
+    expect(created.fileName).toBe('My Movie.mkv')
+  })
+
   it('stores an encrypted requestContext when one is supplied (never plaintext)', async () => {
     const created = await createRemoteImport({
       userId: 'user-1',

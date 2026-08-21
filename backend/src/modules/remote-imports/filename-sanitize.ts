@@ -92,3 +92,65 @@ export function appendExtension(name: string, extension: string | null | undefin
   if (/\.$/.test(name) || name.endsWith(`.${ext}`) || name === ext) return name
   return `${name}.${ext}`
 }
+
+/** True when the name already carries a terminal extension (`.mp4`, `.tar.gz`). */
+export function nameHasExtension(name: string): boolean {
+  return /\.\w{1,8}$/.test(name)
+}
+
+/**
+ * Known-safe Content-Type → file extension mappings. Used ONLY to give a
+ * file a usable extension when the remote provided none (no Content-
+ * Disposition header, extensionless URL path). Unknown types map to nothing —
+ * a guessed extension is worse than none. HLS playlist types are deliberately
+ * absent (HLS imports name by the output container instead).
+ */
+const MIME_EXTENSIONS: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/avif': 'avif',
+  'video/mp4': 'mp4',
+  'video/quicktime': 'mov',
+  'video/x-matroska': 'mkv',
+  'video/webm': 'webm',
+  'video/mp2t': 'ts',
+  'video/mpeg': 'mpg',
+  'audio/mpeg': 'mp3',
+  'audio/mp4': 'm4a',
+  'audio/x-m4a': 'm4a',
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/flac': 'flac',
+  'audio/x-flac': 'flac',
+  'audio/ogg': 'ogg',
+  'application/pdf': 'pdf',
+  'application/zip': 'zip',
+  'application/gzip': 'gz',
+  'application/x-tar': 'tar',
+  'application/x-7z-compressed': '7z',
+  'application/x-rar-compressed': 'rar',
+  'text/plain': 'txt',
+  'text/csv': 'csv',
+  'application/json': 'json',
+  'application/xml': 'xml',
+  'text/xml': 'xml',
+}
+
+/** Extension for a known-safe MIME type (normalized, lowercased) or null. */
+export function extensionFromMime(mimeType: string | null | undefined): string | null {
+  if (!mimeType) return null
+  const base = mimeType.split(';')[0].trim().toLowerCase()
+  return MIME_EXTENSIONS[base] ?? null
+}
+
+/**
+ * Append a MIME-derived extension when the name has none AND the type maps to
+ * a known-safe extension. Never touches a name that already has one and never
+ * guesses for unknown types.
+ */
+export function appendExtensionFromMime(name: string, mimeType: string | null | undefined): string {
+  if (nameHasExtension(name)) return name
+  return appendExtension(name, extensionFromMime(mimeType))
+}

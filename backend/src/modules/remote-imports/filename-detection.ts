@@ -26,7 +26,7 @@
  * by this name.
  */
 import { parseContentDispositionFileName } from './content-disposition-parser.js'
-import { appendExtension, sanitizeFileName } from './filename-sanitize.js'
+import { appendExtension, appendExtensionFromMime, extensionFromMime, sanitizeFileName } from './filename-sanitize.js'
 
 export type FileNameSource =
   | 'content-disposition-filename-star'
@@ -85,15 +85,22 @@ export function detectFileName(opts: {
   fallbackShortId: string
   /** Optional extension to append to the generated fallback (safe only). */
   extension?: string | null
+  /** Response Content-Type: supplies a safe extension when the remote gave
+   *  the file no name at all (extensionless URL path / generated fallback). */
+  mimeType?: string | null
 }): DetectedFileName {
   if (opts.contentDisposition) {
     const fromHeader = parseContentDispositionFileName(opts.contentDisposition)
     if (fromHeader) {
       const sanitized = sanitizeFileName(fromHeader)
       if (sanitized && sanitized !== 'file') {
+        // A CD name WITHOUT an extension (bare `filename="movie"`) gets one
+        // from the KNOWN response Content-Type; an explicit extension is never
+        // overwritten.
+        const fileName = appendExtensionFromMime(sanitized, opts.mimeType)
         const isStar = /filename\*=/i.test(opts.contentDisposition)
         return {
-          fileName: sanitized,
+          fileName,
           fileNameSource: isStar ? 'content-disposition-filename-star' : 'content-disposition-filename',
         }
       }
@@ -102,14 +109,18 @@ export function detectFileName(opts: {
 
   const finalSegment = lastUsablePathSegment(opts.finalUrl)
   if (finalSegment) {
-    return { fileName: sanitizeFileName(finalSegment), fileNameSource: 'final-url-path' }
+    // A URL path contributes no extension when the server sends none — give it
+    // one from a KNOWN response Content-Type (never guessed, never overwritten).
+    const fileName = appendExtensionFromMime(sanitizeFileName(finalSegment), opts.mimeType)
+    return { fileName, fileNameSource: 'final-url-path' }
   }
 
   const originalSegment = lastUsablePathSegment(opts.originalUrl)
   if (originalSegment) {
-    return { fileName: sanitizeFileName(originalSegment), fileNameSource: 'original-url-path' }
+    const fileName = appendExtensionFromMime(sanitizeFileName(originalSegment), opts.mimeType)
+    return { fileName, fileNameSource: 'original-url-path' }
   }
 
-  const fallback = generatedFallback(opts.fallbackShortId, opts.extension)
+  const fallback = generatedFallback(opts.fallbackShortId, opts.extension ?? extensionFromMime(opts.mimeType))
   return { fileName: sanitizeFileName(fallback), fileNameSource: 'generated-fallback' }
 }

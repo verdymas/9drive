@@ -16,3 +16,6 @@
 - Use structured correlation-ID logs with step/status/result/route fields and target/probe context; keep values developer-comprehensible while never logging secrets, URLs, or query strings. Confidence: 0.85
 - Keep fixes scoped: do not modify unrelated features or out-of-scope behavior when addressing a specific issue. Confidence: 0.9
 - Apply SSRF enforcement at the layer that performs the connection: the relay edge enforces host→IP-space for relayed requests while the backend still validates URL syntax/policy (so relay mode must not require the backend to resolve targets it never connects to). Confidence: 0.85
+- When a remote/file lacks an extension, append one ONLY from a known-safe Content-Type mapping; never guess for unknown types (e.g. `application/octet-stream`), never overwrite an explicit extension the user/server gave, and never produce duplicate extensions (`movie.mp4.mp4`). Confidence: 0.9
+- Apply name/validation safety nets at the final authoritative layer (e.g. create/service) as well as at detection, because the earlier probe/detection result may be stale or re-derived — the creation path is the last word. Confidence: 0.85
+- Detect and fix bugs by tracing the actual data-flow end to end before touching code, then confirm the exact loss path with targeted tests before/after the fix. Confidence: 0.8

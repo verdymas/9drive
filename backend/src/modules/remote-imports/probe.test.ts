@@ -284,4 +284,67 @@ describe('probeRemoteUrl', () => {
     expect(result.contentLength).toBeNull()
     expect(result.fileName).toBe('nolen.bin')
   })
+
+  it('appends a known MIME extension to an extensionless URL-path name (no CD anywhere)', async () => {
+    // No Content-Disposition on HEAD or GET; the GET reveals video/mp4 and the
+    // URL segment carries no extension — the probe must produce `abc123.mp4`,
+    // never a bare `abc123`.
+    headHandler = (_req, res) => {
+      res.writeHead(200)
+      res.end()
+    }
+    getHandler = (_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'video/mp4', 'Content-Length': String(BODY_BYTES) })
+      res.end(Buffer.alloc(BODY_BYTES))
+    }
+    const result = await probeRemoteUrl(`${baseUrl}/video/abc123`, 'corr-16')
+    expect(result.fileNameSource).toBe('final-url-path')
+    expect(result.fileName).toBe('abc123.mp4')
+  })
+
+  it('appends a known MIME extension to a bare Content-Disposition name', async () => {
+    headHandler = (_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Disposition': cd('screenshot') })
+      res.end()
+    }
+    const result = await probeRemoteUrl(`${baseUrl}/asset/72b`, 'corr-17')
+    expect(result.fileNameSource).toBe('content-disposition-filename')
+    expect(result.fileName).toBe('screenshot.png')
+  })
+
+  it('never overwrites an explicit extension from a known MIME type', async () => {
+    headHandler = (_req, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'video/mp4',
+        'Content-Disposition': cd('release.archive.720p.webm'),
+      })
+      res.end()
+    }
+    const result = await probeRemoteUrl(`${baseUrl}/file`, 'corr-18')
+    expect(result.fileName).toBe('release.archive.720p.webm')
+  })
+
+  it('does not guess an extension for unknown MIME types', async () => {
+    headHandler = (_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': cd('blob') })
+      res.end()
+    }
+    const result = await probeRemoteUrl(`${baseUrl}/file`, 'corr-19')
+    expect(result.fileName).toBe('blob')
+  })
+
+  it('gives the generated fallback a known MIME extension', async () => {
+    // Pathless URL + a known image type → `remote-file-<id>.png`.
+    headHandler = (_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'image/png' })
+      res.end()
+    }
+    getHandler = (_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': String(BODY_BYTES) })
+      res.end(Buffer.alloc(BODY_BYTES))
+    }
+    const result = await probeRemoteUrl(`${baseUrl}/?token=x`, 'corr-20')
+    expect(result.fileNameSource).toBe('generated-fallback')
+    expect(result.fileName).toMatch(/^remote-file-[a-z0-9]+\.png$/)
+  })
 })

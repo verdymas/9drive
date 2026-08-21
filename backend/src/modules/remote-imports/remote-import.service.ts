@@ -3,7 +3,7 @@ import { prisma } from '../../config/prisma.js'
 import { AppError } from '../../utils/app-error.js'
 import { createAuditLog } from '../../utils/audit.js'
 import { encryptText } from '../../utils/crypto.js'
-import { sanitizeFileName } from './filename-sanitize.js'
+import { appendExtensionFromMime, sanitizeFileName } from './filename-sanitize.js'
 import {
   decryptRequestContext,
   encryptRequestContext,
@@ -107,7 +107,12 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
   // selected) is rejected before creation: the displayed filename must be the
   // one ultimately uploaded (§4).
   const hls = input.hls
-  const finalFileName = hls ? hlsFinalFileName(fileName, hls.outputContainer) : fileName
+  const finalFileName = hls
+    ? hlsFinalFileName(fileName, hls.outputContainer)
+    // Direct-file imports: when the remote supplied no extension (no CD name,
+    // extensionless URL), give the stored name one from a KNOWN response
+    // Content-Type. Never overwrites an explicit extension and never guesses.
+    : appendExtensionFromMime(fileName, input.mimeType)
 
   const created = await prisma.remoteImport.create({
     data: {

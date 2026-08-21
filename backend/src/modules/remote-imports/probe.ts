@@ -349,6 +349,9 @@ function buildProbeResult(
     originalUrl: original,
     finalUrl: final,
     fallbackShortId: shortId(),
+    // Supplies a safe extension only when the remote gave no name at all
+    // (extensionless URL path, generated fallback) — never overwrites a name.
+    mimeType: res.headers['content-type'] ?? null,
   })
 
   const rawLength = res.headers['content-length']
