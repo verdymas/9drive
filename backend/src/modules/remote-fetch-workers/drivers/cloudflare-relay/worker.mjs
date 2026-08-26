@@ -178,12 +178,23 @@ async function handleFetch(request) {
   } catch (error) {
     // The relay itself is healthy — the UPSTREAM fetch failed (DNS/TLS/
     // connect error, or the runtime blocked the destination). Log only safe
-    // metadata — never the URL, query, header values, or body.
+    // metadata — never the URL, query, header values, or body. Error NAMES
+    // and well-known cause codes (ENOTFOUND, ECONNRESET, ...) are static
+    // constants — safe to log and safe to return for diagnosis.
+    let errorName = 'Unknown';
+    let causeCode = '';
     try {
-      const errorName = error && typeof error === 'object' && error.name ? String(error.name) : 'Unknown';
-      console.log(`[relay] event=upstream_fetch_failed upstreamMethod=${method} targetHost=${targetHostForLog} hasRange=${hasRange} errorName=${errorName}`);
+      if (error && typeof error === 'object') {
+        if (error.name) errorName = String(error.name);
+        const cause = error.cause;
+        if (cause && typeof cause === 'object') {
+          if (cause.code && /^(E[A-Z]+|UND_ERR_[A-Z_]+)$/.test(String(cause.code))) causeCode = String(cause.code);
+          else if (!causeCode && cause.name && /^[A-Za-z]+$/.test(String(cause.name))) causeCode = String(cause.name);
+        }
+      }
+      console.log(`[relay] event=upstream_fetch_failed upstreamMethod=${method} targetHost=${targetHostForLog} hasRange=${hasRange} errorName=${errorName}${causeCode ? ` cause=${causeCode}` : ''}`);
     } catch {}
-    return json({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION' }, 502);
+    return json({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION', reason: errorName, ...(causeCode ? { cause: causeCode } : {}) }, 502);
   }
 }
 
