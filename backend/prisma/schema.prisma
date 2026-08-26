@@ -33,6 +33,9 @@ model User {
   apiKeys              ApiKey[]
   remoteImports        RemoteImport[]
   syncRuns             SyncRun[]
+  browserDevicePairings BrowserDevicePairing[]
+  browserDevices       BrowserDevice[]
+  capturedResources    CapturedResource[]
 
   @@map("users")
 }
@@ -525,6 +528,80 @@ model WorkspaceInvite {
   @@index([inviteeEmail])
   @@index([targetType, targetId])
   @@map("workspace_invites")
+}
+
+// ── Browser Capture: a registered browser extension instance ("device") and
+// the resources it detects. The extension is a CAPTURE CLIENT only — it never
+// downloads bytes; every import goes through the existing Remote Import
+// pipeline. Device tokens are stored hashed (same pattern as refresh/API-key
+// tokens); captured URLs are untrusted input validated at submit AND again at
+// import time by the Remote Import URL gate.
+model BrowserDevicePairing {
+  id        String    @id @default(uuid()) @db.Char(36)
+  userId    String    @map("user_id") @db.Char(36)
+  codeHash  String    @unique @map("code_hash") @db.VarChar(255)
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("browser_device_pairings")
+}
+
+model BrowserDevice {
+  id               String             @id @default(uuid()) @db.Char(36)
+  userId           String             @map("user_id") @db.Char(36)
+  name             String             @db.VarChar(191)
+  browser          String             @db.VarChar(64)
+  platform         String             @db.VarChar(64)
+  extensionVersion String?            @map("extension_version") @db.VarChar(32)
+  // Hashed device credential — raw token is shown once at registration/rotation.
+  deviceTokenHash  String             @unique @map("device_token_hash") @db.VarChar(255)
+  status           String             @default("active") @db.VarChar(32)
+  lastSeenAt       DateTime?          @map("last_seen_at")
+  revokedAt        DateTime?          @map("revoked_at")
+  createdAt        DateTime           @default(now()) @map("created_at")
+  updatedAt        DateTime           @updatedAt @map("updated_at")
+  user             User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  capturedResources CapturedResource[]
+
+  @@index([userId])
+  @@index([userId, status])
+  @@map("browser_devices")
+}
+
+model CapturedResource {
+  id                      String        @id @default(uuid()) @db.Char(36)
+  browserDeviceId         String        @map("browser_device_id") @db.Char(36)
+  userId                  String        @map("user_id") @db.Char(36)
+  // Full URL (signed query params intact — needed for the actual download),
+  // AES-256-GCM encrypted at rest. `displayUrl` strips query/hash for UI.
+  urlEncrypted            String        @map("url_encrypted") @db.Text
+  displayUrl              String        @map("display_url") @db.Text
+  // video | hls | dash | document
+  type                    String        @db.VarChar(16)
+  mimeType                String?       @map("mime_type") @db.VarChar(191)
+  filename                String        @db.VarChar(255)
+  pageUrl                 String?       @map("page_url") @db.Text
+  pageTitle               String?       @map("page_title") @db.VarChar(512)
+  // Safe context only (referer/origin/userAgent) — cookies are NEVER accepted;
+  // values validated + encrypted at rest, booleans-only across the API.
+  requestContextEncrypted String?       @map("request_context_encrypted") @db.Text
+  // pending | consumed | expired | deleted
+  status                  String        @default("pending") @db.VarChar(16)
+  detectedAt              DateTime      @default(now()) @map("detected_at")
+  expiresAt               DateTime      @map("expires_at")
+  importedAt              DateTime?     @map("imported_at")
+  createdAt               DateTime      @default(now()) @map("created_at")
+  updatedAt               DateTime      @updatedAt @map("updated_at")
+  device                  BrowserDevice @relation(fields: [browserDeviceId], references: [id], onDelete: Cascade)
+  user                    User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status, detectedAt])
+  @@index([browserDeviceId, status])
+  @@index([status, expiresAt])
+  @@map("captured_resources")
 }
 
 // ── Remote Fetch Worker: a remote network relay used by 9Drive to fetch

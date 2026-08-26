@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "9Drive Browser Capture",
+  "version": "0.1.0",
+  "description": "Detect media and documents on pages and send them to your 9Drive via Remote Import. The extension never downloads files itself.",
+  "minimum_chrome_version": "114",
+  "permissions": [
+    "storage",
+    "alarms",
+    "contextMenus",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "9Drive Capture"
+  },
+  "icons": {
+    "128": "icons/icon128.png"
+  }
+}

@@ -20,6 +20,7 @@ import { createSmbRouter } from './modules/smb/smb.routes.js'
 import { remoteImportRouter } from './modules/remote-imports/remote-import.routes.js'
 import { remoteImportQueueHealth } from './modules/remote-imports/queue.js'
 import { syncRouter } from './modules/sync/sync.routes.js'
+import { browserCaptureRouter } from './modules/browser-capture/browser-capture.routes.js'
 // Importing the module registers the installed worker drivers (cloudflare)
 // into the registry before any route handler can resolve them.
 import { remoteFetchWorkerRouter } from './modules/remote-fetch-workers/index.js'
@@ -53,6 +54,7 @@ app.use('/webdav', webdavRouter)
 app.use('/remote-imports', remoteImportRouter)
 app.use('/workers', remoteFetchWorkerRouter)
 app.use('/sync', syncRouter)
+app.use('/browser-capture', browserCaptureRouter)
 app.use(
   '/smb',
   createSmbRouter({

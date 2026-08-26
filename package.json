@@ -1,10 +1,5 @@
 {
   "dependencies": {
     "hls-parser": "^0.16.1"
-  },
-  "devDependencies": {
-    "@playwright/test": "^1.62.1",
-    "@types/node": "^26.2.0"
-  },
-  "scripts": {}
+  }
 }

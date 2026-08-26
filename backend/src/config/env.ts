@@ -86,6 +86,8 @@ const envSchema = z.object({
   CLOUDFLARE_API_BASE: z.string().url().default('https://api.cloudflare.com/client/v4'),
   // Timeout for each Cloudflare Workers API call during provision/deprovision.
   CLOUDFLARE_DEPLOY_TIMEOUT_SECONDS: z.coerce.number().default(30),
+  // Browser Capture (extension device + captured resources).
+  BROWSER_CAPTURE_ENABLED: z.coerce.boolean().default(true),
 })
 
 export const env = envSchema.parse(process.env)

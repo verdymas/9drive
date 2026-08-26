@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { DummyModal } from '@/components/drive/DummyModal'
 import { PageHeader } from '@/components/drive/PageHeader'
+import { BrowserCaptureCard } from '@/components/settings/BrowserCaptureCard'
 import { apiFetch, formatBytes, API_URL } from '@/lib/api'
 import { getGravatarUrl } from '@/lib/gravatar'
 import { getStoredUser, getAccessToken, clearAuthSession } from '@/lib/auth'
@@ -417,6 +418,8 @@ export function SettingsPage() {
               <Button className="w-full sm:w-32" size="sm" variant="outline" onClick={() => setS3Open(true)}><Database className="h-4 w-4" />Connect S3</Button>
             </div>
           </Card>
+
+          <BrowserCaptureCard />
 
           <Card className="p-4">
             <h2 className="text-[16px] font-bold">Connected Storage Accounts</h2>

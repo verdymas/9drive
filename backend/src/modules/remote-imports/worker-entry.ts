@@ -3,10 +3,14 @@
 // registers SIGINT/SIGTERM handling; the process stays alive processing jobs.
 import { startRemoteImportWorker } from './worker.js'
 import { startReconcileSweep } from './queue-reconcile.js'
+import { startCaptureSweep } from '../browser-capture/capture-sweep.js'
 
 const worker = startRemoteImportWorker()
 // The sweep is owned by the worker process: it reconciles queued rows whose
 // queue job was lost, and processing rows whose worker died (§35/§37). The
 // API also does a cheap reconcile-on-read for stale `queued` rows.
 startReconcileSweep()
+// Browser Capture cleanup rides the same process: expire stale captured
+// resources + prune used pairings (Phase 07).
+startCaptureSweep()
 console.log('[remote-import] worker started (concurrency ' + worker.concurrency + ')')
