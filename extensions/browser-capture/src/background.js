@@ -9,7 +9,7 @@
  */
 import { classifyResource, detectFilename } from './classify.js'
 import { addCapture, allCaptures, pruneAgainstServer, removeCapture, updateCapture } from './store.js'
-import { getConfig, heartbeat, submitResource, deleteServerResource, setConfig } from './api.js'
+import { getConfig, heartbeat, submitResource, deleteServerResource, setConfig, registerDevice } from './api.js'
 
 const EXT_VERSION = chrome.runtime.getManifest().version
 
@@ -206,9 +206,12 @@ async function pairDevice(baseUrl, pairingCode) {
   const ua = navigator.userAgent
   const browser = ua.includes('Edg/') ? 'edge' : ua.includes('Chrome') ? 'chrome' : 'chromium'
   const platform = navigator.platform || 'unknown'
-  const reg = await import('./api.js').then((m) =>
-    m.registerDevice(baseUrl, pairingCode, { name: `${browser}-${platform}`, browser, platform, extensionVersion: EXT_VERSION }),
-  )
+  const reg = await registerDevice(baseUrl, pairingCode, {
+    name: `${browser} on ${platform}`,
+    browser,
+    platform,
+    extensionVersion: EXT_VERSION,
+  })
   await setConfig({ baseUrl, deviceToken: reg.deviceToken, deviceName: reg.device?.name })
   return { ok: true, device: reg.device }
 }
