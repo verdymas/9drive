@@ -8,7 +8,7 @@ const CFG_KEY = '9drive.config'
 
 export async function getConfig() {
   const obj = await chrome.storage.local.get(CFG_KEY)
-  return obj[CFG_KEY] ?? { baseUrl: null, deviceToken: null, deviceName: null }
+  return obj[CFG_KEY] ?? { baseUrl: null, apiBase: null, deviceToken: null, deviceName: null }
 }
 
 export async function setConfig(patch) {
@@ -18,7 +18,36 @@ export async function setConfig(patch) {
 }
 
 export async function clearConnection() {
-  await chrome.storage.local.set({ [CFG_KEY]: { baseUrl: null, deviceToken: null, deviceName: null } })
+  await chrome.storage.local.set({ [CFG_KEY]: { baseUrl: null, apiBase: null, deviceToken: null, deviceName: null } })
+}
+
+/** The resolved API root (e.g. https://site.com/api or http://localhost:4000). */
+function apiRoot(cfg) {
+  return (cfg.apiBase || cfg.baseUrl || '').replace(/\/$/, '')
+}
+
+/**
+ * Resolve the API root for a user-entered 9Drive URL. Accepts BOTH forms:
+ *   - direct backend:  http://localhost:4000        (GET /health works)
+ *   - site origin:     https://9drive.example.com   (only /api/* proxies)
+ * Probes each candidate's /health and requires the real JSON answer
+ * ({status:"ok"}) — nginx SPA fallbacks also return 200 for unknown paths,
+ * so the body is what distinguishes the backend from the static handler.
+ */
+export async function resolveApiRoot(userUrl) {
+  const base = userUrl.replace(/\/$/, '')
+  const candidates = []
+  if (/\/api$/.test(base)) candidates.push(base)
+  else candidates.push(base, `${base}/api`)
+  for (const candidate of candidates) {
+    try {
+      const res = await fetch(`${candidate}/health`)
+      if (!res.ok) continue
+      const data = await res.json().catch(() => null)
+      if (data && data.status === 'ok') return candidate
+    } catch { /* try next */ }
+  }
+  throw Object.assign(new Error(`Could not reach a 9Drive backend at ${userUrl} (tried ${candidates.join(', ')})`), { code: 'HOST_UNREACHABLE' })
 }
 
 async function request(path, { method = 'GET', body, auth = true } = {}) {
@@ -26,13 +55,13 @@ async function request(path, { method = 'GET', body, auth = true } = {}) {
   if (!cfg.baseUrl) throw Object.assign(new Error('Not connected'), { code: 'NOT_CONNECTED' })
   const headers = { 'content-type': 'application/json' }
   if (auth && cfg.deviceToken) headers.authorization = `Bearer ${cfg.deviceToken}`
-  const res = await fetch(`${cfg.baseUrl.replace(/\/$/, '')}${path}`, {
+  const res = await fetch(`${apiRoot(cfg)}${path}`, {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   const text = await res.text()
-  const data = text ? JSON.parse(text).catch?.(() => ({})) ?? safeJson(text) : null
+  const data = safeJson(text)
   if (!res.ok) {
     const err = new Error(data?.message || res.statusText || `HTTP ${res.status}`)
     err.code = data?.code || `HTTP_${res.status}`
@@ -47,21 +76,6 @@ function safeJson(text) {
 }
 
 // ── Pairing / device lifecycle ──────────────────────────────────────────────
-
-/** Exchange a dashboard pairing code for a persistent device token. */
-export function registerDevice(baseUrl, pairingCode, meta) {
-  return requestTo(baseUrl, '/browser-capture/devices/register', {
-    method: 'POST',
-    body: {
-      pairingCode,
-      name: meta.name,
-      browser: meta.browser,
-      platform: meta.platform,
-      extensionVersion: meta.extensionVersion,
-    },
-    auth: false,
-  })
-}
 
 export function heartbeat(extensionVersion) {
   return request('/browser-capture/heartbeat', { method: 'POST', body: { extensionVersion } })
@@ -103,7 +117,7 @@ export function importResource(resourceId, opts) {
   return request(`/browser-capture/resources/${resourceId}/import`, { method: 'POST', body: opts })
 }
 
-async function requestTo(baseUrl, path, init) {
+export async function requestTo(baseUrl, path, init) {
   const headers = { 'content-type': 'application/json' }
   const res = await fetch(`${baseUrl.replace(/\/$/, '')}${path}`, {
     method: init.method ?? 'GET',

@@ -9,7 +9,7 @@
  */
 import { classifyResource, detectFilename } from './classify.js'
 import { addCapture, allCaptures, pruneAgainstServer, removeCapture, updateCapture } from './store.js'
-import { getConfig, heartbeat, submitResource, deleteServerResource, setConfig, registerDevice } from './api.js'
+import { getConfig, heartbeat, submitResource, deleteServerResource, setConfig, resolveApiRoot, requestTo } from './api.js'
 
 const EXT_VERSION = chrome.runtime.getManifest().version
 
@@ -202,16 +202,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 // ── Pairing handshake ───────────────────────────────────────────────────────
 
-async function pairDevice(baseUrl, pairingCode) {
+async function pairDevice(userUrl, pairingCode) {
+  // Resolve the real API root (direct backend vs site origin behind nginx)
+  // BEFORE registering — the register POST must hit Express, not the SPA.
+  const apiBase = await resolveApiRoot(userUrl)
   const ua = navigator.userAgent
   const browser = ua.includes('Edg/') ? 'edge' : ua.includes('Chrome') ? 'chrome' : 'chromium'
   const platform = navigator.platform || 'unknown'
-  const reg = await registerDevice(baseUrl, pairingCode, {
-    name: `${browser} on ${platform}`,
-    browser,
-    platform,
-    extensionVersion: EXT_VERSION,
+  const reg = await requestTo(apiBase, '/browser-capture/devices/register', {
+    method: 'POST',
+    body: {
+      pairingCode,
+      name: `${browser} on ${platform}`,
+      browser,
+      platform,
+      extensionVersion: EXT_VERSION,
+    },
   })
-  await setConfig({ baseUrl, deviceToken: reg.deviceToken, deviceName: reg.device?.name })
+  await setConfig({ baseUrl: userUrl, apiBase, deviceToken: reg.deviceToken, deviceName: reg.device?.name })
   return { ok: true, device: reg.device }
 }

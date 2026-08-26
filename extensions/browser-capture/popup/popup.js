@@ -66,7 +66,7 @@ async function openDialog(capture) {
   $('#dlgName').value = capture.filename || ''
   if (!state.options) {
     try {
-      const res = await fetch(`${(await cfgBase()).replace(/\/$/, '')}/browser-capture/import-options`, { headers: await authHeaders() })
+      const res = await fetch(`${await apiBase()}/browser-capture/import-options`, { headers: await authHeaders() })
       state.options = res.ok ? await res.json() : { folders: [], storageAccounts: [], workers: [] }
     } catch {
       state.options = { folders: [], storageAccounts: [], workers: [] }
@@ -79,8 +79,11 @@ async function openDialog(capture) {
   $('#importDialog').showModal()
 }
 
-async function cfgBase() {
-  return (await send({ type: 'getState' })).baseUrl
+/** Resolved API root from storage (set during pairing; may be <base>/api). */
+async function apiBase() {
+  const cfg = await new Promise((resolve) => chrome.storage.local.get('9drive.config', resolve))
+  const c = cfg['9drive.config'] ?? {}
+  return (c.apiBase || c.baseUrl || '').replace(/\/$/, '')
 }
 
 async function authHeaders() {
@@ -104,29 +107,26 @@ async function startImport(capture) {
   $('#dlgMsg').textContent = 'Submitting…'
   $('#dlgMsg').className = 'msg'
   try {
+    const base = await apiBase()
     // The backend imports by its own captured-resource id. If this local row
     // was never synced (offline at detection), resolve it by URL first.
     let serverId = capture.remoteId
     if (!serverId) {
-      const base = (await cfgBase()).replace(/\/$/, '')
       const listRes = await fetch(`${base}/browser-capture/resources`, { headers: await authHeaders() })
       const list = listRes.ok ? (await listRes.json()).items ?? [] : []
       serverId = list.find((r) => r.url === capture.displayUrl || r.url === stripQuery(capture.url))?.id
       if (!serverId) throw new Error('Capture not synced yet — reopen the popup in a moment.')
     }
-    const res = await fetch(
-      `${(await cfgBase()).replace(/\/$/, '')}/browser-capture/resources/${serverId}/import`,
-      {
-        method: 'POST',
-        headers: await authHeaders(),
-        body: JSON.stringify({
-          filename: $('#dlgName').value.trim() || null,
-          folderId: $('#dlgFolder').value || null,
-          connectedAccountId: $('#dlgAccount').value || null,
-          workerId: $('#dlgWorker').value || null,
-        }),
-      },
-    )
+    const res = await fetch(`${base}/browser-capture/resources/${serverId}/import`, {
+      method: 'POST',
+      headers: await authHeaders(),
+      body: JSON.stringify({
+        filename: $('#dlgName').value.trim() || null,
+        folderId: $('#dlgFolder').value || null,
+        connectedAccountId: $('#dlgAccount').value || null,
+        workerId: $('#dlgWorker').value || null,
+      }),
+    })
     const data = await res.json().catch(() => ({}))
     if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`)
     await send({ type: 'markConsumed', url: capture.url })
