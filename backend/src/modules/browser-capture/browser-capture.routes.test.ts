@@ -132,6 +132,16 @@ vi.mock('../../middleware/auth.middleware.js', () => ({
 // own suite) — capture tests assert delegation + capture-row consumption only.
 const hImport = vi.hoisted(() => ({ createRemoteImport: vi.fn(async (input: any) => ({ id: 'ri-1', ...input })), serializeRemoteImport: vi.fn((row: any) => row) }))
 vi.mock('../remote-imports/remote-import.service.js', () => hImport)
+// The HLS probe is likewise a boundary; per-test mocks below set its result.
+const hProbe = vi.hoisted(() => ({
+  probeRemoteUrl: vi.fn(async () => ({
+    sourceType: 'hls_master',
+    hls: { isFinite: true, sourceType: 'hls_master', playlistType: 'vod', variants: [], audioTracks: [], durationSeconds: 100, detectedInBody: true },
+    fileName: 'master.m3u8', mimeType: 'application/vnd.apple.mpegurl', finalUrl: '', originalUrl: '',
+    contentLength: null, supportsRange: false, sourceUrlForFetch: '',
+  })),
+}))
+vi.mock('../remote-imports/probe.js', () => hProbe)
 
 import { browserCaptureRouter } from './browser-capture.routes.js'
 import { errorMiddleware } from '../../middleware/error.middleware.js'
@@ -343,6 +353,13 @@ describe('listing, expiration, consumption', () => {
 describe('import via Remote Import pipeline (Phase 03)', () => {
   beforeEach(() => {
     hImport.createRemoteImport.mockClear()
+    hProbe.probeRemoteUrl.mockClear()
+    hProbe.probeRemoteUrl.mockImplementation(async () => ({
+      sourceType: 'hls_master',
+      hls: { isFinite: true, sourceType: 'hls_master', playlistType: 'vod', variants: [], audioTracks: [], durationSeconds: 100, detectedInBody: true },
+      fileName: 'master.m3u8', mimeType: 'application/vnd.apple.mpegurl', finalUrl: '', originalUrl: '',
+      contentLength: null, supportsRange: false, sourceUrlForFetch: '',
+    }))
   })
 
   /** Seed a captured row directly; returns its id. */
@@ -448,6 +465,89 @@ describe('import via Remote Import pipeline (Phase 03)', () => {
       }
     }
     expect(lastStatus).toBe(429)
+  })
+
+  it('HLS capture: probe runs through the selected worker, hls options reach createRemoteImport, MIME nulled', async () => {
+    const row = await seedResource({
+      type: 'hls',
+      mimeType: 'application/vnd.apple.mpegurl',
+      filename: 'master.m3u8',
+      urlEncrypted: encryptText('https://stream.example.com/master.m3u8?tok=1'),
+    })
+    const res = await call('POST', `/resources/${row.id}/import`, { workerId: 'wk-hls' })
+    expect(res.status).toBe(201)
+    // Probe used the SAME selected worker — no Direct shortcut.
+    expect(hProbe.probeRemoteUrl).toHaveBeenCalledWith(
+      'https://stream.example.com/master.m3u8?tok=1', row.id, undefined, { workerId: 'wk-hls' },
+    )
+    // sourceType persisted via the hls options → processor routes to the HLS pipeline.
+    expect(hImport.createRemoteImport).toHaveBeenCalledWith(expect.objectContaining({
+      workerId: 'wk-hls',
+      mimeType: null, // remuxed output derives video/* from the actual container
+      hls: { sourceType: 'hls_master', outputContainer: expect.stringMatching(/^(auto|mp4)$/) },
+    }))
+    expect(row.status).toBe('consumed')
+  })
+
+  it('HLS capture with custom filename movie.mkv passes the name through untouched', async () => {
+    const row = await seedResource({ type: 'hls', filename: 'master.m3u8' })
+    const res = await call('POST', `/resources/${row.id}/import`, { filename: 'movie.mkv' })
+    expect(res.status).toBe(201)
+    // Extension-matching pass-through is proven by hlsFinalFileName's own tests;
+    // here we assert the user name wins over the captured manifest name.
+    expect(hImport.createRemoteImport).toHaveBeenCalledWith(expect.objectContaining({ fileName: 'movie.mkv' }))
+  })
+
+  it('live HLS (isFinite=false) is rejected with a clear error and stays pending', async () => {
+    hProbe.probeRemoteUrl.mockImplementation(async () => ({
+      sourceType: 'hls_media',
+      hls: { isFinite: false, sourceType: 'hls_media', playlistType: 'event', variants: [], audioTracks: [], durationSeconds: null, detectedInBody: true },
+      fileName: 'live.m3u8', mimeType: 'application/vnd.apple.mpegurl', finalUrl: '', originalUrl: '',
+      contentLength: null, supportsRange: false, sourceUrlForFetch: '',
+    }))
+    const row = await seedResource({ type: 'hls' })
+    const res = await call('POST', `/resources/${row.id}/import`, {})
+    expect(res.status).toBe(400)
+    expect(res.body.code).toBe('CAPTURE_LIVE_HLS_UNSUPPORTED')
+    expect(hImport.createRemoteImport).not.toHaveBeenCalled()
+    expect(row.status).toBe('pending')
+  })
+
+  it('probe refuting HLS (direct_file) fails without consuming the capture', async () => {
+    hProbe.probeRemoteUrl.mockImplementation(async () => ({
+      sourceType: 'direct_file', hls: null,
+      fileName: 'x.bin', mimeType: null, finalUrl: '', originalUrl: '', contentLength: null, supportsRange: false, sourceUrlForFetch: '',
+    }))
+    const row = await seedResource({ type: 'hls' })
+    const res = await call('POST', `/resources/${row.id}/import`, {})
+    expect(res.status).toBe(400)
+    expect(res.body.code).toBe('CAPTURE_NOT_HLS')
+    expect(hImport.createRemoteImport).not.toHaveBeenCalled()
+    expect(row.status).toBe('pending')
+  })
+
+  it('probe failure (typed AppError) surfaces and leaves the capture retryable', async () => {
+    hProbe.probeRemoteUrl.mockRejectedValueOnce(new AppError('HLS_INVALID_MANIFEST', 'The source is not a valid HLS playlist.', 400))
+    const row = await seedResource({ type: 'hls' })
+    const res = await call('POST', `/resources/${row.id}/import`, {})
+    expect(res.status).toBe(400)
+    expect(res.body.code).toBe('HLS_INVALID_MANIFEST')
+    expect(row.status).toBe('pending')
+  })
+
+  it('non-HLS captures skip the probe entirely (regression guard)', async () => {
+    const pdf = await seedResource({ type: 'document', mimeType: 'application/pdf' })
+    await call('POST', `/resources/${pdf.id}/import`, {})
+    const vid = await seedResource()
+    await call('POST', `/resources/${vid.id}/import`, {})
+    expect(hProbe.probeRemoteUrl).not.toHaveBeenCalled()
+    // Payloads unchanged from pre-HLS behavior — no `hls` key at all.
+    const calls = hImport.createRemoteImport.mock.calls.map((c) => c[0])
+    expect(calls).toEqual(expect.arrayContaining([
+      expect.objectContaining({ mimeType: 'application/pdf' }),
+      expect.objectContaining({ mimeType: 'video/mp4' }),
+    ]))
+    expect(calls.every((c) => !('hls' in c))).toBe(true)
   })
 
   it('captured request context flows into the Remote Import (Phase 04)', async () => {

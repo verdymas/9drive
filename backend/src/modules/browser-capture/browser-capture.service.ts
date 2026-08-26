@@ -11,7 +11,8 @@ import {
   serializeRequestContext,
   type RemoteImportRequestContext,
 } from '../remote-imports/request-context.js'
-import { createRemoteImport } from '../remote-imports/remote-import.service.js'
+import { createRemoteImport, type CreateRemoteImportHlsOptions } from '../remote-imports/remote-import.service.js'
+import { probeRemoteUrl } from '../remote-imports/probe.js'
 import { CAPTURED_RESOURCE_TTL_MS, RESOURCE_TYPES, type CapturedResourceType } from './capture-types.js'
 
 /**
@@ -339,6 +340,33 @@ export async function importCapturedResource(
   }
 
   const sourceUrl = decryptText(resource.urlEncrypted)
+  const requestContext = decryptRequestContext(resource.requestContextEncrypted)
+
+  // HLS captures must enter the existing HLS pipeline, not the generic
+  // direct-download path (which would save the manifest as a file). The probe
+  // runs through the SAME selected worker transport and confirms/refutes HLS;
+  // the create call below then persists `sourceType`, which is what
+  // processor.ts's isHlsRecord() routes on.
+  let hls: CreateRemoteImportHlsOptions | undefined
+  let mimeType = resource.mimeType
+  if (resource.type === 'hls') {
+    const probed = await probeRemoteUrl(sourceUrl, resource.id, requestContext ?? undefined, { workerId: input.workerId ?? null })
+    if (probed.sourceType !== 'hls_master' && probed.sourceType !== 'hls_media') {
+      throw new AppError('CAPTURE_NOT_HLS', 'This captured resource is no longer a valid HLS stream.', 400)
+    }
+    if (!probed.hls?.isFinite) {
+      // Live/event sources need a recording duration — that choice lives in the
+      // dashboard's Remote Import modal; the extension popup has no such field.
+      throw new AppError('CAPTURE_LIVE_HLS_UNSUPPORTED', 'Live streams cannot be imported from the extension. Use Remote Import in the 9Drive dashboard to set a recording duration.', 400)
+    }
+    // Default container honors REMOTE_IMPORT_HLS_DEFAULT_CONTAINER ('mp4'
+    // selects MP4 explicitly; anything else → auto, which resolves to MKV).
+    const envContainer = String(env.REMOTE_IMPORT_HLS_DEFAULT_CONTAINER).toLowerCase()
+    hls = { sourceType: probed.sourceType, outputContainer: envContainer === 'mp4' ? 'mp4' : 'auto' }
+    // The manifest MIME must not label the remuxed output — the processor
+    // derives video/x-matroska|video/mp4 from the actual container when null.
+    mimeType = null
+  }
 
   // The import is created FIRST with its own worker guard + URL gate; the
   // capture row is consumed only after creation succeeds, so a failed create
@@ -348,14 +376,15 @@ export async function importCapturedResource(
     sourceUrl,
     // Captured context (referer/origin/userAgent) flows to the same encrypted
     // request-context column Remote Import already manages.
-    requestContext: decryptRequestContext(resource.requestContextEncrypted),
+    requestContext,
     folderId: input.folderId ?? null,
     connectedAccountId: input.connectedAccountId ?? null,
     workerId: input.workerId ?? null,
     // Priority chain: user override wins, else the captured filename (already
     // sanitized at submit; sanitized again inside createRemoteImport).
     fileName: input.filename?.trim() || resource.filename,
-    mimeType: resource.mimeType,
+    mimeType,
+    ...(hls ? { hls } : {}),
   })
 
   await prisma.capturedResource.updateMany({
