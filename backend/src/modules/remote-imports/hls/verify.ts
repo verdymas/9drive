@@ -29,6 +29,13 @@ type FfprobeStream = { codec_type?: string; codec_name?: string; width?: number;
 /**
  * Verify the remuxed output. `expectVideo` / `expectAudio` assert the streams
  * the selected variant implied. Throws HLS_OUTPUT_INVALID on any failure.
+ *
+ * `expectAudio` is a HINT from the source's declared structure (a master
+ * variant with an AUDIO group, or a separately-selected audio track), not a
+ * hard contract: many legitimately video-only HLS streams exist (silent
+ * surveillance feeds, dash cams, some live events). A missing audio stream is
+ * therefore a WARNING, never a hard failure — the video stream is the
+ * essential output. `expectVideo` remains strict.
  */
 export async function verifyOutput(filePath: string, opts: { expectVideo: boolean; expectAudio: boolean }): Promise<MediaVerification> {
   const stats = await fsp.stat(filePath).catch(() => null)
@@ -50,7 +57,9 @@ export async function verifyOutput(filePath: string, opts: { expectVideo: boolea
     throw new AppError(HLS_ERROR_CODES.HLS_OUTPUT_INVALID, 'The output contains no video stream.', 500)
   }
   if (opts.expectAudio && !audio) {
-    throw new AppError(HLS_ERROR_CODES.HLS_OUTPUT_INVALID, 'The output contains no audio stream.', 500)
+    // Video-only sources are legitimate — a hard failure here breaks silent
+    // streams that remuxed perfectly. Warn and continue.
+    console.warn('[hls] verify: expected audio but output has none — video-only source accepted')
   }
 
   const formatDuration = Number(format?.duration)

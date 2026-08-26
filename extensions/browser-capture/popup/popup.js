@@ -20,7 +20,34 @@ const state = {
 // ── Message API ─────────────────────────────────────────────────────────────
 
 function send(msg) {
-  return new Promise((resolve) => chrome.runtime.sendMessage(msg, resolve))
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(msg, (response) => {
+        if (chrome.runtime.lastError) {
+          console.warn('[popup] sendMessage error:', chrome.runtime.lastError.message)
+          resolve(null)
+        } else {
+          resolve(response)
+        }
+      })
+    } catch (e) {
+      console.warn('[popup] sendMessage threw:', e.message)
+      resolve(null)
+    }
+  })
+}
+
+/** Direct storage read fallback — bypasses background if messages fail. */
+async function directStorageRead() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get('9drive.captures', (obj) => {
+        resolve(obj['9drive.captures'] ?? [])
+      })
+    } catch {
+      resolve([])
+    }
+  })
 }
 
 async function refreshState() {
@@ -28,8 +55,19 @@ async function refreshState() {
   // between the last updateBadge and this popup open).
   await send({ type: 'updateBadge' })
   const s = await send({ type: 'getState' })
-  state.connected = Boolean(s?.connected)
-  state.captures = s?.captures ?? []
+  if (s) {
+    state.connected = Boolean(s.connected)
+    state.captures = s.captures ?? []
+  } else {
+    // Background service worker may have been terminated — fall back to
+    // reading storage directly (bypasses the background message channel).
+    console.warn('[popup] getState failed, falling back to direct storage read')
+    const all = await directStorageRead()
+    state.captures = all.filter((c) => c.status === 'detected' || c.status === 'pending')
+    state.connected = false // can't determine without background
+  }
+  console.debug(`[popup] refresh: connected=${state.connected} captures=${state.captures.length}`)
+  console.debug(`[popup] raw response:`, JSON.stringify(s).slice(0, 500))
   render()
 }
 
@@ -82,8 +120,12 @@ function renderList() {
     return
   }
 
+  // groupCaptures already excludes expired/consumed; `getState` only returns
+  // detected/pending. Filtering by status here is WRONG for hls-group entries
+  // (they carry no top-level `status` — the primary capture does). All groups
+  // that reach this point are actionable; no extra filter needed.
   const groups = groupCaptures(state.captures)
-  const pending = groups.filter((g) => g.status === 'detected')
+  const pending = groups.filter((g) => (g.type === 'hls-group' ? g.primary : g).status === 'detected')
 
   if (pending.length === 0) {
     list.innerHTML = '<div class="empty">No captured media yet.<br>Play or open a video/PDF to detect it.</div>'

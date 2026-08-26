@@ -331,6 +331,11 @@ export function RemoteImportsPage() {
                         <span className="shrink-0"><StatusBadge item={item} /></span>
                       </div>
                       <p className="mt-1 min-w-0 truncate text-xs text-slate-400" title={formatDisplayUrl(item.displayUrl)}>{formatDisplayUrl(item.displayUrl)}</p>
+                      {item.sourceFileName && item.sourceFileName !== item.fileName ? (
+                        <p className="mt-0.5 min-w-0 truncate text-xs text-slate-500" title={`Source: ${item.sourceFileName}`}>
+                          <span className="font-semibold text-slate-600">Source:</span> {item.sourceFileName}
+                        </p>
+                      ) : null}
                       {(item.sourceType === 'hls_master' || item.sourceType === 'hls_media') ? (
                         <p className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs font-semibold text-slate-500">
                           {item.hlsIsLive ? (

@@ -88,6 +88,7 @@ const envSchema = z.object({
   CLOUDFLARE_DEPLOY_TIMEOUT_SECONDS: z.coerce.number().default(30),
   // Browser Capture (extension device + captured resources).
   BROWSER_CAPTURE_ENABLED: z.coerce.boolean().default(true),
+  BROWSER_CAPTURE_EXTENSION_DIR: z.string().optional(),
 })
 
 export const env = envSchema.parse(process.env)

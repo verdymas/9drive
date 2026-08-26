@@ -161,7 +161,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       case 'getState': {
         const [cfg, captures] = await Promise.all([getConfig(), allCaptures()])
         const pending = captures.filter((c) => c.status === 'detected' || c.status === 'pending')
-        console.debug(`[popup] loaded_resources=${pending.length}`)
+        console.debug(`[popup] loaded_resources=${pending.length} (raw=${captures.length})`)
         sendResponse({
           connected: Boolean(cfg.baseUrl && cfg.deviceToken),
           baseUrl: cfg.baseUrl,
@@ -204,6 +204,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   })()
   return true // async response
 })
+
+// ── Debug: dump storage state (call from service worker console) ─────────────
+// Type `dumpState()` in the service worker console to see exactly what's in
+// chrome.storage.local and why badge/popup might mismatch.
+globalThis.dumpState = async () => {
+  const all = await chrome.storage.local.get(null)
+  const captures = all['9drive.captures'] ?? []
+  const config = all['9drive.config'] ?? {}
+  console.table(captures.map((c) => ({ id: c.id?.slice(0, 8), status: c.status, type: c.type, url: (c.url ?? '').slice(0, 50) })))
+  console.log('config:', { connected: Boolean(config.baseUrl && config.deviceToken), baseUrl: config.baseUrl })
+  console.log(`total=${captures.length} pending=${captures.filter((c) => c.status === 'detected' || c.status === 'pending').length}`)
+}
 
 // ── Pairing handshake ───────────────────────────────────────────────────────
 

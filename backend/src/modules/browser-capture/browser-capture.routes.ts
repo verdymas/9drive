@@ -1,7 +1,11 @@
 import { Router } from 'express'
 import type { NextFunction, Request, Response } from 'express'
 import { z } from 'zod'
+import fs from 'node:fs'
+import path from 'node:path'
+import { ZipArchive } from 'archiver'
 import { prisma } from '../../config/prisma.js'
+import { env } from '../../config/env.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
 import { AppError } from '../../utils/app-error.js'
 import { hashToken } from '../../utils/crypto.js'
@@ -184,6 +188,32 @@ browserCaptureRouter.delete('/resources/:id', requireDevice, async (req: DeviceR
     return res.status(204).end()
   } catch (error) {
     if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
+    return next(error)
+  }
+})
+
+// ── Extension download (authenticated) ───────────────────────────────────────
+
+/** Stream the browser-extension package as a zip for manual installation. */
+browserCaptureRouter.get('/extension.zip', requireAuth, async (_req, res, next) => {
+  try {
+    // Resolve the extension dir relative to the backend package root. In dev
+    // it's ../../extensions/browser-capture; the backend's compiled location
+    // may differ in production, so allow an env override.
+    const configured = env.BROWSER_CAPTURE_EXTENSION_DIR
+    const extDir = configured
+      ? path.resolve(configured)
+      : path.resolve(__dirname, '..', '..', '..', '..', 'extensions', 'browser-capture')
+    if (!fs.existsSync(extDir)) return res.status(404).json({ code: 'EXTENSION_NOT_FOUND', message: 'Extension package not available on this server.' })
+    res.setHeader('Content-Type', 'application/zip')
+    res.setHeader('Content-Disposition', 'attachment; filename="9drive-capture.zip"')
+    const archive = new ZipArchive({ zlib: { level: 9 } })
+    archive.on('error', (err: any) => { throw err })
+    archive.pipe(res)
+    // Exclude tests/ and node_modules (if any) from the zip.
+    archive.glob('**/*', { cwd: extDir, ignore: ['tests/**', 'node_modules/**'] })
+    await archive.finalize()
+  } catch (error) {
     return next(error)
   }
 })

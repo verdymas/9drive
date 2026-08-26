@@ -6,6 +6,9 @@ export type RemoteImportStage = 'waiting' | 'probing' | 'downloading' | 'segment
 export type RemoteImportItem = {
   id: string
   fileName: string
+  /** Original source filename (e.g. captured "master.m3u8") when the import
+   *  came from a captured resource; null otherwise. */
+  sourceFileName?: string | null
   displayUrl: string
   status: RemoteImportStatus
   stage: RemoteImportStage

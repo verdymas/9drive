@@ -19,7 +19,9 @@ const MAX_CAPTURES = 200
 
 export async function allCaptures() {
   const obj = await chrome.storage.local.get(KEY)
-  return obj[KEY] ?? []
+  const list = obj[KEY] ?? []
+  console.debug(`[store] allCaptures: ${list.length} total, statuses=[${[...new Set(list.map((c) => c.status))].join(',')}]`)
+  return list
 }
 
 export async function saveCaptures(list) {

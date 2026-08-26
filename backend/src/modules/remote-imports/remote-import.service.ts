@@ -47,6 +47,8 @@ export type CreateRemoteImportInput = {
   workerId?: string | null
   /** User-entered filename. When supplied it wins over any server detection. */
   fileName?: string | null
+  /** Original source filename (e.g. captured "master.m3u8"), preserved for UI. */
+  sourceFileName?: string | null
   /** Server-side detected filename (from the probe), used when the user did
    *  not type one. Always re-sanitized at creation — never trusted as-is. */
   detectedFileName?: string | null
@@ -131,6 +133,7 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
       requestContextEncrypted: input.requestContext ? encryptRequestContext(input.requestContext) : null,
       displayUrl: displayUrl(input.sourceUrl),
       fileName: finalFileName,
+      sourceFileName: input.sourceFileName?.slice(0, 255) ?? null,
       mimeType: input.mimeType || null,
       status: 'queued',
       stage: 'waiting',

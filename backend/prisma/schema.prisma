@@ -278,6 +278,10 @@ model RemoteImport {
   displayUrl                  String             @map("display_url") @db.Text
   finalUrlEncrypted           String?            @map("final_url_encrypted") @db.Text
   fileName                    String             @map("file_name") @db.VarChar(255)
+  // Original source filename from the captured resource (e.g. "master.m3u8")
+  // preserved separately from the upload-derived fileName which carries the
+  // output container extension (e.g. "master.mkv"). Null for non-capture/legacy.
+  sourceFileName              String?            @map("source_file_name") @db.VarChar(255)
   mimeType                    String?            @map("mime_type") @db.VarChar(191)
   status                      String             @default("queued") @db.VarChar(32)
   stage                       String             @default("waiting") @db.VarChar(32)

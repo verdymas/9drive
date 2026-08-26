@@ -228,7 +228,12 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
       })
     }
 
-    expectAudio = Boolean(audioPlaylistUrl) || sourceInfo.sourceType === 'media'
+    // Audio is expected when the master variant declares an AUDIO group (a
+    // separate audio rendition), or when an alternate audio track was explicitly
+    // selected. A bare media playlist (no master) is not assumed to carry audio —
+    // many video-only HLS streams exist (surveillance, dash cams, silent feeds).
+    // The verification step will warn instead of failing if audio is absent.
+    expectAudio = Boolean(audioPlaylistUrl) || (sourceInfo.sourceType === 'master' && selectedVariant?.audioGroup != null)
 
     // ── 6. Verify FFmpeg + resolve container. ───────────────────────────────
     ffmpeg.verifyFfmpegAvailable()

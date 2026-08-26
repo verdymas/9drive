@@ -40,7 +40,11 @@ export async function createDevicePairing(userId: string) {
   const row = await prisma.browserDevicePairing.create({
     data: { userId, codeHash: hashToken(code), expiresAt: new Date(Date.now() + PAIRING_TTL_MS) },
   })
-  return { id: row.id, code, expiresAt: row.expiresAt.toISOString() }
+  // The backend URL the extension should connect to: FRONTEND_URL is the
+  // dashboard origin, but the API lives at a different base in production
+  // (e.g. /api subpath behind nginx). FRONTEND_URL is used by the extension's
+  // api.js probe to find the Express root (probes both /health and /api/health).
+  return { id: row.id, code, expiresAt: row.expiresAt.toISOString(), backendUrl: env.FRONTEND_URL.replace(/\/$/, '') }
 }
 
 export type DeviceRegistrationInput = {
@@ -382,7 +386,10 @@ export async function importCapturedResource(
     workerId: input.workerId ?? null,
     // Priority chain: user override wins, else the captured filename (already
     // sanitized at submit; sanitized again inside createRemoteImport).
+    // Preserve the original source filename for the UI even when the upload
+    // name is container-derived (e.g. master.m3u8 → master.mkv).
     fileName: input.filename?.trim() || resource.filename,
+    sourceFileName: resource.filename,
     mimeType,
     ...(hls ? { hls } : {}),
   })
