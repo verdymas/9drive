@@ -28,7 +28,19 @@ import { remoteFetchWorkerRouter } from './modules/remote-fetch-workers/index.js
 export const app = express()
 app.set('trust proxy', true)
 
-app.use(cors({ origin: env.FRONTEND_URL }))
+// Dashboard origin plus browser-extension origins (the capture extension
+// pairs and submits from chrome-extension://<id>; Edge/Firefox/Safari use
+// their own schemes). Everything else is refused a CORS grant.
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || origin === env.FRONTEND_URL || /^(chrome|moz|safari-web)-extension:\/\//.test(origin)) {
+        return callback(null, true)
+      }
+      return callback(null, false)
+    },
+  }),
+)
 app.use(express.json({ limit: '1mb' }))
 
 app.get('/health', async (_req, res) => {
