@@ -178,24 +178,41 @@ async function handleFetch(request) {
   } catch (error) {
     // The relay itself is healthy — the UPSTREAM fetch failed (DNS/TLS/
     // connect error, or the runtime blocked the destination). Log only safe
-    // metadata — never the URL, query, header values, or body. Error NAMES
-    // and well-known cause codes (ENOTFOUND, ECONNRESET, ...) are static
-    // constants — safe to log and safe to return for diagnosis.
+    // metadata — never the URL query, header values, or body. The error
+    // message may name the failing HOST (already logged above); it never
+    // carries query strings or credentials. A keyword-classified `kind`
+    // gives the caller a stable diagnostic bucket without echoing raw text.
     let errorName = 'Unknown';
     let causeCode = '';
+    let message = '';
     try {
       if (error && typeof error === 'object') {
         if (error.name) errorName = String(error.name);
+        if (typeof error.message === 'string') message = error.message;
         const cause = error.cause;
         if (cause && typeof cause === 'object') {
           if (cause.code && /^(E[A-Z]+|UND_ERR_[A-Z_]+)$/.test(String(cause.code))) causeCode = String(cause.code);
           else if (!causeCode && cause.name && /^[A-Za-z]+$/.test(String(cause.name))) causeCode = String(cause.name);
         }
       }
-      console.log(`[relay] event=upstream_fetch_failed upstreamMethod=${method} targetHost=${targetHostForLog} hasRange=${hasRange} errorName=${errorName}${causeCode ? ` cause=${causeCode}` : ''}`);
+      const kind = classifyUpstreamError(message, causeCode);
+      console.log(`[relay] event=upstream_fetch_failed upstreamMethod=${method} targetHost=${targetHostForLog} hasRange=${hasRange} errorName=${errorName}${causeCode ? ` cause=${causeCode}` : ''} kind=${kind} message=${JSON.stringify(message.slice(0, 200))}`);
+      return json({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION', reason: errorName, kind, ...(causeCode ? { cause: causeCode } : {}) }, 502);
     } catch {}
-    return json({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION', reason: errorName, ...(causeCode ? { cause: causeCode } : {}) }, 502);
+    return json({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION', reason: errorName }, 502);
   }
+}
+
+// Keyword buckets for the runtime's fetch TypeError (which carries no cause
+// code). Patterns match the fixed message set of the Workers runtime.
+function classifyUpstreamError(message, causeCode) {
+  const hay = `${message} ${causeCode}`.toLowerCase();
+  if (/resolve|dns|nxdomain|no such host|getaddrinfo/.test(hay)) return 'DNS_FAILURE';
+  if (/tls|ssl|cert/.test(hay)) return 'TLS_ERROR';
+  if (/reset|refused|unreachable|abort|closed/.test(hay)) return 'CONNECT_FAILURE';
+  if (/timeout|timed out/.test(hay)) return 'TIMEOUT';
+  if (/memory|allocation|exceed/.test(hay)) return 'RESOURCE_LIMIT';
+  return 'UNKNOWN';
 }
 
 export default {

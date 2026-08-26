@@ -308,13 +308,13 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
 
     // Upstream fetch failed at the relay (the relay itself is healthy).
     if (isUpstreamFailureEnvelope(response.status, bodyText)) {
-      // The relay's structured reason/cause are static error NAMES/codes
-      // (TypeError, ENOTFOUND, ...) — safe diagnostics, never request data.
+      // The relay's structured reason/kind/cause are static error names and
+      // classification buckets — safe diagnostics, never request data.
       let detail = ''
       try {
-        const parsed = JSON.parse(bodyText) as { reason?: string; cause?: string }
-        const parts = [parsed.reason, parsed.cause].filter(Boolean)
-        if (parts.length > 0) detail = ` (${parts.join(' / ')})`
+        const parsed = JSON.parse(bodyText) as { reason?: string; cause?: string; kind?: string }
+        const parts = [parsed.kind, parsed.reason, parsed.cause].filter(Boolean)
+        if (parts.length > 0) detail = ` (${[...new Set(parts)].join(' / ')})`
       } catch { /* keep generic */ }
       console.error(`[remote-import:transport] relay upstream fetch failed status=502 attempt=${attempt} ${relayId}${detail}`)
       return {
