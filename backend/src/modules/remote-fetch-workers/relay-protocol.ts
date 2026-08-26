@@ -11,12 +11,28 @@ export const RELAY_HEALTH_PATH = '/health' as const
 export const RELAY_FETCH_PATH = '/fetch' as const
 export const RELAY_SIGNATURE_HEADER = 'x-9drive-signature' as const
 
+/**
+ * Streaming mode (v1.1 opt-in): `response: "stream"` asks the relay to answer
+ * with the RAW upstream response — status + headers copied to the relay HTTP
+ * response and the body piped through unbuffered (no JSON/base64 envelope).
+ * Metadata travels in these synthetic response headers:
+ *   x-9drive-streaming: 1          — marks the streaming wire format
+ *   x-9drive-upstream-status: <n>  — the upstream HTTP status
+ *   x-9drive-final-url: <url>      — post-redirect URL (URI-encoded)
+ * Relays deployed before this flag ignore unknown payload keys and keep
+ * answering the v1 JSON envelope — the transport falls back automatically.
+ */
+export const STREAM_RESPONSE_HEADER = 'x-9drive-streaming'
+export const UPSTREAM_STATUS_HEADER = 'x-9drive-upstream-status'
+export const FINAL_URL_HEADER = 'x-9drive-final-url'
+
 export const RelayFetchRequestSchema = z.object({
   protocolVersion: z.literal(RELAY_PROTOCOL_VERSION),
   url: z.string().url(),
   method: z.enum(['GET', 'HEAD', 'POST']),
   headers: z.record(z.string(), z.string()),
   body: z.string().optional(),
+  response: z.enum(['stream']).optional(),
 })
 
 export type RelayFetchRequest = z.infer<typeof RelayFetchRequestSchema>
@@ -98,7 +114,7 @@ export function getRelayParseReason(rawJson: unknown, result: ReturnType<typeof 
       return RELAY_PARSE_REASONS.INVALID_METHOD
     }
     if (path === 'headers') return RELAY_PARSE_REASONS.INVALID_HEADERS
-    if (path === 'body') return RELAY_PARSE_REASONS.INVALID_BODY_TYPE
+    if (path === 'body' || path === 'response') return RELAY_PARSE_REASONS.INVALID_BODY_TYPE
     return RELAY_PARSE_REASONS.INVALID_BODY_TYPE
   }
   return RELAY_PARSE_REASONS.INVALID_BODY_TYPE

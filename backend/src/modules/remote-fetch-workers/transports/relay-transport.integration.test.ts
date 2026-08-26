@@ -622,7 +622,9 @@ describe('CloudflareRemoteFetchTransport via mock relay', () => {
     expect(captured).not.toBeNull()
     expect(captured.body).toBeUndefined()
     expect(captured.protocolVersion).toBe(RELAY_PROTOCOL_VERSION)
-    expect(Object.keys(captured).sort()).toEqual(['headers', 'method', 'protocolVersion', 'url'])
+    // The transport opts into streaming mode; the parser accepts the key.
+    expect(captured.response).toBe('stream')
+    expect(Object.keys(captured).sort()).toEqual(['headers', 'method', 'protocolVersion', 'response', 'url'])
     // Verify via canonical parser — must be accepted
     expect(() => parseRelayRequest(JSON.stringify(captured))).not.toThrow()
     // Also GET
@@ -644,6 +646,59 @@ describe('CloudflareRemoteFetchTransport via mock relay', () => {
     const transport = new CloudflareRemoteFetchTransport({ endpointUrl: relayUrl, secret: SECRET })
     const res = await transport.request({ method: 'HEAD', url: `${upstreamUrl}/test`, headers: {} })
     expect(res.status).toBe(200)
+  })
+
+  it('streaming passthrough: raw upstream bytes + metadata headers are decoded, envelope never parsed', async () => {
+    // A v1.1-speaking relay: pipe the upstream body straight through with
+    // x-9drive-* metadata — no JSON/base64 buffering.
+    const streamRelay = http.createServer(async (req, res) => {
+      const url = new URL(req.url ?? '/', `http://${req.headers.host}`)
+      if (req.method === 'POST' && url.pathname === '/fetch') {
+        await req.resume() // drain payload
+        const upstream = await fetch(`${upstreamUrl}/big.bin`)
+        const headers: Record<string, string> = {}
+        upstream.headers.forEach((v, k) => { if (!['transfer-encoding', 'content-length', 'connection'].includes(k)) headers[k] = v })
+        res.writeHead(200, {
+          ...headers,
+          'x-9drive-streaming': '1',
+          'x-9drive-upstream-status': String(upstream.status),
+          'x-9drive-final-url': encodeURI(upstream.url),
+        })
+        // undici's body is a web ReadableStream — convert before piping.
+        const { Readable } = await import('node:stream')
+        if (upstream.body) Readable.fromWeb(upstream.body as never).pipe(res)
+        else res.end()
+        return
+      }
+      res.writeHead(404).end()
+    })
+    await new Promise<void>((resolve) => streamRelay.listen(0, '127.0.0.1', resolve))
+    const streamUrl = `http://127.0.0.1:${(streamRelay.address() as AddressInfo).port}`
+    try {
+      const transport = new CloudflareRemoteFetchTransport({ endpointUrl: streamUrl, secret: SECRET, workerId: 'w1' })
+      const res = await transport.request({ method: 'GET', url: `${upstreamUrl}/big.bin`, headers: {} })
+      expect(res.status).toBe(200)
+      let bytes = 0
+      for await (const chunk of res.body as AsyncIterable<Uint8Array>) bytes += chunk.byteLength
+      expect(bytes).toBe(upstreamBody.length)
+      expect((res as { finalUrl?: string }).finalUrl).toBe(`${upstreamUrl}/big.bin`)
+      expect(res.headers['content-type']).toBe('text/plain')
+      // No synthetic marker leaks into caller-visible headers.
+      expect(Object.keys(res.headers).some((k) => k.startsWith('x-9drive-'))).toBe(false)
+    } finally {
+      await new Promise<void>((resolve) => streamRelay.close(() => resolve()))
+    }
+  })
+
+  it('old v1-only relay (no streaming marker) still works via envelope fallback', async () => {
+    // The default mock relay above speaks only v1 envelope — this whole suite
+    // is already that proof; assert explicitly that a GET still round-trips.
+    const transport = new CloudflareRemoteFetchTransport({ endpointUrl: relayUrl, secret: SECRET, workerId: 'w1' })
+    const res = await transport.request({ method: 'GET', url: `${upstreamUrl}/legacy`, headers: {} })
+    expect(res.status).toBe(200)
+    let body = ''
+    for await (const chunk of res.body as AsyncIterable<Uint8Array>) body += Buffer.from(chunk).toString()
+    expect(body).toBe(upstreamBody)
   })
 })
 

@@ -86,6 +86,11 @@ describe('serializer → worker.mjs parser (real artifact, real serializer)', ()
         res.end()
         return
       }
+      if (req.url === '/missing.m3u8') {
+        res.writeHead(404, { 'content-type': 'text/plain' })
+        res.end('not found')
+        return
+      }
       res.writeHead(200, {
         'content-type': 'application/vnd.apple.mpegurl',
         'content-length': String(UPSTREAM_BODY_LEN),
@@ -147,6 +152,45 @@ describe('serializer → worker.mjs parser (real artifact, real serializer)', ()
     expect(json.finalUrl).toBe(`${upstreamUrl}/final.m3u8`)
     // The relay (not the backend transport) performed the redirect hop.
     expect(upstreamHits.some((site) => site.url === '/redirect-to-final')).toBe(true)
+  })
+
+  it('response:"stream" pipes raw upstream bytes with metadata headers (no envelope)', async () => {
+    const payload = {
+      protocolVersion: RELAY_PROTOCOL_VERSION,
+      url: `${upstreamUrl}/sample.m3u8`,
+      method: 'GET' as const,
+      headers: {},
+      response: 'stream' as const,
+    }
+    const res = await worker.fetch(buildRequest(payload), { RELAY_SECRET: SECRET })
+    // The RELAY response is 200 even when upstream is not — status rides in
+    // x-9drive-upstream-status.
+    expect(res.status).toBe(200)
+    expect(res.headers.get('x-9drive-streaming')).toBe('1')
+    expect(res.headers.get('x-9drive-upstream-status')).toBe('200')
+    expect(res.headers.get('x-9drive-final-url')).toContain('/sample.m3u8')
+    // Upstream content-type passes through verbatim.
+    expect(res.headers.get('content-type')).toBe('application/vnd.apple.mpegurl')
+    // Body is the RAW upstream bytes — not base64, not JSON-wrapped.
+    const text = await res.text()
+    expect(text).toBe(UPSTREAM_BODY)
+    // No synthetic markers leak into caller-visible headers.
+    expect([...res.headers.keys()].filter((k) => k.startsWith('x-9drive-')).sort())
+      .toEqual(['x-9drive-final-url', 'x-9drive-streaming', 'x-9drive-upstream-status'])
+  })
+
+  it('response:"stream" still reports non-2xx upstream status via metadata header', async () => {
+    const payload = {
+      protocolVersion: RELAY_PROTOCOL_VERSION,
+      url: `${upstreamUrl}/missing.m3u8`,
+      method: 'GET' as const,
+      headers: {},
+      response: 'stream' as const,
+    }
+    // Add a 404 route on the upstream for this test only.
+    const res = await worker.fetch(buildRequest(payload), { RELAY_SECRET: SECRET })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('x-9drive-upstream-status')).toBe('404')
   })
 
   it('upstream fetch exception → structured 502 envelope with code UPSTREAM_FETCH_EXCEPTION', async () => {

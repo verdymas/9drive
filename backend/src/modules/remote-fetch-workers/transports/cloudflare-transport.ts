@@ -132,6 +132,11 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
       url: targetUrl,
       method,
       headers: reqHeaders,
+      // Streaming mode (v1.1): the relay pipes the upstream response through
+      // unbuffered — large files no longer hit the Worker memory ceiling.
+      // Older relays ignore the key and answer the v1 envelope; the attempt
+      // parser falls back transparently.
+      response: 'stream',
       ...(bodyValue !== undefined ? { body: bodyValue } : {}),
     }
     // Canonical serialization — drifts are caught by Zod (single source of truth: relay-protocol.ts)
@@ -304,6 +309,31 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
       }
     }
 
+    // ── Streaming passthrough (v1.1): raw upstream bytes, metadata in headers.
+    // MUST be checked BEFORE response.text() — reading the body locks and
+    // drains the stream, which would destroy the passthrough.
+    // Detected by the x-9drive-streaming marker; a relay predating streaming
+    // never sets it and falls through to the v1 JSON envelope below.
+    if (response.headers.get('x-9drive-streaming') === '1') {
+      const upstreamStatus = Number(response.headers.get('x-9drive-upstream-status') ?? '200')
+      const finalUrlHeader = response.headers.get('x-9drive-final-url')
+      const respHeaders: Record<string, string> = {}
+      response.headers.forEach((value, key) => {
+        if (key.toLowerCase().startsWith('x-9drive-')) return
+        respHeaders[key.toLowerCase()] = value
+      })
+      return {
+        kind: 'ok',
+        status: Number.isFinite(upstreamStatus) ? upstreamStatus : 200,
+        statusText: String(upstreamStatus),
+        headers: respHeaders,
+        // The relay body IS the upstream stream — handed to the caller as-is,
+        // never buffered here.
+        body: response.body as unknown as AsyncIterable<Uint8Array>,
+        finalUrl: finalUrlHeader ? decodeURI(finalUrlHeader) : targetUrl,
+      }
+    }
+
     const bodyText = await response.text().catch(() => '')
 
     // Upstream fetch failed at the relay (the relay itself is healthy).
@@ -339,6 +369,7 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
       }
     }
 
+    // ── Streaming passthrough handled ABOVE (before body read). ──────────────
     // Relay 2xx: decode the upstream response envelope {status, headers, body}.
     let data: any
     try {

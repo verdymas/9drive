@@ -64,7 +64,7 @@ function handleHealth() {
     protocolVersion: PROTOCOL_VERSION,
     status: 'ok',
     capabilities: {
-      streaming: false,
+      streaming: true,
       rangeRequests: true,
       requestContext: true,
       hls: false,
@@ -80,7 +80,8 @@ async function handleFetch(request) {
   } catch {
     return json({ error: 'invalid payload', reason: 'INVALID_JSON' }, 400);
   }
-  const { method, url, headers, body, protocolVersion } = payload || {};
+  const { method, url, headers, body, protocolVersion, response: responseMode } = payload || {};
+  const STREAMING = responseMode === 'stream';
   // Canonical 9drive-relay-v1 contract — keep in sync with backend/src/modules/remote-fetch-workers/relay-protocol.ts
   // Validation with safe reason codes — never echo URL, headers values, or body content.
   if (protocolVersion === undefined || protocolVersion === null) {
@@ -152,6 +153,24 @@ async function handleFetch(request) {
       body: method === 'GET' || method === 'HEAD' ? undefined : body,
       redirect: 'follow',
     });
+
+    // Streaming mode (v1.1): pipe the upstream response through UNBUFFERED —
+    // the Worker never holds the whole body in memory, so large files no
+    // longer hit the runtime memory ceiling (RESOURCE_LIMIT). Metadata rides
+    // in x-9drive-* headers; hop-by-hop headers are dropped.
+    if (STREAMING) {
+      const passthrough = new Headers();
+      upstream.headers.forEach((value, key) => {
+        const k = key.toLowerCase();
+        if (k === 'transfer-encoding' || k === 'content-length' || k === 'connection') return;
+        passthrough.set(key, value);
+      });
+      passthrough.set('x-9drive-streaming', '1');
+      passthrough.set('x-9drive-upstream-status', String(upstream.status));
+      if (upstream.url) passthrough.set('x-9drive-final-url', encodeURI(upstream.url));
+      return new Response(upstream.body, { status: 200, headers: passthrough });
+    }
+
     const responseBody = new Uint8Array(await upstream.arrayBuffer());
     const responseHeaders = {};
     upstream.headers.forEach((value, key) => {
