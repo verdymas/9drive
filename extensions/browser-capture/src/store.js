@@ -1,8 +1,17 @@
 /**
  * Local capture store (chrome.storage.local). Each pending capture:
  *   { id, url, type, mime, pageUrl, pageTitle, filename, status, ts }
- * status: detected | submitted  (selected is transient UI state; expired/
- * consumed live server-side and are pruned on sync).
+ *
+ * Status taxonomy:
+ *   detected  — local capture, not yet synced to server   → counted by badge
+ *   pending   — synced to server, awaiting import         → counted by badge
+ *   submitted — import was created                        → not counted
+ *   imported  — import completed                          → not counted
+ *   removed   — user deleted                              → not counted
+ *   expired   — TTL exceeded                              → not counted
+ *
+ * Badge and popup MUST both derive their count from `countPending()` —
+ * the single source of truth for "how many resources are actionable."
  */
 
 const KEY = '9drive.captures'
@@ -51,4 +60,13 @@ export async function pruneAgainstServer(pendingUrls) {
   )
   await saveCaptures(kept)
   return kept
+}
+
+/**
+ * Canonical pending count — used by both badge and popup.
+ * Returns the number of captures with actionable status.
+ */
+export async function countPending() {
+  const list = await allCaptures()
+  return list.filter((c) => c.status === 'detected' || c.status === 'pending').length
 }

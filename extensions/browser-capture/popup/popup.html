@@ -3,43 +3,134 @@
 <head>
   <meta charset="utf-8" />
   <style>
-    :root { color-scheme: light dark; }
-    * { box-sizing: border-box; }
-    body { width: 340px; margin: 0; font: 13px/1.4 system-ui, sans-serif; }
-    header { padding: 10px 12px; border-bottom: 1px solid #e5e7eb; display: flex; justify-content: space-between; align-items: center; }
-    header h1 { font-size: 14px; margin: 0; }
-    .status { font-size: 11px; padding: 2px 8px; border-radius: 99px; background: #dcfce7; color: #166534; }
-    .status.off { background: #fee2e2; color: #991b1b; }
-    main { max-height: 380px; overflow-y: auto; padding: 6px 8px; }
-    .item { border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; }
-    .item .name { font-weight: 600; word-break: break-all; }
-    .item .meta { font-size: 11px; color: #6b7280; margin: 2px 0 6px; }
-    .row { display: flex; gap: 6px; }
-    button { flex: 1; border: 1px solid #d1d5db; background: #f9fafb; border-radius: 6px; padding: 4px 8px; cursor: pointer; font-size: 12px; }
-    button.primary { background: #2563eb; border-color: #2563eb; color: white; }
-    button.danger { color: #b91c1c; }
-    button:hover { filter: brightness(0.96); }
-    .empty { text-align: center; color: #6b7280; padding: 24px 10px; }
-    /* Pair form */
-    form { padding: 12px; }
-    label { display: block; font-size: 11px; margin: 8px 0 3px; color: #374151; }
-    input { width: 100%; padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 12px; }
-    .msg { margin-top: 8px; font-size: 12px; }
-    .msg.err { color: #b91c1c; }
-    /* Dialog */
-    dialog { border: none; border-radius: 10px; padding: 14px; width: 300px; }
-    dialog::backdrop { background: rgba(0,0,0,0.35); }
-    select, dialog input { width: 100%; margin-bottom: 8px; padding: 6px; border: 1px solid #d1d5db; border-radius: 6px; }
+    :root {
+      color-scheme: light dark;
+      --bg: #ffffff; --bg-alt: #f9fafb; --border: #e5e7eb;
+      --text: #111827; --text-dim: #6b7280; --text-label: #374151;
+      --primary: #2563eb; --primary-hover: #1d4ed8;
+      --danger: #b91c1c; --danger-bg: #fef2f2;
+      --success: #166534; --success-bg: #dcfce7;
+      --error: #991b1b; --error-bg: #fee2e2;
+      --radius: 8px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        --bg: #1a1a2e; --bg-alt: #16213e; --border: #2a2a4a;
+        --text: #e2e8f0; --text-dim: #94a3b8; --text-label: #cbd5e1;
+        --primary: #3b82f6; --primary-hover: #2563eb;
+        --danger: #fca5a5; --danger-bg: #450a0a;
+        --success: #86efac; --success-bg: #14532d;
+        --error: #fca5a5; --error-bg: #450a0a;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 480px; min-height: 600px; max-height: 720px;
+      font: 13px/1.4 system-ui, -apple-system, sans-serif;
+      background: var(--bg); color: var(--text);
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+
+    /* ── Header ─────────────────────────────────────────── */
+    header {
+      padding: 12px 14px; border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;
+    }
+    header h1 { font-size: 15px; font-weight: 700; }
+    .badge { font-size: 11px; padding: 2px 8px; border-radius: 99px; font-weight: 600; }
+    .badge.on { background: var(--success-bg); color: var(--success); }
+    .badge.off { background: var(--error-bg); color: var(--error); }
+
+    /* ── Pair form ──────────────────────────────────────── */
+    #pairForm { padding: 16px; flex-shrink: 0; }
+    #pairForm p { font-size: 12px; color: var(--text-dim); margin-bottom: 10px; line-height: 1.5; }
+    #pairForm label { display: block; font-size: 11px; font-weight: 600; color: var(--text-label); margin: 10px 0 4px; }
+    #pairForm input { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); font-size: 13px; background: var(--bg); color: var(--text); }
+    #pairForm button { width: 100%; margin-top: 14px; padding: 10px; }
+
+    /* ── Capture list ───────────────────────────────────── */
+    #captureList {
+      flex: 1 1 0; overflow-y: auto; padding: 8px 10px; min-height: 0;
+    }
+    .empty { text-align: center; color: var(--text-dim); padding: 32px 16px; font-size: 13px; }
+    .card {
+      border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 10px 12px; margin-bottom: 8px; background: var(--bg-alt);
+    }
+    .card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+    .card-name { font-weight: 600; word-break: break-all; font-size: 13px; }
+    .card-meta { font-size: 11px; color: var(--text-dim); margin: 3px 0 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+    .card-meta span { white-space: nowrap; }
+    .card-meta .domain { color: var(--primary); font-weight: 500; }
+    .type-badge {
+      font-size: 10px; padding: 1px 6px; border-radius: 4px; font-weight: 600;
+      background: #ede9fe; color: #6d28d9; flex-shrink: 0;
+    }
+    @media (prefers-color-scheme: dark) { .type-badge { background: #2e1065; color: #c4b5fd; } }
+    .card-actions { display: flex; gap: 5px; flex-wrap: wrap; }
+    .card-actions button { padding: 5px 10px; font-size: 11px; flex: none; }
+
+    /* ── HLS group card ─────────────────────────────────── */
+    .hls-variants { margin: 4px 0 6px; display: flex; flex-direction: column; gap: 3px; }
+    .hls-variant {
+      display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim);
+    }
+    .hls-variant .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--primary); flex-shrink: 0; }
+    .hls-quality-select {
+      width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+      font-size: 12px; background: var(--bg); color: var(--text); margin: 6px 0;
+    }
+
+    /* ── Import form (inline, not dialog) ───────────────── */
+    #importForm {
+      border-top: 1px solid var(--border); padding: 12px 14px;
+      flex-shrink: 0; background: var(--bg-alt);
+    }
+    #importForm h3 { font-size: 13px; font-weight: 700; margin-bottom: 10px; }
+    .form-row { margin-bottom: 8px; }
+    .form-row label { display: block; font-size: 11px; font-weight: 600; color: var(--text-label); margin-bottom: 3px; }
+    .form-row input, .form-row select {
+      width: 100%; padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius);
+      font-size: 12px; background: var(--bg); color: var(--text);
+    }
+    .context-indicator {
+      font-size: 11px; color: var(--text-dim); margin: 6px 0 0; display: flex; gap: 8px; flex-wrap: wrap;
+    }
+    .context-indicator .dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; margin-right: 3px; vertical-align: middle; }
+    .context-indicator .dot.on { background: var(--success); }
+    .context-indicator .dot.off { background: var(--border); }
+
+    /* ── Sticky footer ──────────────────────────────────── */
+    footer {
+      border-top: 1px solid var(--border); padding: 10px 14px;
+      display: flex; gap: 8px; flex-shrink: 0; background: var(--bg);
+    }
+    footer button { flex: 1; padding: 10px; font-size: 13px; font-weight: 600; border-radius: var(--radius); cursor: pointer; border: 1px solid var(--border); background: var(--bg-alt); color: var(--text); }
+    footer button.primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+    footer button.primary:hover { background: var(--primary-hover); }
+    footer button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* ── Status messages ────────────────────────────────── */
+    .msg { font-size: 12px; margin-top: 6px; }
+    .msg.ok { color: var(--success); }
+    .msg.err { color: var(--danger); }
+    .msg.loading { color: var(--text-dim); }
+
+    /* ── Hidden state ───────────────────────────────────── */
+    [hidden] { display: none !important; }
   </style>
 </head>
 <body>
+
+  <!-- Header -->
   <header>
     <h1>9Drive Capture</h1>
-    <span id="conn" class="status off">Not connected</span>
+    <span id="conn" class="badge off">Not connected</span>
   </header>
 
+  <!-- Pair form (shown when not connected) -->
   <form id="pairForm" hidden>
-    <p style="font-size:12px;color:#374151">Open 9Drive → <b>Settings → Browser Capture</b>, create a pairing code, and paste it here.</p>
+    <p>Open 9Drive → <b>Settings → Browser Capture</b>, create a pairing code, and paste it here.</p>
     <label for="baseUrl">9Drive backend URL</label>
     <input id="baseUrl" placeholder="https://your-9drive.example.com" required />
     <label for="pairingCode">Pairing code</label>
@@ -48,22 +139,43 @@
     <div id="pairMsg" class="msg"></div>
   </form>
 
-  <main id="list">
-    <div class="empty" id="empty">No captured media yet.<br />Play or open a video/PDF to detect it.</div>
-  </main>
+  <!-- Capture list -->
+  <div id="captureList">
+    <div class="empty" id="empty">No captured media yet.<br>Play or open a video/PDF to detect it.</div>
+  </div>
 
-  <dialog id="importDialog">
-    <h3 style="margin:0 0 10px;font-size:14px">Import to 9Drive</h3>
-    <label>Filename</label><input id="dlgName" />
-    <label>Destination folder</label><select id="dlgFolder"><option value="">Root</option></select>
-    <label>Storage account</label><select id="dlgAccount"><option value="">Automatic</option></select>
-    <label>Network route</label><select id="dlgWorker"><option value="">Direct</option></select>
-    <div class="row" style="margin-top:8px">
-      <button type="button" id="dlgCancel">Cancel</button>
-      <button class="primary" type="button" id="dlgStart">Start Import</button>
+  <!-- Import form (inline, shown when a capture is selected) -->
+  <div id="importForm" hidden>
+    <h3>Import to 9Drive</h3>
+    <div class="form-row">
+      <label for="dlgName">Filename</label>
+      <input id="dlgName" />
+    </div>
+    <div class="form-row">
+      <label for="dlgFolder">Destination folder</label>
+      <select id="dlgFolder"><option value="">Root</option></select>
+    </div>
+    <div class="form-row">
+      <label for="dlgAccount">Storage account</label>
+      <select id="dlgAccount"><option value="">Automatic</option></select>
+    </div>
+    <div class="form-row">
+      <label for="dlgWorker">Network route</label>
+      <select id="dlgWorker"><option value="">Direct</option></select>
+    </div>
+    <div class="context-indicator" id="ctxIndicator" hidden>
+      <span><span class="dot on"></span>Referer</span>
+      <span><span class="dot on"></span>Origin</span>
+      <span><span class="dot on"></span>User-Agent</span>
     </div>
     <div id="dlgMsg" class="msg"></div>
-  </dialog>
+  </div>
+
+  <!-- Sticky footer (shown when import form is open) -->
+  <footer id="importFooter" hidden>
+    <button type="button" id="dlgCancel">Cancel</button>
+    <button class="primary" type="button" id="dlgStart">Start Import</button>
+  </footer>
 
   <script src="popup.js" type="module"></script>
 </body>

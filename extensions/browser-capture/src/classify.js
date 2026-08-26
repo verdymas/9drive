@@ -95,3 +95,72 @@ export function detectFilename({ url, pageTitle, fallback }) {
   }
   return fallback || 'captured-file'
 }
+
+// ── Capture grouping (for the popup) ────────────────────────────────────────
+
+/**
+ * Group captures for display:
+ *  - Non-HLS: each stays its own group.
+ *  - HLS variants from the same page: one group with a primary + variants.
+ *    "Same page" is defined by matching `pageUrl` origin+path (ignoring query).
+ *    The primary is the first detected; variants are the rest.
+ *
+ * Returns an array of group objects:
+ *  { type: 'single', ...capture }           — a non-HLS or lone HLS capture
+ *  { type: 'hls-group', primary: capture, variants: capture[] }  — grouped HLS
+ */
+export function groupCaptures(captures) {
+  const pending = captures.filter((c) => c.status !== 'expired' && c.status !== 'consumed')
+
+  const hls = []
+  const singles = []
+
+  for (const c of pending) {
+    if (c.type === 'hls' || c.type === 'dash') hls.push(c)
+    else singles.push({ ...c, type: 'single' })
+  }
+
+  // Group HLS by page origin+path (ignoring query strings).
+  const byPage = new Map()
+  for (const c of hls) {
+    const key = hlsGroupKey(c)
+    if (!byPage.has(key)) byPage.set(key, [])
+    byPage.get(key).push(c)
+  }
+
+  const groups = [...singles]
+  for (const [, variants] of byPage) {
+    if (variants.length === 1) {
+      groups.push({ ...variants[0], type: 'single' })
+    } else {
+      // Primary = first detected; variants = rest sorted by quality hint.
+      const primary = variants[0]
+      const rest = variants.slice(1).sort((a, b) => qualityRank(a.filename) - qualityRank(b.filename))
+      groups.push({ type: 'hls-group', primary, variants: [primary, ...rest] })
+    }
+  }
+
+  // Sort: groups first, then by most recent detection.
+  return groups.sort((a, b) => {
+    const ta = (a.type === 'hls-group' ? a.primary : a).ts ?? 0
+    const tb = (b.type === 'hls-group' ? b.primary : b).ts ?? 0
+    return tb - ta
+  })
+}
+
+function hlsGroupKey(capture) {
+  // Group by page URL origin + path (ignore query, which carries signed tokens).
+  try {
+    const u = new URL(capture.pageUrl || capture.url)
+    return `${u.origin}${u.pathname}`
+  } catch {
+    return capture.pageUrl || capture.url || capture.id
+  }
+}
+
+/** Rough quality rank from filename: higher number = higher quality. */
+function qualityRank(filename) {
+  if (!filename) return 0
+  const m = filename.match(/(\d{3,4})p?/i)
+  return m ? parseInt(m[1], 10) : 0
+}

@@ -8,7 +8,7 @@
  * Remote Import pipeline.
  */
 import { classifyResource, detectFilename } from './classify.js'
-import { addCapture, allCaptures, pruneAgainstServer, removeCapture, updateCapture } from './store.js'
+import { addCapture, allCaptures, countPending, pruneAgainstServer, removeCapture, updateCapture } from './store.js'
 import { getConfig, heartbeat, submitResource, deleteServerResource, setConfig, resolveApiRoot, requestTo } from './api.js'
 
 const EXT_VERSION = chrome.runtime.getManifest().version
@@ -95,8 +95,11 @@ chrome.webRequest.onHeadersReceived.addListener(
       status: 'detected',
       ts: Date.now(),
     }
-    await addCapture(entry)
-    await updateBadge()
+    const added = await addCapture(entry)
+    if (added) {
+      console.debug(`[capture] resource_saved id=${added.id} type=${added.type} status=${added.status}`)
+      await updateBadge()
+    }
     void syncCapture(entry, safeContext)
   },
   { urls: ['http://*/*', 'https://*/*'] },
@@ -125,10 +128,10 @@ async function updateCaptureByRemoteId(url, patch) {
 // ── Badge + periodic sync ───────────────────────────────────────────────────
 
 async function updateBadge() {
-  const list = await allCaptures()
-  const pending = list.filter((c) => c.status === 'detected').length
+  const pending = await countPending()
   await chrome.action.setBadgeText({ text: pending > 0 ? String(pending) : '' })
   await chrome.action.setBadgeBackgroundColor({ color: '#2563eb' })
+  console.debug(`[badge] pending_count=${pending}`)
 }
 
 chrome.alarms.create('sync', { periodInMinutes: 5 })
@@ -157,11 +160,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     switch (msg?.type) {
       case 'getState': {
         const [cfg, captures] = await Promise.all([getConfig(), allCaptures()])
+        const pending = captures.filter((c) => c.status === 'detected' || c.status === 'pending')
+        console.debug(`[popup] loaded_resources=${pending.length}`)
         sendResponse({
           connected: Boolean(cfg.baseUrl && cfg.deviceToken),
           baseUrl: cfg.baseUrl,
           deviceName: cfg.deviceName,
-          captures: captures.filter((c) => c.status !== 'expired'),
+          captures: pending,
         })
         return
       }
