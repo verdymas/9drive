@@ -30,7 +30,10 @@ services:
 
   backend:
     build:
-      context: ./backend
+      # Repo root context: the Dockerfile copies backend/ for the app and
+      # extensions/ for the Browser Capture zip served at /browser-capture/extension.zip.
+      context: .
+      dockerfile: backend/Dockerfile
     restart: unless-stopped
     depends_on:
       mysql:
@@ -101,7 +104,8 @@ services:
 
   remote-import-worker:
     build:
-      context: ./backend
+      context: .
+      dockerfile: backend/Dockerfile
     restart: unless-stopped
     command: ["sh", "-c", "npm run db:migrate:deploy && node dist/modules/remote-imports/worker-entry.js"]
     depends_on:

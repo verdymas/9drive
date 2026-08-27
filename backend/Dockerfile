@@ -2,8 +2,9 @@ FROM node:20-alpine AS base
 
 WORKDIR /app
 
-COPY package*.json ./
-COPY prisma ./prisma
+# Build context is the repo root (see docker-compose.yml) — prefix backend/.
+COPY backend/package*.json ./
+COPY backend/prisma ./prisma
 
 RUN npm ci
 
@@ -13,9 +14,11 @@ RUN npm ci
 # missing — installing them here keeps the worker image self-contained.
 RUN apk add --no-cache ffmpeg
 
-COPY tsconfig.json ./
-COPY src ./src
-COPY scripts ./scripts
+COPY backend/tsconfig.json ./
+COPY backend/src ./src
+COPY backend/scripts ./scripts
+# Browser Capture extension source — served as a zip at /browser-capture/extension.zip.
+COPY extensions ./extensions
 
 RUN npm run build && npx prisma generate
 

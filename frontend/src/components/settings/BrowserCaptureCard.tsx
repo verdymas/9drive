@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { MonitorSmartphone, Plus, Trash2, RefreshCcw, Copy, Check, Download, Link2 } from 'lucide-react'
+import { MonitorSmartphone, Plus, Trash2, RefreshCcw, Copy, Check, Download } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { apiFetch, API_URL } from '@/lib/api'
@@ -23,7 +23,8 @@ type Device = {
 export function BrowserCaptureCard() {
   const [devices, setDevices] = useState<Device[]>([])
   const [pairing, setPairing] = useState<Pairing | null>(null)
-  const [copied, setCopied] = useState(false)
+  const [copiedCode, setCopiedCode] = useState(false)
+  const [copiedUrl, setCopiedUrl] = useState(false)
   const [busy, setBusy] = useState(false)
 
   const load = useCallback(async () => {
@@ -42,7 +43,8 @@ export function BrowserCaptureCard() {
     try {
       const p = await apiFetch<Pairing>('/browser-capture/devices/pairing', { method: 'POST' })
       setPairing(p)
-      setCopied(false)
+      setCopiedCode(false)
+      setCopiedUrl(false)
     } catch (e) {
       alert((e as Error).message)
     } finally {
@@ -62,17 +64,24 @@ export function BrowserCaptureCard() {
     await load()
   }
 
-  const copyCode = async () => {
-    if (!pairing) return
-    await navigator.clipboard.writeText(pairing.code)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1500)
+  const copyCode = async (code: string) => {
+    try {
+      await navigator.clipboard.writeText(code)
+      setCopiedCode(true)
+      setTimeout(() => setCopiedCode(false), 1500)
+    } catch {
+      /* clipboard unavailable — ignore */
+    }
   }
 
   const copyBackendUrl = async () => {
-    await navigator.clipboard.writeText(API_URL)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1500)
+    try {
+      await navigator.clipboard.writeText(API_URL)
+      setCopiedUrl(true)
+      setTimeout(() => setCopiedUrl(false), 1500)
+    } catch {
+      /* clipboard unavailable — ignore */
+    }
   }
 
   const downloadExtension = async () => {
@@ -112,12 +121,12 @@ export function BrowserCaptureCard() {
           <p className="text-xs font-semibold text-blue-900">One-time pairing code (expires {new Date(pairing.expiresAt).toLocaleTimeString()})</p>
           <div className="mt-1.5 flex items-center gap-2">
             <code className="min-w-0 flex-1 break-all rounded-lg bg-white px-2 py-1.5 text-[12px]">{pairing.code}</code>
-            <Button size="sm" variant="outline" onClick={copyCode}>{copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}{copied ? 'Copied' : 'Copy'}</Button>
+            <Button size="sm" variant="outline" onClick={() => copyCode(pairing.code)}>{copiedCode ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}{copiedCode ? 'Copied' : 'Copy'}</Button>
           </div>
           <p className="mt-2.5 text-xs font-semibold text-blue-900">Connect the extension to this backend URL</p>
           <div className="mt-1.5 flex items-center gap-2">
             <code className="min-w-0 flex-1 break-all rounded-lg bg-white px-2 py-1.5 text-[12px]">{API_URL}</code>
-            <Button size="sm" variant="outline" onClick={copyBackendUrl}><Link2 className="h-4 w-4" />Copy</Button>
+            <Button size="sm" variant="outline" onClick={copyBackendUrl}>{copiedUrl ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}{copiedUrl ? 'Copied' : 'Copy'}</Button>
           </div>
         </div>
       ) : null}

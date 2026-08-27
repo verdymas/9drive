@@ -110,6 +110,14 @@
     footer button.primary:hover { background: var(--primary-hover); }
     footer button:disabled { opacity: 0.5; cursor: not-allowed; }
 
+    /* ── Clear All button (header) ──────────────────────── */
+    .clear-btn {
+      font-size: 11px; padding: 4px 10px; border: 1px solid var(--border);
+      border-radius: 99px; background: var(--bg-alt); color: var(--danger);
+      cursor: pointer; font-weight: 600;
+    }
+    .clear-btn:hover { background: var(--danger-bg); }
+
     /* ── Status messages ────────────────────────────────── */
     .msg { font-size: 12px; margin-top: 6px; }
     .msg.ok { color: var(--success); }
@@ -124,8 +132,14 @@
 
   <!-- Header -->
   <header>
-    <h1>9Drive Capture</h1>
-    <span id="conn" class="badge off">Not connected</span>
+    <div style="display:flex;align-items:center;gap:8px">
+      <img src="../icons/icon48.png" alt="9Drive" style="width:24px;height:24px;border-radius:4px">
+      <h1>9Drive Capture</h1>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button id="clearAll" hidden class="clear-btn">Clear All</button>
+      <span id="conn" class="badge off">Not connected</span>
+    </div>
   </header>
 
   <!-- Pair form (shown when not connected) -->

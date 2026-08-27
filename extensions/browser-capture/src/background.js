@@ -7,8 +7,8 @@
  * The extension NEVER downloads file bytes; import goes through the backend's
  * Remote Import pipeline.
  */
-import { classifyResource, detectFilename } from './classify.js'
-import { addCapture, allCaptures, countPending, pruneAgainstServer, removeCapture, updateCapture } from './store.js'
+import { classifyResource, detectFilename, displayTypeFor, extractQuality } from './classify.js'
+import { addCapture, allCaptures, clearAllCaptures, countPending, pruneAgainstServer, removeCapture, updateCapture } from './store.js'
 import { getConfig, heartbeat, submitResource, deleteServerResource, setConfig, resolveApiRoot, requestTo } from './api.js'
 
 const EXT_VERSION = chrome.runtime.getManifest().version
@@ -36,12 +36,18 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     const cls = classifyResource(info.linkUrl, null)
     if (!cls || cls.sub === 'segment') return // unsupported link — ignore silently
     const cfg = await getConfig()
+    const detectedName = detectFilename({ url: info.linkUrl, fallback: '' })
     const entry = {
       url: info.linkUrl,
       type: cls.type,
+      displayType: displayTypeFor(cls.type, null),
       mime: null,
       pageUrl: info.pageUrl ?? tab?.url ?? null,
-      filename: detectFilename({ url: info.linkUrl, fallback: '' }),
+      filename: detectedName,
+      estimatedSize: null,
+      sizeSource: null,
+      quality: extractQuality(detectedName),
+      customFilename: null,
       status: 'detected',
       ts: Date.now(),
     }
@@ -86,12 +92,20 @@ chrome.webRequest.onHeadersReceived.addListener(
         }
       } catch { /* non-http initiator */ }
     }
+    const contentLength = headers.get('content-length')
+    const size = contentLength && /^\d+$/.test(contentLength) ? Number(contentLength) : null
+    const detectedName = detectFilename({ url: details.url, contentDisposition: headers.get('content-disposition'), fallback: '' })
     const entry = {
       url: details.url,
       type: cls.type,
+      displayType: displayTypeFor(cls.type, mimeHeader),
       mime: mimeHeader ?? null,
       pageUrl,
-      filename: detectFilename({ url: details.url, fallback: '' }),
+      filename: detectedName,
+      estimatedSize: size,
+      sizeSource: size != null ? 'content-length' : null,
+      quality: extractQuality(detectedName),
+      customFilename: null,
       status: 'detected',
       ts: Date.now(),
     }
@@ -160,10 +174,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     switch (msg?.type) {
       case 'getState': {
         const [cfg, captures] = await Promise.all([getConfig(), allCaptures()])
+        // Verify the device token still works — a revoked/rotated device must
+        // surface as "Not connected" immediately, not after the next 5-min sweep.
+        // heartbeat() clears the stored token on DEVICE_TOKEN_INVALID.
+        let connected = Boolean(cfg.baseUrl && cfg.deviceToken)
+        if (connected) {
+          try {
+            await heartbeat(EXT_VERSION)
+          } catch {
+            const fresh = await getConfig()
+            connected = Boolean(fresh.baseUrl && fresh.deviceToken)
+          }
+        }
         const pending = captures.filter((c) => c.status === 'detected' || c.status === 'pending')
         console.debug(`[popup] loaded_resources=${pending.length} (raw=${captures.length})`)
         sendResponse({
-          connected: Boolean(cfg.baseUrl && cfg.deviceToken),
+          connected,
           baseUrl: cfg.baseUrl,
           deviceName: cfg.deviceName,
           captures: pending,
@@ -200,6 +226,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         await updateBadge()
         sendResponse({ ok: true })
         return
+      case 'clearAll': {
+        await clearAllCaptures()
+        await updateBadge()
+        sendResponse({ ok: true })
+        return
+      }
+      case 'updateCapture': {
+        await updateCapture(msg.id, msg.patch)
+        await updateBadge()
+        sendResponse({ ok: true })
+        return
+      }
     }
   })()
   return true // async response

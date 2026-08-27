@@ -83,17 +83,74 @@ export function filenameFromUrl(url) {
 }
 
 /**
- * Filename priority chain (spec Phase 06 subset): Content-Disposition-style
- * name > URL path > page title > fallback. Signed query strings are never used.
+ * Extract the `filename=` value from a Content-Disposition header. Handles
+ * quoted and unquoted values; RFC 5987 `filename*` (UTF-8 encoded) is skipped —
+ * the backend's Remote Import probe re-encodes the name at import time.
+ * Returns null when absent/unparseable.
  */
-export function detectFilename({ url, pageTitle, fallback }) {
+export function parseContentDispositionFilename(header) {
+  if (!header) return null
+  const m = /filename\s*=\s*(?:"([^"]+)"|([^;]+))(?:\s*;|$)/i.exec(header)
+  const name = m ? (m[1] ?? m[2])?.trim() : null
+  return name && name.length > 0 ? name.replace(/[\\/:*?"<>|]+/g, '-').slice(0, 255) : null
+}
+
+/**
+ * Filename priority chain: Content-Disposition > URL path > page title >
+ * fallback. Signed query strings are never used. Generic HLS manifest names
+ * (master/playlist/index) are skipped when a better name exists.
+ */
+export function detectFilename({ url, pageTitle, contentDisposition, fallback }) {
+  const fromHeader = parseContentDispositionFilename(contentDisposition)
+  if (fromHeader) return fromHeader
   const fromUrl = filenameFromUrl(url)
-  if (fromUrl) return fromUrl
+  if (fromUrl && !isGenericManifestName(fromUrl)) return fromUrl
   if (pageTitle) {
     const clean = String(pageTitle).replace(/[\r\n\t]+/g, ' ').trim().slice(0, 100)
     if (clean) return clean
   }
-  return fallback || 'captured-file'
+  return fromUrl || fallback || 'captured-file'
+}
+
+/** True for generic HLS/DASH manifest names that carry no real identity. */
+function isGenericManifestName(name) {
+  return /^(master|playlist|index|variant|media|chunklist)\.(m3u8?|mpd)$/i.test(name)
+}
+
+/** User-facing display type; never raw MIME as the main label. */
+export function displayTypeFor(type, mime) {
+  if (type === 'hls') return 'HLS Stream'
+  if (type === 'dash') return 'MPEG-DASH'
+  if (type === 'video') return 'Video'
+  if (type === 'audio') return 'Audio'
+  if (type === 'document') {
+    const m = (mime || '').toLowerCase()
+    return m === 'application/pdf' ? 'PDF Document' : 'Document'
+  }
+  return 'Unknown'
+}
+
+/** Extract a quality label (e.g. "1080p") from a filename, or null. */
+export function extractQuality(filename) {
+  if (!filename) return null
+  const m = filename.match(/(?:^|[._\s-])(\d{3,4})p?(?:[._\s-]|$)/i)
+  return m ? `${m[1]}p` : null
+}
+
+/**
+ * Estimate size in bytes from a Content-Length value, or for HLS from
+ * (targetDuration × EXTINF sum × bandwidth / 8). Returns null when unknown.
+ */
+export function estimateSize({ type, contentLength, hls }) {
+  if (type !== 'hls') {
+    if (contentLength == null || !/^\d+$/.test(String(contentLength))) return null
+    return Number(contentLength)
+  }
+  // HLS: durationSeconds (from EXTINF/EXT-X-TARGETDURATION) × bitrate / 8.
+  const duration = Number(hls?.durationSeconds ?? 0)
+  const bandwidth = Number(hls?.bandwidth ?? 0)
+  if (!(duration > 0) || !(bandwidth > 0)) return null
+  return Math.round((duration * bandwidth) / 8)
 }
 
 // ── Capture grouping (for the popup) ────────────────────────────────────────

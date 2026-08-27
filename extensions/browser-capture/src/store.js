@@ -45,6 +45,11 @@ export async function removeCapture(id) {
   await saveCaptures(list)
 }
 
+/** Remove every local capture (including submitted/consumed/expired). */
+export async function clearAllCaptures() {
+  await chrome.storage.local.set({ [KEY]: [] })
+}
+
 export async function updateCapture(id, patch) {
   const list = await allCaptures()
   const row = list.find((c) => c.id === id)

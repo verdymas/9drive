@@ -4,7 +4,7 @@
   "main": "dist/server.js",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc && node scripts/copy-relay-asset.mjs",
+    "build": "tsc && node scripts/copy-relay-asset.mjs && node scripts/zip-extension.mjs",
     "start": "node dist/server.js",
     "start:deploy": "npm run db:migrate:deploy && node dist/server.js",
     "prisma:generate": "prisma generate",
@@ -17,6 +17,7 @@
     "test:s3": "tsx src/scripts/test-s3-connection.ts",
     "test:api-upload": "tsx src/scripts/test-api-upload.ts",
     "test:cloudflare-relay": "tsx scripts/test-cloudflare-relay.ts",
+    "zip:extension": "node scripts/zip-extension.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

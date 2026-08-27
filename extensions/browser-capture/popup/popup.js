@@ -4,7 +4,7 @@
  * Architecture: single `state` object + `render()` function.
  * No framework; chrome popups are tiny — imperative DOM is fastest and clearest.
  */
-import { groupCaptures } from '../src/classify.js'
+import { groupCaptures, displayTypeFor } from '../src/classify.js'
 
 const $ = (sel) => document.querySelector(sel)
 
@@ -96,6 +96,9 @@ function render() {
   conn.textContent = state.connected ? 'Connected' : 'Not connected'
   conn.className = `badge ${state.connected ? 'on' : 'off'}`
 
+  // Clear All — only when there are captures to clear
+  $('#clearAll').hidden = state.captures.length === 0
+
   // Pair form
   $('#pairForm').hidden = state.connected
 
@@ -147,18 +150,21 @@ function renderCaptureCard(capture) {
 
   const icon = { video: '🎬', hls: '🎬', dash: '🎬', document: '📄' }[capture.type] ?? '📦'
   const domain = safeDomain(capture.url || capture.pageUrl)
+  const dt = displayTypeFor(capture.type, capture.mime)
+  const name = capture.customFilename || capture.filename || '(unnamed)'
 
   div.innerHTML = `
     <div class="card-header">
       <div>
-        <div class="card-name">${esc(capture.filename || '(unnamed)')}</div>
+        <div class="card-name">${icon} ${esc(name)}</div>
         <div class="card-meta">
-          <span>${icon} ${capture.type.toUpperCase()}</span>
-          ${capture.mime ? `<span>${esc(capture.mime)}</span>` : ''}
-          ${domain ? `<span class="domain">${esc(domain)}</span>` : ''}
+          <span>${esc(dt)}</span>
+          ${capture.quality ? `<span>Quality: ${esc(capture.quality)}</span>` : ''}
+          <span>Estimated size: ${formatSize(capture.estimatedSize)}</span>
+          ${domain ? `<span class="domain">Source: ${esc(domain)}</span>` : ''}
         </div>
       </div>
-      <span class="type-badge">${esc(capture.type)}</span>
+      <span class="type-badge">${esc(dt)}</span>
     </div>
     <div class="card-actions">
       <button class="primary" data-act="import">Import</button>
@@ -178,17 +184,23 @@ function renderHlsGroup(group) {
   div.className = 'card'
   const domain = safeDomain(group.primary.url || group.primary.pageUrl)
   const variants = group.variants
+  const dt = displayTypeFor(group.primary.type, group.primary.mime)
+  // Sum variant sizes for the group estimate; unknown sizes are excluded.
+  const sizes = variants.map((v) => v.estimatedSize).filter((s) => s != null)
+  const groupSize = sizes.length > 0 ? sizes.reduce((a, b) => a + b, 0) : null
 
   div.innerHTML = `
     <div class="card-header">
       <div>
-        <div class="card-name">🎬 HLS Stream</div>
+        <div class="card-name">🎬 ${esc(group.primary.customFilename || group.primary.filename || 'HLS Stream')}</div>
         <div class="card-meta">
+          <span>${esc(dt)}</span>
           <span>${variants.length} variant${variants.length > 1 ? 's' : ''}</span>
-          ${domain ? `<span class="domain">${esc(domain)}</span>` : ''}
+          <span>Estimated size: ${formatSize(groupSize)}</span>
+          ${domain ? `<span class="domain">Source: ${esc(domain)}</span>` : ''}
         </div>
       </div>
-      <span class="type-badge">HLS</span>
+      <span class="type-badge">${esc(dt)}</span>
     </div>
     <div class="hls-variants">
       ${variants.map((v, i) => `<div class="hls-variant"><span class="dot"></span>${esc(qualityLabel(v.filename, i))}</div>`).join('')}
@@ -225,7 +237,7 @@ function renderForm() {
   const capture = state.captures.find((c) => c.id === state.selectedId)
   if (!capture) { state.selectedId = null; render(); return }
 
-  $('#dlgName').value = capture.filename || ''
+  $('#dlgName').value = capture.customFilename || capture.filename || ''
 
   // Context indicator
   const ctx = $('#ctxIndicator')
@@ -280,6 +292,9 @@ function cancelImport() {
 async function startImport() {
   const capture = state.captures.find((c) => c.id === state.selectedId)
   if (!capture) return
+  // Snapshot the user's edited filename BEFORE render() re-populates the input
+  // from capture.filename — render() must never overwrite explicit user input.
+  const userFilename = $('#dlgName').value.trim() || null
   state.importStatus = 'submitting'
   render()
 
@@ -302,7 +317,7 @@ async function startImport() {
       method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       body: JSON.stringify({
-        filename: $('#dlgName').value.trim() || null,
+        filename: userFilename,
         folderId: $('#dlgFolder').value || null,
         connectedAccountId: $('#dlgAccount').value || null,
         workerId: $('#dlgWorker').value || null,
@@ -310,6 +325,10 @@ async function startImport() {
     })
     const data = await res.json().catch(() => ({}))
     if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`)
+    // Persist the user's edited filename so reopening the dialog keeps it.
+    if (userFilename && userFilename !== capture.filename) {
+      await send({ type: 'updateCapture', id: capture.id, patch: { customFilename: userFilename } })
+    }
     await send({ type: 'markConsumed', url: capture.url })
     state.importStatus = 'success'
     render()
@@ -327,8 +346,30 @@ async function removeCapture(id) {
   await refreshState()
 }
 
+// ── Clear all ────────────────────────────────────────────────────────────────
+
+async function clearAll() {
+  const ok = confirm('Clear all captured files?\n\nThis only removes the capture list.\nIt does not delete files from 9Drive storage.')
+  if (!ok) return
+  await send({ type: 'clearAll' })
+  state.captures = []
+  state.selectedId = null
+  state.importStatus = 'idle'
+  state.importMsg = ''
+  render()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+function formatSize(bytes) {
+  if (bytes == null) return 'Unknown'
+  const n = Number(bytes)
+  if (!Number.isFinite(n) || n < 0) return 'Unknown'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
 function stripQuery(url) { try { const u = new URL(url); u.search = ''; u.hash = ''; return u.href } catch { return url } }
 function safeDomain(url) { try { return new URL(url).hostname } catch { return '' } }
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML }
@@ -352,6 +393,7 @@ $('#pairForm').addEventListener('submit', async (e) => {
 
 $('#dlgCancel').onclick = cancelImport
 $('#dlgStart').onclick = startImport
+$('#clearAll').onclick = clearAll
 
 // ── Init ────────────────────────────────────────────────────────────────────
 

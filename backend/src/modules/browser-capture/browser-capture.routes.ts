@@ -3,7 +3,6 @@ import type { NextFunction, Request, Response } from 'express'
 import { z } from 'zod'
 import fs from 'node:fs'
 import path from 'node:path'
-import { ZipArchive } from 'archiver'
 import { prisma } from '../../config/prisma.js'
 import { env } from '../../config/env.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
@@ -194,25 +193,37 @@ browserCaptureRouter.delete('/resources/:id', requireDevice, async (req: DeviceR
 
 // ── Extension download (authenticated) ───────────────────────────────────────
 
-/** Stream the browser-extension package as a zip for manual installation. */
+/** Resolve the extension dir by walking up from __dirname until `extensions`
+ *  is found. __dirname depth differs between dev (src/, 4 ups) and compiled
+ *  (dist/, 3 ups to the app root) — a fixed hop count breaks one of them. */
+function resolveExtensionDir(): string {
+  const configured = env.BROWSER_CAPTURE_EXTENSION_DIR
+  if (configured) return path.resolve(configured)
+  let dir = path.resolve(__dirname)
+  for (let i = 0; i < 6; i++) {
+    const candidate = path.join(dir, 'extensions', 'browser-capture')
+    if (fs.existsSync(candidate)) return candidate
+    const parent = path.dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return path.join(dir, 'extensions', 'browser-capture')
+}
+
+/** Stream the pre-built browser-extension zip for manual installation. */
 browserCaptureRouter.get('/extension.zip', requireAuth, async (_req, res, next) => {
   try {
-    // Resolve the extension dir relative to the backend package root. In dev
-    // it's ../../extensions/browser-capture; the backend's compiled location
-    // may differ in production, so allow an env override.
-    const configured = env.BROWSER_CAPTURE_EXTENSION_DIR
-    const extDir = configured
-      ? path.resolve(configured)
-      : path.resolve(__dirname, '..', '..', '..', '..', 'extensions', 'browser-capture')
-    if (!fs.existsSync(extDir)) return res.status(404).json({ code: 'EXTENSION_NOT_FOUND', message: 'Extension package not available on this server.' })
+    // The zip is generated at build time by `npm run build` (or
+    // `npm run zip:extension`) into extensions/9drive-browser-capture-ext.zip
+    // and must exist before serving.
+    const extDir = resolveExtensionDir()
+    const zipPath = path.resolve(extDir, '..', '9drive-browser-capture-ext.zip')
+    if (!fs.existsSync(zipPath)) {
+      return res.status(404).json({ code: 'EXTENSION_NOT_FOUND', message: 'Extension package not built. Run npm run build first.' })
+    }
     res.setHeader('Content-Type', 'application/zip')
     res.setHeader('Content-Disposition', 'attachment; filename="9drive-capture.zip"')
-    const archive = new ZipArchive({ zlib: { level: 9 } })
-    archive.on('error', (err: any) => { throw err })
-    archive.pipe(res)
-    // Exclude tests/ and node_modules (if any) from the zip.
-    archive.glob('**/*', { cwd: extDir, ignore: ['tests/**', 'node_modules/**'] })
-    await archive.finalize()
+    fs.createReadStream(zipPath).pipe(res)
   } catch (error) {
     return next(error)
   }

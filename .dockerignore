@@ -1,0 +1,9 @@
+# Root build context (backend service now uses `context: .`). Keep the image
+# lean: node_modules, build output, env, and local dotfiles.
+**/node_modules
+**/dist
+**/.env
+**/.env.local
+**/.env.*.local
+**/npm-debug.log
+.git

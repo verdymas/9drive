@@ -63,6 +63,12 @@ async function request(path, { method = 'GET', body, auth = true } = {}) {
   const text = await res.text()
   const data = safeJson(text)
   if (!res.ok) {
+    // A revoked/rotated device token invalidates the stored connection — clear
+    // it so the popup's getState reports "Not connected" instead of pretending
+    // the device is still paired. Never let a stale local token linger.
+    if (res.status === 401 && data?.code === 'DEVICE_TOKEN_INVALID' && auth) {
+      await clearConnection()
+    }
     const err = new Error(data?.message || res.statusText || `HTTP ${res.status}`)
     err.code = data?.code || `HTTP_${res.status}`
     err.status = res.status
