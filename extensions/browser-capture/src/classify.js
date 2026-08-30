@@ -8,6 +8,8 @@
  *  - Never derive filenames from query strings (signed params).
  */
 
+import { parseContentDispositionFilename as parseCdFilename, sanitizeFilename } from './filename-resolver.js'
+
 const VIDEO_EXT = /\.(m3u8|mpd|mp4|webm|m4v|mkv|mov)(?:$|[?#])/i
 const DOC_EXT = /\.(pdf|docx?|xlsx?|pptx?|epub)(?:$|[?#])/i
 
@@ -83,26 +85,27 @@ export function filenameFromUrl(url) {
 }
 
 /**
- * Extract the `filename=` value from a Content-Disposition header. Handles
- * quoted and unquoted values; RFC 5987 `filename*` (UTF-8 encoded) is skipped —
- * the backend's Remote Import probe re-encodes the name at import time.
+ * Extract the filename from a Content-Disposition header, honoring `filename*`
+ * (RFC 5987, UTF-8) with `filename` fallback. Delegates to the shared
+ * filename-resolver parser (port of the backend's content-disposition-parser).
  * Returns null when absent/unparseable.
  */
 export function parseContentDispositionFilename(header) {
-  if (!header) return null
-  const m = /filename\s*=\s*(?:"([^"]+)"|([^;]+))(?:\s*;|$)/i.exec(header)
-  const name = m ? (m[1] ?? m[2])?.trim() : null
-  return name && name.length > 0 ? name.replace(/[\\/:*?"<>|]+/g, '-').slice(0, 255) : null
+  return parseCdFilename(header)
 }
 
 /**
  * Filename priority chain: Content-Disposition > URL path > page title >
  * fallback. Signed query strings are never used. Generic HLS manifest names
  * (master/playlist/index) are skipped when a better name exists.
+ *
+ * @deprecated Use resolveFilename() from filename-resolver.js (candidate
+ * scoring + metadata + HLS container handling). Kept for the popup's
+ * qualityLabel/grouping logic and backward compatibility.
  */
 export function detectFilename({ url, pageTitle, contentDisposition, fallback }) {
   const fromHeader = parseContentDispositionFilename(contentDisposition)
-  if (fromHeader) return fromHeader
+  if (fromHeader) return sanitizeFilename(fromHeader)
   const fromUrl = filenameFromUrl(url)
   if (fromUrl && !isGenericManifestName(fromUrl)) return fromUrl
   if (pageTitle) {
@@ -114,7 +117,7 @@ export function detectFilename({ url, pageTitle, contentDisposition, fallback })
 
 /** True for generic HLS/DASH manifest names that carry no real identity. */
 function isGenericManifestName(name) {
-  return /^(master|playlist|index|variant|media|chunklist)\.(m3u8?|mpd)$/i.test(name)
+  return /^(master|playlist|index|variant|media|chunklist|manifest|stream|file|download|chunk|segment|prog_index|main|source|output|\d{3,4})\.(m3u8?|mpd|mp4|webm|mkv|mov|ts)$/i.test(name)
 }
 
 /** User-facing display type; never raw MIME as the main label. */

@@ -522,16 +522,15 @@ describe('createRemoteImport', () => {
     expect(h.enqueueSpy).toHaveBeenCalledWith(created.id, 1)
   })
 
-  it('rejects an explicit filename extension contradicting the container', async () => {
-    await expect(
-      createRemoteImport({
-        userId: 'user-1',
-        sourceUrl: 'https://cdn.example/playlist.m3u8',
-        fileName: 'Movie.mp4',
-        hls: { sourceType: 'hls_media', outputContainer: 'mkv' },
-      }),
-    ).rejects.toMatchObject({ code: 'FILE_NAME_EXTENSION_MISMATCH' })
-    expect(h.enqueueSpy).not.toHaveBeenCalled()
+  it('silently replaces an explicit filename extension contradicting the container', async () => {
+    const created = await createRemoteImport({
+      userId: 'user-1',
+      sourceUrl: 'https://cdn.example/playlist.m3u8',
+      fileName: 'Movie.mp4',
+      hls: { sourceType: 'hls_media', outputContainer: 'mkv' },
+    })
+    expect(created.fileName).toBe('Movie.mkv')
+    expect(h.enqueueSpy).toHaveBeenCalledWith(created.id, 1)
   })
 
   it('appends the output container extension when none is given', async () => {

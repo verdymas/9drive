@@ -18,6 +18,14 @@
     "service_worker": "src/background.js",
     "type": "module"
   },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["src/content-script.js"],
+      "run_at": "document_end",
+      "all_frames": false
+    }
+  ],
   "action": {
     "default_popup": "popup/popup.html",
     "default_title": "9Drive Capture",

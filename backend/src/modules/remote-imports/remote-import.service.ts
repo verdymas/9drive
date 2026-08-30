@@ -122,6 +122,10 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
     // Content-Type. Never overwrites an explicit extension and never guesses.
     : appendExtensionFromMime(fileName, input.mimeType)
 
+  // Safe provenance diagnostics (never URLs, cookies, tokens, or secrets).
+  const nameSource = input.fileName ? 'explicit' : input.detectedFileName ? 'probe' : 'url-fallback'
+  console.debug(`[remote-import:filename] stage=create source=${nameSource} canonical=${finalFileName}`)
+
   const created = await prisma.remoteImport.create({
     data: {
       userId: input.userId,
@@ -179,8 +183,11 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
  * the pipeline re-derives it later once the real container is known).
  *
  * A user-entered explicit extension that contradicts the selected container is
- * rejected with FILE_NAME_EXTENSION_MISMATCH — the name the user sees in the
- * create modal must be the name that is ultimately uploaded (§4).
+ * silently replaced by the container's extension — the canonical basename is
+ * preserved, only the last extension is swapped. The extension's FilenameResolver
+ * always suggests `.mkv` (the default container) and cannot know a backend
+ * configured for MP4 (`REMOTE_IMPORT_HLS_DEFAULT_CONTAINER=mp4`), so rejecting
+ * would fail the import at creation (§5: adjust only the extension).
  */
 export function hlsFinalFileName(fileName: string, outputContainer: string | undefined): string {
   const extension = outputContainer === 'mp4' ? 'mp4' : 'mkv'
@@ -190,7 +197,11 @@ export function hlsFinalFileName(fileName: string, outputContainer: string | und
     // A name whose extension already matches the output container is the
     // canonical requested name — never re-derive it (no double extension).
     if (given === extension) return fileName
-    throw new AppError('FILE_NAME_EXTENSION_MISMATCH', `The file name extension (.${given}) must match the selected output container (${extension.toUpperCase()}).`, 400)
+    // Extension mismatch: silently replace with the output container's
+    // extension. The canonical basename is preserved — only the last
+    // extension is swapped.
+    const base = fileName.replace(/\.[^.]+$/, '')
+    return `${base || 'video'}.${extension}`
   }
   const base = fileName.replace(/\.(m3u8|m3u)$/i, '').replace(/\.+$/, '')
   return `${base || 'video'}.${extension}`

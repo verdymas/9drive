@@ -575,6 +575,7 @@ async function processHlsImport(
     // (`record.fileName`), never the pipeline-derived one (playlist basename
     // or `output.<ext>`) — the name shown in the create modal is the name
     // ultimately uploaded (§3/§5).
+    console.debug(`[remote-import:filename] stage=upload canonical=${record.fileName}`)
     const mimeType = record.mimeType ?? (mimeCodeSuffix === 'mp4' ? 'video/mp4' : 'video/x-matroska')
     const uploaded = await uploadTempFile(
       importId,
@@ -641,6 +642,9 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
   const folderId = record.folderId
   const fileName = sanitizeFileName(record.fileName)
   const mimeType = record.mimeType ?? 'application/octet-stream'
+  // Safe provenance diagnostics — the persisted canonical filename is
+  // authoritative; nothing downstream re-derives it from the URL/headers.
+  console.debug(`[remote-import:filename] stage=start canonical=${fileName}`)
   const sourceUrl = decryptText(record.sourceUrlEncrypted)
   const requestContext = decryptRequestContext(record.requestContextEncrypted) ?? undefined
   const maxBytes = BigInt(env.REMOTE_IMPORT_MAX_BYTES)
@@ -839,6 +843,7 @@ async function continueFromPart(
 
   // Upload. `uploadTempFile` starts the upload phase (stage + uploadTotalBytes
   // from the local file) and writes throttled progress for both providers.
+  console.debug(`[remote-import:filename] stage=upload canonical=${fileName}`)
   const uploaded = await uploadTempFile(importId, { id: account.id, provider: account.provider }, userId, folderId, fileName, mimeType, tempPartPath, placement.folderStorageLocation.providerFolderId)
 
   assertWithinTimeout()

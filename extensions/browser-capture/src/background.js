@@ -7,11 +7,32 @@
  * The extension NEVER downloads file bytes; import goes through the backend's
  * Remote Import pipeline.
  */
-import { classifyResource, detectFilename, displayTypeFor, extractQuality } from './classify.js'
+import { classifyResource, displayTypeFor, extractQuality, filenameFromUrl } from './classify.js'
+import { resolveFilename } from './filename-resolver.js'
 import { addCapture, allCaptures, clearAllCaptures, countPending, pruneAgainstServer, removeCapture, updateCapture } from './store.js'
 import { getConfig, heartbeat, submitResource, deleteServerResource, setConfig, resolveApiRoot, requestTo } from './api.js'
 
 const EXT_VERSION = chrome.runtime.getManifest().version
+
+// ── Redirect tracking ────────────────────────────────────────────────────────
+// Map requestId → original URL (before redirects). onHeadersReceived fires with
+// the FINAL URL after redirects, so the original is captured here to derive a
+// better filename. In-memory: cleared on service-worker restart (acceptable —
+// details.url remains the primary source).
+
+const requestOrigins = new Map()
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    if (details.type !== 'media' && details.type !== 'xmlhttprequest' && details.type !== 'object' && details.type !== 'other') return
+    requestOrigins.set(details.requestId, { originalUrl: details.url, ts: Date.now() })
+    if (requestOrigins.size > 500) {
+      const cutoff = Date.now() - 60_000
+      for (const [id, e] of requestOrigins) { if (e.ts < cutoff) requestOrigins.delete(id) }
+    }
+  },
+  { urls: ['http://*/*', 'https://*/*'] },
+)
 
 // ── Context menu (Phase 06) ─────────────────────────────────────────────────
 
@@ -36,7 +57,8 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     const cls = classifyResource(info.linkUrl, null)
     if (!cls || cls.sub === 'segment') return // unsupported link — ignore silently
     const cfg = await getConfig()
-    const detectedName = detectFilename({ url: info.linkUrl, fallback: '' })
+    const result = resolveFilename({ requestUrl: info.linkUrl, finalUrl: info.linkUrl })
+    const detectedName = result.filename
     const entry = {
       url: info.linkUrl,
       type: cls.type,
@@ -44,6 +66,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       mime: null,
       pageUrl: info.pageUrl ?? tab?.url ?? null,
       filename: detectedName,
+      filenameSource: result.source,
       estimatedSize: null,
       sizeSource: null,
       quality: extractQuality(detectedName),
@@ -94,17 +117,56 @@ chrome.webRequest.onHeadersReceived.addListener(
     }
     const contentLength = headers.get('content-length')
     const size = contentLength && /^\d+$/.test(contentLength) ? Number(contentLength) : null
-    const detectedName = detectFilename({ url: details.url, contentDisposition: headers.get('content-disposition'), fallback: '' })
+    const finalUrl = details.url
+
+    // Page metadata + download attribute collected by the content script.
+    let pageMetadata = null
+    let downloadAttr = null
+    if (pageUrl) {
+      try {
+        const p = new URL(pageUrl)
+        if (p.protocol === 'http:' || p.protocol === 'https:') {
+          const metaKey = `pageMetadata:${p.origin}${p.pathname}`
+          const sessionData = await chrome.storage.session.get(metaKey)
+          pageMetadata = sessionData[metaKey] ?? null
+        }
+      } catch { /* non-http initiator */ }
+    }
+    if (pageMetadata) {
+      try {
+        const dlKey = `downloadAttr:${finalUrl}`
+        const dlData = await chrome.storage.session.get(dlKey)
+        downloadAttr = dlData[dlKey] ?? null
+      } catch { /* ignore */ }
+    }
+
+    const originEntry = requestOrigins.get(details.requestId)
+    const originalUrl = originEntry?.originalUrl || finalUrl
+
+    const result = resolveFilename({
+      requestUrl: originalUrl,
+      finalUrl,
+      contentDisposition: headers.get('content-disposition'),
+      downloadAttr,
+      pageMetadata,
+      type: cls.type,
+      quality: extractQuality(filenameFromUrl(finalUrl)),
+    })
+
     const entry = {
-      url: details.url,
+      url: finalUrl,
+      originalUrl,
+      finalUrl,
       type: cls.type,
       displayType: displayTypeFor(cls.type, mimeHeader),
       mime: mimeHeader ?? null,
       pageUrl,
-      filename: detectedName,
+      filename: result.filename,
+      filenameSource: result.source,
+      pageMetadata,
       estimatedSize: size,
       sizeSource: size != null ? 'content-length' : null,
-      quality: extractQuality(detectedName),
+      quality: extractQuality(result.filename),
       customFilename: null,
       status: 'detected',
       ts: Date.now(),
@@ -123,8 +185,12 @@ chrome.webRequest.onHeadersReceived.addListener(
 async function syncCapture(entry, safeContext = {}) {
   try {
     const serverRow = await submitResource({
-      ...entry,
-      pageTitle: null,
+      url: entry.url,
+      type: entry.type,
+      mimeType: entry.mime,
+      filename: entry.filename,
+      pageUrl: entry.pageUrl,
+      pageTitle: entry.pageMetadata?.title ?? null,
       requestContext: safeContext,
     })
     if (serverRow?.id) await updateCaptureByRemoteId(entry.url, { remoteId: serverRow.id })

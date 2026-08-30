@@ -393,6 +393,7 @@ export async function importCapturedResource(
     mimeType,
     ...(hls ? { hls } : {}),
   })
+  console.debug(`[browser-capture:filename] stage=import source=${input.filename ? 'user-override' : 'captured-filename'} canonical=${input.filename?.trim() || resource.filename}`)
 
   await prisma.capturedResource.updateMany({
     where: { id: resource.id, status: 'pending' },

@@ -53,8 +53,8 @@ assert.equal(parseContentDispositionFilename('attachment; filename=video.mkv'), 
 assert.equal(parseContentDispositionFilename('inline; filename="doc.pdf"'), 'doc.pdf')
 assert.equal(parseContentDispositionFilename(null), null)
 assert.equal(parseContentDispositionFilename(''), null)
-// filename* (RFC 5987) is intentionally skipped — returns null
-assert.equal(parseContentDispositionFilename("attachment; filename*=UTF-8''movie.mp4"), null)
+// filename* (RFC 5987) now supported by the shared filename-resolver parser
+assert.equal(parseContentDispositionFilename("attachment; filename*=UTF-8''movie.mp4"), 'movie.mp4')
 pass += 6
 
 // ── detectFilename with Content-Disposition ─────────────────────────────────

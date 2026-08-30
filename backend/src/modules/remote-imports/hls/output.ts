@@ -48,6 +48,11 @@ export function containerExtension(container: 'mkv' | 'mp4'): string {
  *    double extension),
  *  - a `.m3u8`/`.m3u` suffix is replaced by the output extension,
  *  - otherwise the extension is appended once.
+ *
+ * NOTE: this name is METADATA-ONLY. It describes the remuxed output for
+ * diagnostics/UI, but the processor never uses it as the canonical filename —
+ * the persisted `remote_imports.fileName` is authoritative and is what the
+ * provider upload and the `File.name` registration receive (see processor.ts).
  */
 export function hlsDerivedFileName(fileName: string, extension: string): string {
   if (fileNameHasExtension(fileName, extension)) return fileName
