@@ -11,7 +11,10 @@
 import { parseContentDispositionFilename as parseCdFilename, sanitizeFilename } from './filename-resolver.js'
 
 const VIDEO_EXT = /\.(m3u8|mpd|mp4|webm|m4v|mkv|mov)(?:$|[?#])/i
+const AUDIO_EXT = /\.(mp3|m4a|aac|oga|ogg|opus|wav|flac|aiff?|wma)(?:$|[?#])/i
 const DOC_EXT = /\.(pdf|docx?|xlsx?|pptx?|epub)(?:$|[?#])/i
+const ARCHIVE_EXT = /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|zst|iso|tar\.gz|tar\.bz2|tar\.xz|tar\.zst)(?:$|[?#])/i
+const IMAGE_EXT = /\.(jpe?g|png|gif|webp|avif|heic|bmp|tiff?|svg)(?:$|[?#])/i
 
 /** MIME → capture type. null = not capturable. */
 export function classifyMime(mime) {
@@ -20,8 +23,13 @@ export function classifyMime(mime) {
   if (m === 'application/vnd.apple.mpegurl' || m === 'application/x-mpegurl') return 'hls'
   if (m === 'application/dash+xml') return 'dash'
   if (m.startsWith('video/')) return 'video'
+  if (m.startsWith('audio/')) return 'audio'
   if (m === 'application/pdf' || m.startsWith('application/msword') ||
       m.includes('officedocument') || m.startsWith('application/epub')) return 'document'
+  if (m === 'application/zip' || m === 'application/gzip' || m === 'application/x-7z-compressed' ||
+      m === 'application/x-rar-compressed' || m.includes('x-tar') || m === 'application/x-bzip2' ||
+      m === 'application/x-xz' || m.includes('application/zstd')) return 'archive'
+  if (m.startsWith('image/')) return 'image'
   return null
 }
 
@@ -54,8 +62,14 @@ export function classifyResource(url, mime) {
   }
 
   const extVideo = VIDEO_EXT.test(u.pathname)
+  const extAudio = AUDIO_EXT.test(u.pathname)
   const extDoc = DOC_EXT.test(u.pathname)
+  const extArchive = ARCHIVE_EXT.test(u.pathname)
+  const extImage = IMAGE_EXT.test(u.pathname)
   if (byMime === 'video' || extVideo) return { type: 'video', sub: null }
+  if (byMime === 'audio' || extAudio) return { type: 'audio', sub: null }
+  if (byMime === 'archive' || extArchive) return { type: 'archive', sub: null }
+  if (byMime === 'image' || extImage) return { type: 'image', sub: null }
   if (byMime === 'document' || extDoc) return { type: 'document', sub: null }
   return null
 }
@@ -126,6 +140,8 @@ export function displayTypeFor(type, mime) {
   if (type === 'dash') return 'MPEG-DASH'
   if (type === 'video') return 'Video'
   if (type === 'audio') return 'Audio'
+  if (type === 'image') return 'Image'
+  if (type === 'archive') return 'Archive'
   if (type === 'document') {
     const m = (mime || '').toLowerCase()
     return m === 'application/pdf' ? 'PDF Document' : 'Document'
@@ -161,9 +177,13 @@ export function estimateSize({ type, contentLength, hls }) {
 /**
  * Group captures for display:
  *  - Non-HLS: each stays its own group.
- *  - HLS variants from the same page: one group with a primary + variants.
- *    "Same page" is defined by matching `pageUrl` origin+path (ignoring query).
- *    The primary is the first detected; variants are the rest.
+ *  - HLS/DASH manifests that belong to ONE logical stream: one group with a
+ *    primary + variants. Two manifests belong together when they come from the
+ *    same page and live in the same provider URL tree (same origin, and the
+ *    path minus quality/rendition directories matches — a master at
+ *    /videos/master.m3u8 groups with /videos/1080/index.m3u8 and
+ *    /videos/audio/index.m3u8). The primary is the manifest closest to the
+ *    tree root that is not itself a pure quality/rendition name (the master).
  *
  * Returns an array of group objects:
  *  { type: 'single', ...capture }           — a non-HLS or lone HLS capture
@@ -180,7 +200,7 @@ export function groupCaptures(captures) {
     else singles.push({ ...c, type: 'single' })
   }
 
-  // Group HLS by page origin+path (ignoring query strings).
+  // Group HLS by page origin+path (ignoring query strings) + provider tree.
   const byPage = new Map()
   for (const c of hls) {
     const key = hlsGroupKey(c)
@@ -189,14 +209,16 @@ export function groupCaptures(captures) {
   }
 
   const groups = [...singles]
-  for (const [, variants] of byPage) {
-    if (variants.length === 1) {
-      groups.push({ ...variants[0], type: 'single' })
+  for (const [, members] of byPage) {
+    if (members.length === 1) {
+      groups.push({ ...members[0], type: 'single' })
     } else {
-      // Primary = first detected; variants = rest sorted by quality hint.
-      const primary = variants[0]
-      const rest = variants.slice(1).sort((a, b) => qualityRank(a.filename) - qualityRank(b.filename))
-      groups.push({ type: 'hls-group', primary, variants: [primary, ...rest] })
+      // Primary = the master (shallowest, non-quality name, else first seen).
+      const primary = pickPrimary(members)
+      const rest = members.filter((m) => m.id !== primary.id)
+      // Variants sorted by quality hint (ascending — best is last).
+      const variants = [primary, ...rest.sort((a, b) => qualityRank(a.filename) - qualityRank(b.filename))]
+      groups.push({ type: 'hls-group', primary, variants })
     }
   }
 
@@ -208,13 +230,82 @@ export function groupCaptures(captures) {
   })
 }
 
+/** Directory segments that mark a quality/rendition folder (not identity). */
+const VARIANT_DIR_RE = /^(?:[0-9]{3,4}p?|4k|uhd|fhd|hd|sd|audio|video|subtitle|subs|captions|aac|eng|spa|esp|deu|fra|jpn|kor|por|ita|pol|rus|tur|zho|chi|ara)$/i
+
+/** Pure quality/rendition basename stems (never a logical primary). */
+const VARIANT_STEM_RE = /^(?:[0-9]{3,4}p?|4k|uhd|fhd|hd|sd|audio|video|index|playlist|chunklist|variant|prog_index|media|stream)$/i
+
 function hlsGroupKey(capture) {
-  // Group by page URL origin + path (ignore query, which carries signed tokens).
+  // Group by type (hls vs dash never mix) + page URL origin/path (query
+  // carries signed tokens) plus the provider URL tree with quality/rendition
+  // directories stripped.
   try {
-    const u = new URL(capture.pageUrl || capture.url)
-    return `${u.origin}${u.pathname}`
+    const page = new URL(capture.pageUrl || capture.url)
+    const u = new URL(capture.url)
+    const segments = u.pathname.split('/').filter(Boolean)
+    segments.pop() // manifest basename
+    while (segments.length > 0 && VARIANT_DIR_RE.test(segments[segments.length - 1])) segments.pop()
+    const tree = segments.length > 0 ? `/${segments.join('/')}` : ''
+    return `${capture.type}|${page.origin}${page.pathname}|${u.origin}${tree}`
   } catch {
     return capture.pageUrl || capture.url || capture.id
+  }
+}
+
+function pickPrimary(members) {
+  return [...members].sort((a, b) => {
+    const da = urlDirDepth(a.url)
+    const db = urlDirDepth(b.url)
+    if (da !== db) return da - db
+    const ga = qualityOnlyBasename(a.url) ? 1 : 0
+    const gb = qualityOnlyBasename(b.url) ? 1 : 0
+    if (ga !== gb) return ga - gb
+    return (a.ts ?? 0) - (b.ts ?? 0)
+  })[0]
+}
+
+function urlDirDepth(url) {
+  try {
+    return Math.max(0, new URL(url).pathname.split('/').filter(Boolean).length - 1)
+  } catch {
+    return 0
+  }
+}
+
+function qualityOnlyBasename(url) {
+  try {
+    const last = new URL(url).pathname.split('/').filter(Boolean).pop() ?? ''
+    const stem = String(last).replace(/\.(m3u8?|mpd)$/i, '')
+    return VARIANT_STEM_RE.test(stem)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Quality label derived from the URL itself (quality dir or basename), e.g.
+ * /videos/1080/index.m3u8 → "1080p". Falls back to the quality field, then
+ * null — used by the popup to name variants precisely.
+ */
+export function urlQualityLabel(url) {
+  if (!url) return null
+  try {
+    const segments = new URL(url).pathname.split('/').filter(Boolean)
+    // Prefer a quality directory segment (1080/index.m3u8 → 1080).
+    for (let i = segments.length - 2; i >= 0; i -= 1) {
+      const seg = segments[i]
+      const stem = seg.toLowerCase()
+      if (/^[0-9]{3,4}$/.test(stem)) return `${stem}p`
+      if (stem === '4k' || stem === 'uhd') return '4K'
+      if (stem === 'fhd') return '1080p'
+      if (stem === 'hd') return '720p'
+      if (stem === 'sd') return '480p'
+    }
+    // Then a quality basename (1080.m3u8 → 1080p).
+    return extractQuality(segments[segments.length - 1] ?? '')
+  } catch {
+    return null
   }
 }
 

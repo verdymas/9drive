@@ -129,7 +129,7 @@ const resourceContextSchema = z.object({
 
 const submitSchema = z.object({
   url: z.string().min(1).max(4096),
-  type: z.enum(['video', 'hls', 'dash', 'document']),
+  type: z.enum(['video', 'audio', 'hls', 'dash', 'document', 'archive', 'image', 'unknown']),
   mimeType: z.string().max(191).nullable().optional(),
   filename: z.string().max(255).nullable().optional(),
   pageUrl: z.string().max(4096).nullable().optional(),

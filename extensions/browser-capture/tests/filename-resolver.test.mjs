@@ -216,4 +216,183 @@ testCustomFilenameImmutable('custom filename survives video',
 testCustomFilenameImmutable('custom filename with CD header',
   { customFilename: 'User Name.mp4', contentDisposition: 'attachment; filename="server-name.mkv"', requestUrl: 'https://cdn.com/x.m3u8', finalUrl: 'https://cdn.com/x.m3u8', type: 'video' })
 
+// ── Phase 13 spec regression cases ──────────────────────────────────────────
+
+// Content-Disposition "Movie Final.mp4" → Movie Final.mp4
+testResolve('spec: Content-Disposition Movie Final.mp4',
+  { contentDisposition: 'attachment; filename="Movie Final.mp4"', requestUrl: 'https://cdn.com/download', finalUrl: 'https://cdn.com/download', type: 'video' },
+  'Movie Final.mp4', SOURCES.CD_FILENAME)
+
+// /download?id=123 → redirect → CDN /files/movie.mp4 → movie.mp4
+testResolve('spec: CDN final URL after redirect',
+  { requestUrl: 'https://site.com/download?id=123', finalUrl: 'https://cdn.com/files/movie.mp4', type: 'video' },
+  'movie.mp4', SOURCES.FINAL_URL)
+
+// /1080/index.m3u8 + og:title "Big Buck Bunny" + 1080p → Big Buck Bunny 1080p.mkv
+testResolve('spec: variant manifest + og:title + quality',
+  { requestUrl: 'https://cdn.com/1080/index.m3u8', finalUrl: 'https://cdn.com/1080/index.m3u8', type: 'hls', quality: '1080p',
+    pageMetadata: { ogTitle: 'Big Buck Bunny' } },
+  'Big Buck Bunny 1080p.mkv', SOURCES.OG_TITLE)
+
+// /master.m3u8 + page title "Movie Name" → Movie Name.mkv
+testResolve('spec: master.m3u8 + page title',
+  { requestUrl: 'https://cdn.com/master.m3u8', finalUrl: 'https://cdn.com/master.m3u8', type: 'hls',
+    pageMetadata: { title: 'Movie Name' } },
+  'Movie Name.mkv', SOURCES.PAGE_TITLE)
+
+// /manifest.mpd + media title "Movie Name" → Movie Name.mkv
+testResolve('spec: manifest.mpd + media title',
+  { requestUrl: 'https://cdn.com/manifest.mpd', finalUrl: 'https://cdn.com/manifest.mpd', type: 'dash',
+    pageMetadata: { mediaTitle: 'Movie Name' } },
+  'Movie Name.mkv', SOURCES.MEDIA_TITLE)
+
+// Custom filename persists through the HLS container swap (Phase 10).
+testResolve('spec: custom filename with .mkv never rewritten',
+  { customFilename: 'Big Buck Bunny 1080p.mkv', requestUrl: 'https://cdn.com/1080/index.m3u8', finalUrl: 'https://cdn.com/1080/index.m3u8', type: 'hls', quality: '1080p',
+    pageMetadata: { ogTitle: 'Something Else' } },
+  'Big Buck Bunny 1080p.mkv', SOURCES.CUSTOM_FILENAME)
+
+// Unicode survives detection → resolver.
+testResolve('spec: Unicode title-derived HLS name',
+  { requestUrl: 'https://cdn.com/master.m3u8', finalUrl: 'https://cdn.com/master.m3u8', type: 'hls',
+    pageMetadata: { ogTitle: 'Filme 日本語 1080p' } },
+  'Filme 日本語 1080p.mkv', SOURCES.OG_TITLE)
+
+// ── Late re-resolution / merge semantics (root-cause fix) ──────────────────
+// In-memory chrome.storage.local mock for these tests.
+const memory = new Map()
+globalThis.chrome = {
+  storage: {
+    local: {
+      async get(key) {
+        if (key === null) return Object.fromEntries(memory)
+        if (Array.isArray(key)) {
+          const out = {}
+          for (const k of key) out[k] = memory.get(k)
+          return out
+        }
+        return { [key]: memory.get(key) }
+      },
+      async set(obj) {
+        for (const [k, v] of Object.entries(obj)) memory.set(k, v)
+      },
+    },
+  },
+}
+
+const { addCapture: addC, allCaptures: allC, updateCapture: upC } = await import('../src/store.js')
+
+// Detected with no metadata — typical cold-SW race. The resolver falls back
+// to the manifest basename; the in-store `filename` is the manifest basename.
+const first = await addC({
+  url: 'https://cdn.com/1080/index.m3u8',
+  type: 'hls',
+  filename: 'index.m3u8',
+  filenameSource: 'final-url',
+  pageUrl: 'https://stream.example.com/watch',
+  pageMetadata: null,
+  status: 'detected',
+  ts: Date.now(),
+})
+assert.ok(first.id, 'cold-SW detection created with no metadata')
+assert.equal(first.filename, 'index.m3u8', 'fallback to manifest basename when no metadata')
+assert.equal(first.filenameSource, 'final-url', 'fallback source recorded')
+pass += 3
+
+// Re-detection with the same display URL but richer metadata upgrades the
+// suggested filename in place. This is the core forensic-fix behavior.
+const refreshed = await addC({
+  url: 'https://cdn.com/1080/index.m3u8?token=rotated',
+  type: 'hls',
+  filename: 'Big Buck Bunny 1080p.mkv',
+  filenameSource: 'og-title',
+  pageUrl: 'https://stream.example.com/watch',
+  pageMetadata: { ogTitle: 'Big Buck Bunny', quality: '1080p' },
+  status: 'detected',
+  ts: Date.now(),
+})
+assert.equal(refreshed.id, first.id, 're-detection with rotated signed URL keeps the same card')
+assert.equal(refreshed.filename, 'Big Buck Bunny 1080p.mkv', 'late metadata upgrades the suggested filename')
+assert.equal(refreshed.filenameSource, 'og-title', 'the source that won is the page og:title')
+pass += 3
+
+// A subsequent re-detection that brings LESS metadata must NOT erase the
+// better value the popup is already showing.
+const stale = await addC({
+  url: 'https://cdn.com/1080/index.m3u8?token=rotated-again',
+  type: 'hls',
+  filename: 'index.m3u8',
+  filenameSource: 'final-url',
+  pageUrl: 'https://stream.example.com/watch',
+  pageMetadata: null,
+  status: 'detected',
+  ts: Date.now(),
+})
+assert.equal(stale.id, first.id, 'same card')
+assert.equal(stale.filename, 'Big Buck Bunny 1080p.mkv', 'later generic-name metadata does not erase the better value')
+assert.equal(stale.filenameSource, 'og-title', 'source stays og-title')
+pass += 3
+
+// user-edited customFilename is permanent — automatic updates never replace it.
+await upC(first.id, { customFilename: 'My Movie.mkv' })
+const afterEdit = await addC({
+  url: 'https://cdn.com/1080/index.m3u8?token=yet-another',
+  type: 'hls',
+  filename: 'Whatever Title 1080p.mkv',
+  filenameSource: 'page-title',
+  pageUrl: 'https://stream.example.com/watch',
+  pageMetadata: { title: 'Different Title', quality: '1080p' },
+  status: 'detected',
+  ts: Date.now(),
+})
+assert.equal(afterEdit.id, first.id, 'still the same card')
+assert.equal(afterEdit.customFilename, 'My Movie.mkv', 'customFilename preserved')
+assert.equal(afterEdit.filename, 'Big Buck Bunny 1080p.mkv', 'suggested filename preserved when custom is set')
+pass += 4
+
+// Direct-file spec cases must keep Content-Disposition over URL.
+const direct = await addC({
+  url: 'https://site.com/download?id=123',
+  type: 'video',
+  filename: 'Movie Final.mp4',
+  filenameSource: 'cd-filename',
+  pageUrl: 'https://site.com/download?id=123',
+  pageMetadata: null,
+  status: 'detected',
+  ts: Date.now(),
+})
+assert.equal(direct.filename, 'Movie Final.mp4', 'CD-derived filename wins for direct files')
+assert.equal(direct.filenameSource, 'cd-filename', 'source recorded')
+pass += 2
+
+// PDF spec case.
+const pdf = await addC({
+  url: 'https://files.example.com/Annual%20Report.pdf',
+  type: 'document',
+  filename: 'Annual Report.pdf',
+  filenameSource: 'final-url',
+  pageUrl: 'https://files.example.com/',
+  pageMetadata: null,
+  status: 'detected',
+  ts: Date.now(),
+})
+assert.equal(pdf.filename, 'Annual Report.pdf')
+assert.equal(pdf.filenameSource, 'final-url')
+pass += 2
+
+// Generic streaming URL with a meaningful media title wins over manifest basename.
+const generic = await addC({
+  url: 'https://stream.example.com/stream/abc123/index.m3u8',
+  type: 'hls',
+  filename: 'Big Buck Bunny 1080p.mkv',
+  filenameSource: 'media-title',
+  pageUrl: 'https://stream.example.com/watch',
+  pageMetadata: { mediaTitle: 'Big Buck Bunny', quality: '1080p' },
+  status: 'detected',
+  ts: Date.now(),
+})
+assert.equal(generic.filenameSource, 'media-title', 'mediaTitle wins over generic manifest basename')
+assert.equal(generic.filename, 'Big Buck Bunny 1080p.mkv')
+pass += 2
+
 console.log(`filename-resolver: ${pass} checks passed`)

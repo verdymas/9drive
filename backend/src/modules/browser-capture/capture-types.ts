@@ -3,7 +3,13 @@
 /** Pending resources expire after this long (spec: TTL/expiration). */
 export const CAPTURED_RESOURCE_TTL_MS = 24 * 60 * 60 * 1000
 
-export const RESOURCE_TYPES = ['video', 'hls', 'dash', 'document'] as const
+/**
+ * Normalized resource types. `unknown` is reserved for API completeness (a
+ * resource that looks capturable but has no reliable signal); the extension
+ * never submits it — its classifier returns null (not capturable) for
+ * ambiguous responses.
+ */
+export const RESOURCE_TYPES = ['video', 'audio', 'hls', 'dash', 'document', 'archive', 'image', 'unknown'] as const
 export type CapturedResourceType = (typeof RESOURCE_TYPES)[number]
 
 /**

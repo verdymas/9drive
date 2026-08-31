@@ -8,8 +8,8 @@
  * Remote Import pipeline.
  */
 import { classifyResource, displayTypeFor, extractQuality, filenameFromUrl } from './classify.js'
-import { resolveFilename } from './filename-resolver.js'
-import { addCapture, allCaptures, clearAllCaptures, countPending, pruneAgainstServer, removeCapture, updateCapture } from './store.js'
+import { resolveFilename, parseContentDispositionFilename } from './filename-resolver.js'
+import { addCapture, allCaptures, clearAllCaptures, countPending, displayUrlOf, pruneAgainstServer, removeCapture, saveCaptures, updateCapture } from './store.js'
 import { getConfig, heartbeat, submitResource, deleteServerResource, setConfig, resolveApiRoot, requestTo } from './api.js'
 
 const EXT_VERSION = chrome.runtime.getManifest().version
@@ -143,6 +143,10 @@ chrome.webRequest.onHeadersReceived.addListener(
     const originEntry = requestOrigins.get(details.requestId)
     const originalUrl = originEntry?.originalUrl || finalUrl
 
+    // Quality hint: the media element's real resolution (content script) beats
+    // a number scraped from the URL basename.
+    const quality = pageMetadata?.quality || extractQuality(filenameFromUrl(finalUrl))
+
     const result = resolveFilename({
       requestUrl: originalUrl,
       finalUrl,
@@ -150,8 +154,29 @@ chrome.webRequest.onHeadersReceived.addListener(
       downloadAttr,
       pageMetadata,
       type: cls.type,
-      quality: extractQuality(filenameFromUrl(finalUrl)),
+      quality,
     })
+
+    // Forensic-acceptance debug summary: which metadata source won, with safe
+    // fields only (no URLs, cookies, Authorization, signed query values, or
+    // tokens). One line per detected resource, easy to grep.
+    const cdHeader = headers.get('content-disposition')
+    const cdValue = parseContentDispositionFilename(cdHeader ?? null)
+    console.debug(
+      `[capture:filename-debug]`
+        + ` resourceType=${cls.type}`
+        + ` requestBasename=${filenameFromUrl(originalUrl) || '<none>'}`
+        + ` finalBasename=${filenameFromUrl(finalUrl) || '<none>'}`
+        + ` contentDispositionFilename=${cdValue || 'null'}`
+        + ` downloadAttribute=${downloadAttr ? 'set' : 'null'}`
+        + ` mediaTitle="${pageMetadata?.mediaTitle ?? ''}"`
+        + ` ogTitle="${pageMetadata?.ogTitle ?? ''}"`
+        + ` twitterTitle="${pageMetadata?.twitterTitle ?? ''}"`
+        + ` pageTitle="${pageMetadata?.title ?? ''}"`
+        + ` quality=${quality ?? ''}`
+        + ` selectedSource=${result.source}`
+        + ` selectedFilename=${result.filename}`,
+    )
 
     const entry = {
       url: finalUrl,
@@ -166,7 +191,9 @@ chrome.webRequest.onHeadersReceived.addListener(
       pageMetadata,
       estimatedSize: size,
       sizeSource: size != null ? 'content-length' : null,
-      quality: extractQuality(result.filename),
+      quality,
+      thumbnail: pageMetadata?.thumbnail ?? null,
+      duration: pageMetadata?.duration ?? null,
       customFilename: null,
       status: 'detected',
       ts: Date.now(),
@@ -182,6 +209,117 @@ chrome.webRequest.onHeadersReceived.addListener(
   ['responseHeaders'],
 )
 
+// ── Late metadata merge (root-cause fix for the timing race) ────────────────
+// A cold-started service worker on an autoplay page can fire onHeadersReceived
+// before the content script's storage.session stash is written. MediaGrabber
+// avoids this by *pushing* PAGE_METADATA messages and merging into already-
+// detected media; 9Drive re-runs the resolver when a page publishes a fresh
+// metadata stash (e.g. from `loadedmetadata`, SPA navigation, or a
+// `PAGE_METADATA` push). `customFilename` is permanent — automatic refreshes
+// never overwrite it. Existing meaningful values are preserved; a later event
+// that fills in a previously-null field upgrades the suggested filename in
+// place, then the badge is updated so the popup reflects it immediately.
+async function recheckPendingCaptures(pageUrl) {
+  let p
+  try { p = new URL(pageUrl); if (p.protocol !== 'http:' && p.protocol !== 'https:') return } catch { return }
+  const metaKey = `pageMetadata:${p.origin}${p.pathname}`
+  const session = await chrome.storage.session.get([metaKey]).catch(() => ({}))
+  const meta = session[metaKey]
+  if (!meta) return
+
+  const list = await allCaptures()
+  let changed = false
+  for (const row of list) {
+    if (row.status !== 'detected' && row.status !== 'pending') continue
+    if (!row.pageUrl) continue
+    let rowOrigin
+    try { rowOrigin = new URL(row.pageUrl) } catch { continue }
+    if (rowOrigin.origin !== p.origin || rowOrigin.pathname !== p.pathname) continue
+
+    // Skip rows the user has already edited — `customFilename` is permanent.
+    if (row.customFilename) continue
+
+    // Merge: existing meaningful value wins over null/undefined/empty.
+    const mergedMeta = mergeMetadata(row.pageMetadata, meta)
+    const better = isRicherMetadata(mergedMeta, row.pageMetadata)
+    if (!better) continue
+
+    const result = resolveFilename({
+      requestUrl: row.originalUrl ?? row.url,
+      finalUrl: row.finalUrl ?? row.url,
+      contentDisposition: row.contentDisposition ?? null,
+      downloadAttr: row.downloadAttr ?? null,
+      pageMetadata: mergedMeta,
+      type: row.type,
+      quality: mergedMeta.quality ?? extractQuality(filenameFromUrl(row.url)),
+    })
+    if (result.filename === row.filename) {
+      row.pageMetadata = mergedMeta
+      row.thumbnail = mergedMeta.thumbnail ?? row.thumbnail
+      row.duration = mergedMeta.duration ?? row.duration
+      row.quality = mergedMeta.quality ?? row.quality
+      changed = true
+      continue
+    }
+    Object.assign(row, {
+      filename: result.filename,
+      filenameSource: result.source,
+      pageMetadata: mergedMeta,
+      thumbnail: mergedMeta.thumbnail ?? row.thumbnail,
+      duration: mergedMeta.duration ?? row.duration,
+      quality: mergedMeta.quality ?? row.quality,
+      ts: Date.now(),
+    })
+    changed = true
+  }
+  if (changed) {
+    await saveCaptures(list)
+    await updateBadge()
+  }
+}
+
+/** Field-by-field merge that keeps the existing value when it's already meaningful. */
+function mergeMetadata(prev, next) {
+  if (!next) return prev ?? null
+  if (!prev) return next
+  const out = { ...prev }
+  for (const k of ['title', 'ogTitle', 'twitterTitle', 'mediaTitle', 'thumbnail', 'duration', 'resolution', 'quality']) {
+    const incoming = next[k]
+    if (incoming == null || incoming === '') continue
+    if (out[k] == null || out[k] === '' || isGenericString(out[k])) out[k] = incoming
+  }
+  return out
+}
+
+function isGenericString(value) {
+  if (typeof value !== 'string') return false
+  return /^(index|playlist|master|manifest|stream|video|media|chunklist|variant|chunk|segment|file|download)\b/i.test(value.trim())
+}
+
+/** True when `next` brings at least one field of higher signal than `prev`. */
+function isRicherMetadata(next, prev) {
+  if (!next) return false
+  if (!prev) return true
+  for (const k of ['title', 'ogTitle', 'twitterTitle', 'mediaTitle', 'thumbnail', 'duration', 'resolution', 'quality']) {
+    const before = prev[k]
+    const after = next[k]
+    if (after == null || after === '') continue
+    if (before == null || before === '' || isGenericString(before)) return true
+  }
+  return false
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  // Content-script push of PAGE_METADATA — runs the late re-resolution so the
+  // popup filename reflects the best available title even when the SW was
+  // cold-started before the content script's first storage.session write.
+  if (msg?.type === 'PAGE_METADATA_PUSH' && typeof msg.pageUrl === 'string') {
+    void recheckPendingCaptures(msg.pageUrl)
+    sendResponse?.({ ok: true })
+    return false
+  }
+})
+
 async function syncCapture(entry, safeContext = {}) {
   try {
     const serverRow = await submitResource({
@@ -193,15 +331,16 @@ async function syncCapture(entry, safeContext = {}) {
       pageTitle: entry.pageMetadata?.title ?? null,
       requestContext: safeContext,
     })
-    if (serverRow?.id) await updateCaptureByRemoteId(entry.url, { remoteId: serverRow.id })
+    if (serverRow?.id) await updateCaptureByRemoteId(entry, { remoteId: serverRow.id })
   } catch {
     // Offline / backend down: keep locally; the periodic sweep retries.
   }
 }
 
-async function updateCaptureByRemoteId(url, patch) {
+async function updateCaptureByRemoteId(entry, patch) {
   const list = await allCaptures()
-  const row = list.find((c) => c.url === url)
+  const want = displayUrlOf(entry.url)
+  const row = list.find((c) => displayUrlOf(c.url) === want)
   if (row) await updateCapture(row.id, patch)
 }
 
@@ -239,6 +378,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   ;(async () => {
     switch (msg?.type) {
       case 'getState': {
+        // Re-resolve filenames against the freshest session metadata before
+        // handing the list to the popup. Captures detected by a cold-started
+        // SW before the content script's first storage write are upgraded in
+        // place here; `customFilename` is permanent and never touched.
+        const list = await allCaptures()
+        const pageUrlCandidates = list.filter(
+          (c) => (c.status === 'detected' || c.status === 'pending') && c.pageUrl,
+        )
+        const uniquePageUrls = Array.from(new Set(pageUrlCandidates.map((c) => c.pageUrl)))
+        for (const u of uniquePageUrls) {
+          try { await recheckPendingCaptures(u) } catch { /* ignore */ }
+        }
         const [cfg, captures] = await Promise.all([getConfig(), allCaptures()])
         // Verify the device token still works — a revoked/rotated device must
         // surface as "Not connected" immediately, not after the next 5-min sweep.
@@ -281,9 +432,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         return
       }
       case 'markConsumed': {
-        await updateCapture(msg.url ? (await allCaptures()).find((c) => c.url === msg.url)?.id : msg.id, {
-          status: 'submitted',
-        })
+        const captures = await allCaptures()
+        const want = msg.url ? displayUrlOf(msg.url) : null
+        const row = want ? captures.find((c) => displayUrlOf(c.url) === want) : captures.find((c) => c.id === msg.id)
+        await updateCapture(row?.id ?? msg.id, { status: 'submitted' })
         await updateBadge()
         sendResponse({ ok: true })
         return

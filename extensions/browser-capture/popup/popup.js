@@ -4,7 +4,7 @@
  * Architecture: single `state` object + `render()` function.
  * No framework; chrome popups are tiny — imperative DOM is fastest and clearest.
  */
-import { groupCaptures, displayTypeFor } from '../src/classify.js'
+import { groupCaptures, displayTypeFor, urlQualityLabel } from '../src/classify.js'
 
 const $ = (sel) => document.querySelector(sel)
 
@@ -148,18 +148,23 @@ function renderCaptureCard(capture) {
   const div = document.createElement('div')
   div.className = 'card'
 
-  const icon = { video: '🎬', hls: '🎬', dash: '🎬', document: '📄' }[capture.type] ?? '📦'
+  const icon = { video: '🎬', hls: '🎬', dash: '🎬', audio: '🎵', image: '🖼️', archive: '🗜️', document: '📄' }[capture.type] ?? '📦'
   const domain = safeDomain(capture.url || capture.pageUrl)
   const dt = displayTypeFor(capture.type, capture.mime)
   const name = capture.customFilename || capture.filename || '(unnamed)'
+  const thumb = capture.thumbnail
+    ? `<img class="thumb" src="${escAttr(capture.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
+    : ''
 
   div.innerHTML = `
     <div class="card-header">
+      ${thumb}
       <div>
         <div class="card-name">${icon} ${esc(name)}</div>
         <div class="card-meta">
           <span>${esc(dt)}</span>
           ${capture.quality ? `<span>Quality: ${esc(capture.quality)}</span>` : ''}
+          ${capture.duration ? `<span>Duration: ${formatDuration(capture.duration)}</span>` : ''}
           <span>Estimated size: ${formatSize(capture.estimatedSize)}</span>
           ${domain ? `<span class="domain">Source: ${esc(domain)}</span>` : ''}
         </div>
@@ -188,9 +193,13 @@ function renderHlsGroup(group) {
   // Sum variant sizes for the group estimate; unknown sizes are excluded.
   const sizes = variants.map((v) => v.estimatedSize).filter((s) => s != null)
   const groupSize = sizes.length > 0 ? sizes.reduce((a, b) => a + b, 0) : null
+  const thumb = group.primary.thumbnail
+    ? `<img class="thumb" src="${escAttr(group.primary.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
+    : ''
 
   div.innerHTML = `
     <div class="card-header">
+      ${thumb}
       <div>
         <div class="card-name">🎬 ${esc(group.primary.customFilename || group.primary.filename || 'HLS Stream')}</div>
         <div class="card-meta">
@@ -203,10 +212,10 @@ function renderHlsGroup(group) {
       <span class="type-badge">${esc(dt)}</span>
     </div>
     <div class="hls-variants">
-      ${variants.map((v, i) => `<div class="hls-variant"><span class="dot"></span>${esc(qualityLabel(v.filename, i))}</div>`).join('')}
+      ${variants.map((v, i) => `<div class="hls-variant"><span class="dot"></span>${esc(variantLabel(v, i))}</div>`).join('')}
     </div>
     ${variants.length > 1 ? `<select class="hls-quality-select" data-group-hls>
-      ${variants.map((v, i) => `<option value="${v.id}">${esc(qualityLabel(v.filename, i))}</option>`).join('')}
+      ${variants.map((v, i) => `<option value="${v.id}">${esc(variantLabel(v, i))}</option>`).join('')}
     </select>` : ''}
     <div class="card-actions">
       <button class="primary" data-act="import-hls">Import</button>
@@ -227,9 +236,16 @@ function renderHlsGroup(group) {
   return div
 }
 
-function qualityLabel(filename, index) {
-  const clean = (filename || '').replace(/\.(m3u8|m3u)$/i, '').replace(/.*\//, '')
-  if (clean && clean !== filename) return clean
+/**
+ * Variant label: URL-derived quality first (a /1080/index.m3u8 variant is
+ * "1080p"), then the captured quality field, then the cleaned filename.
+ */
+function variantLabel(variant, index) {
+  const fromUrl = urlQualityLabel(variant.url)
+  if (fromUrl) return fromUrl
+  if (variant.quality) return variant.quality
+  const clean = (variant.filename || '').replace(/\.(m3u8|m3u)$/i, '').replace(/.*\//, '')
+  if (clean && clean !== variant.filename) return clean
   return `Variant ${index + 1}`
 }
 
@@ -370,9 +386,18 @@ function formatSize(bytes) {
   if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
 }
+function formatDuration(seconds) {
+  const n = Math.max(0, Math.round(Number(seconds) || 0))
+  const h = Math.floor(n / 3600)
+  const m = Math.floor((n % 3600) / 60)
+  const s = n % 60
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+  return `${m}:${String(s).padStart(2, '0')}`
+}
 function stripQuery(url) { try { const u = new URL(url); u.search = ''; u.hash = ''; return u.href } catch { return url } }
 function safeDomain(url) { try { return new URL(url).hostname } catch { return '' } }
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML }
+function escAttr(s) { return esc(s).replace(/"/g, '&quot;') }
 
 // ── Pairing ─────────────────────────────────────────────────────────────────
 

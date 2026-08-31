@@ -6,6 +6,7 @@ import assert from 'node:assert/strict'
 import {
   classifyResource, filenameFromUrl, detectFilename, groupCaptures,
   parseContentDispositionFilename, displayTypeFor, extractQuality, estimateSize,
+  urlQualityLabel,
 } from '../src/classify.js'
 
 const cases = [
@@ -20,6 +21,17 @@ const cases = [
   ['https://cdn.example.com/doc.pdf', null, 'document', null],
   ['https://cdn.example.com/doc.pdf', 'application/pdf', 'document', null],
   ['https://cdn.example.com/report.docx', null, 'document', null],
+  // Audio
+  ['https://cdn.example.com/song.mp3', null, 'audio', null],
+  ['https://cdn.example.com/track.flac', null, 'audio', null],
+  ['https://cdn.example.com/podcast.mp3', 'audio/mpeg', 'audio', null],
+  // Archive
+  ['https://cdn.example.com/bundle.zip', null, 'archive', null],
+  ['https://cdn.example.com/backup.tar.gz', null, 'archive', null],
+  ['https://cdn.example.com/bundle.rar', 'application/x-rar-compressed', 'archive', null],
+  // Image
+  ['https://cdn.example.com/pic.png', null, 'image', null],
+  ['https://cdn.example.com/photo.jpg', 'image/jpeg', 'image', null],
   // Suppressed: segments and media internals
   ['https://cdn.example.com/hls/seg-0001.ts', null, null, null],
   ['https://cdn.example.com/hls/chunk.m4s', null, null, null],
@@ -27,7 +39,8 @@ const cases = [
   ['https://cdn.example.com/video.key', null, null, null],
   // Not capturable
   ['https://example.com/', 'text/html', null, null],
-  ['https://example.com/image.png', 'image/png', null, null],
+  ['https://example.com/page.html', 'text/html', null, null],
+  ['https://example.com/', 'application/json', null, null],
   ['ftp://x/file.mp4', null, null, null],
   ['javascript:alert(1)', null, null, null],
 ]
@@ -94,12 +107,14 @@ pass += 6
 assert.equal(displayTypeFor('hls', null), 'HLS Stream')
 assert.equal(displayTypeFor('dash', null), 'MPEG-DASH')
 assert.equal(displayTypeFor('video', null), 'Video')
+assert.equal(displayTypeFor('audio', null), 'Audio')
+assert.equal(displayTypeFor('image', null), 'Image')
+assert.equal(displayTypeFor('archive', null), 'Archive')
 assert.equal(displayTypeFor('document', 'application/pdf'), 'PDF Document')
 assert.equal(displayTypeFor('document', 'application/msword'), 'Document')
 assert.equal(displayTypeFor('document', null), 'Document')
 assert.equal(displayTypeFor('unknown', null), 'Unknown')
-assert.equal(displayTypeFor('audio', null), 'Audio')
-pass += 8
+pass += 10
 
 // ── Quality extraction ──────────────────────────────────────────────────────
 
@@ -180,6 +195,56 @@ assert.equal(g6[0].variants[0].id, 'p', 'primary first')
 assert.equal(g6[0].variants[1].id, 'lo', '360 before 1080')
 assert.equal(g6[0].variants[2].id, 'hi', '1080 after 360')
 
-const groupPass = 10
+// ── Master/variant directory grouping (Phase 07) ─────────────────────────────
 
+// Master at tree root + variants in quality subdirectories → ONE group whose
+// primary is the master (shallowest + non-quality name), not the first event.
+const g7 = groupCaptures([
+  cap({ id: 'v1080', type: 'hls', filename: 'index.m3u8', pageUrl: 'https://s.com/watch', url: 'https://cdn.com/videos/1080/index.m3u8', ts: 3 }),
+  cap({ id: 'v720', type: 'hls', filename: 'index.m3u8', pageUrl: 'https://s.com/watch', url: 'https://cdn.com/videos/720/index.m3u8', ts: 2 }),
+  cap({ id: 'master', type: 'hls', filename: 'master.m3u8', pageUrl: 'https://s.com/watch', url: 'https://cdn.com/videos/master.m3u8', ts: 1 }),
+  cap({ id: 'audio', type: 'hls', filename: 'index.m3u8', pageUrl: 'https://s.com/watch', url: 'https://cdn.com/videos/audio/index.m3u8', ts: 4 }),
+])
+assert.equal(g7.length, 1, 'master + variants → one group')
+assert.equal(g7[0].type, 'hls-group')
+assert.equal(g7[0].primary.id, 'master', 'master chosen as primary despite earliest ts')
+assert.equal(g7[0].variants.length, 4)
+
+// Different CDN origins on the same page stay separate (no over-grouping).
+const g8 = groupCaptures([
+  cap({ id: 'a', type: 'hls', filename: 'master.m3u8', pageUrl: 'https://s.com/', url: 'https://cdn-a.com/master.m3u8' }),
+  cap({ id: 'b', type: 'hls', filename: 'master.m3u8', pageUrl: 'https://s.com/', url: 'https://cdn-b.com/master.m3u8' }),
+])
+assert.equal(g8.length, 2, 'different origins → separate cards')
+assert.ok(g8.every((g) => g.type === 'single'))
+
+// Same origin, different trees → separate cards (unrelated media).
+const g9 = groupCaptures([
+  cap({ id: 'a', type: 'hls', filename: 'master.m3u8', pageUrl: 'https://s.com/', url: 'https://cdn.com/trailer/master.m3u8' }),
+  cap({ id: 'b', type: 'hls', filename: 'master.m3u8', pageUrl: 'https://s.com/', url: 'https://cdn.com/feature/master.m3u8' }),
+])
+assert.equal(g9.length, 2, 'different trees → separate cards')
+assert.ok(g9.every((g) => g.type === 'single'))
+
+// DASH groups with DASH (manifest.mpd + 1080/720 dirs) — cross-type is NOT
+// grouped (hls vs dash are different types).
+const g10 = groupCaptures([
+  cap({ id: 'm', type: 'hls', filename: 'master.m3u8', pageUrl: 'https://s.com/', url: 'https://cdn.com/v/master.m3u8' }),
+  cap({ id: 'd', type: 'dash', filename: 'manifest.mpd', pageUrl: 'https://s.com/', url: 'https://cdn.com/v/manifest.mpd' }),
+])
+assert.equal(g10.length, 2, 'hls + dash stay separate')
+assert.ok(g10.every((g) => g.type === 'single'))
+
+// ── URL-derived quality labels (Phase 11 variant naming) ─────────────────────
+
+assert.equal(urlQualityLabel('https://cdn.com/videos/1080/index.m3u8'), '1080p')
+assert.equal(urlQualityLabel('https://cdn.com/videos/720/index.m3u8'), '720p')
+assert.equal(urlQualityLabel('https://cdn.com/videos/audio/index.m3u8'), null)
+assert.equal(urlQualityLabel('https://cdn.com/videos/4k/index.m3u8'), '4K')
+assert.equal(urlQualityLabel('https://cdn.com/videos/master.m3u8'), null)
+assert.equal(urlQualityLabel('https://cdn.com/videos/1080.m3u8'), '1080p')
+assert.equal(urlQualityLabel(null), null)
+pass += 15
+
+const groupPass = 10
 console.log(`classify: ${pass + groupPass} checks passed`)

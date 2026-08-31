@@ -24,3 +24,5 @@ frontend/.env.*.local
 /playwright/.cache/
 /playwright/.auth/
 .playwright-mcp/
+
+references/

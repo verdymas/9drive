@@ -58,6 +58,11 @@
       padding: 10px 12px; margin-bottom: 8px; background: var(--bg-alt);
     }
     .card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+    .card-header > div { flex: 1; min-width: 0; }
+    .thumb {
+      width: 72px; height: 44px; object-fit: cover; border-radius: 6px;
+      border: 1px solid var(--border); flex-shrink: 0; background: var(--bg);
+    }
     .card-name { font-weight: 600; word-break: break-all; font-size: 13px; }
     .card-meta { font-size: 11px; color: var(--text-dim); margin: 3px 0 8px; display: flex; gap: 6px; flex-wrap: wrap; }
     .card-meta span { white-space: nowrap; }
