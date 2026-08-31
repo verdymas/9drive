@@ -30,6 +30,7 @@ import {
   keyLocalName,
   manifestLocalName,
 } from './materializer.js'
+import { validateSegmentFile } from './segment-validator.js'
 import { assertSupportedEncryption, buildRewrittenPlaylist, type NormalizedSegment, type SegmentMap } from './segments.js'
 import { rewriteMediaPlaylist, validateLocalPlaylist } from './manifest-service.js'
 
@@ -211,6 +212,22 @@ export async function materializeMedia(opts: MaterializeMediaOptions): Promise<M
           if (bytes === 0n) {
             throw new AppError(HLS_ERROR_CODES.HLS_SEGMENT_DOWNLOAD_FAILED, HLS_ERROR_MESSAGES.HLS_SEGMENT_DOWNLOAD_FAILED, 502)
           }
+          // ── Download-time content gate (remux fix §2): reject error-page
+          // artifacts (HTML/JSON/XML/empty) that can never be media before
+          // they reach FFmpeg. Signature validation for the raw TS concat
+          // happens at the concat gate — this layer only stops obvious
+          // garbage, so fMP4/AAC/other valid payloads are never rejected.
+          if (!segment.key?.uri) {
+            const validation = await validateSegmentFile(target, { index: segment.index })
+            const c = validation.classification
+            const invalid = c.kind === 'invalid' && (c.reason === 'html' || c.reason === 'json' || c.reason === 'xml' || c.reason === 'empty')
+            console.log(
+              `[hls-segment-validator] segment=${segmentLocalName(mediaLabel, segment.index)} size=${validation.sizeBytes} kind=${c.kind}${c.kind === 'mpegts' || c.kind === 'm2ts' ? ` packetSize=${c.layout.packetSize}` : ''}${c.kind === 'invalid' ? ` reason=${c.reason}` : ''} valid=${!invalid}`,
+            )
+            if (invalid) {
+              throw new AppError(HLS_ERROR_CODES.HLS_SEGMENT_INVALID, HLS_ERROR_MESSAGES.HLS_SEGMENT_INVALID, 502)
+            }
+          }
           cache.set(segment.uri, target)
           totalDownloadedForSegments += bytes
           segmentsCompleted += 1
@@ -223,6 +240,8 @@ export async function materializeMedia(opts: MaterializeMediaOptions): Promise<M
         } catch (error) {
           lastError = error
           if (error instanceof Error && error.name === 'AbortError') throw error
+          // A deterministic content rejection is not fixed by re-downloading.
+          if (error instanceof AppError && error.code === HLS_ERROR_CODES.HLS_SEGMENT_INVALID) throw error
           if (attempt < attempts) await sleep(500 * attempt)
         }
       }

@@ -70,6 +70,13 @@ export function manifestLocalName(mediaLabel: string): string {
   return `${mediaLabel}.m3u8`
 }
 
+/** Kind-aware stable error for a truncated (size-mismatched) download. */
+function truncatedDownloadError(kind?: string): AppError {
+  if (kind === 'map') return new AppError(HLS_ERROR_CODES.HLS_MAP_DOWNLOAD_FAILED, HLS_ERROR_MESSAGES.HLS_MAP_DOWNLOAD_FAILED, 502)
+  if (kind === 'key') return new AppError(HLS_ERROR_CODES.HLS_KEY_DOWNLOAD_FAILED, HLS_ERROR_MESSAGES.HLS_KEY_DOWNLOAD_FAILED, 502)
+  return new AppError(HLS_ERROR_CODES.HLS_SEGMENT_DOWNLOAD_FAILED, HLS_ERROR_MESSAGES.HLS_SEGMENT_DOWNLOAD_FAILED, 502)
+}
+
 export function masterManifestLocalName(): string {
   return 'master.m3u8'
 }
