@@ -40,8 +40,8 @@ function isWeakerFilename(incoming, existing) {
   if (incoming == null || incoming === '') return true
   if (existing == null || existing === '') return false
   if (incoming === existing) return false
-  return GENERIC_FILENAMES.has(stemOf(incoming).toLowerCase())
-    && !GENERIC_FILENAMES.has(stemOf(existing).toLowerCase())
+  return isGenericStem(stemOf(incoming).toLowerCase())
+    && !isGenericStem(stemOf(existing).toLowerCase())
 }
 
 function stemOf(name) {
@@ -49,10 +49,31 @@ function stemOf(name) {
 }
 
 const GENERIC_FILENAMES = new Set([
+  // Original transport stems
   'index', 'playlist', 'master', 'manifest', 'stream', 'video', 'media',
   'file', 'download', 'chunk', 'segment', 'chunklist', 'variant',
   'prog_index', 'main', 'source', 'output', '1080', '720', '480', '360',
+  // Quality stems with the p suffix
+  '1080p', '720p', '480p', '360p', '240p', '144p', '4k', '2k', '8k',
+  // Phase 14: media-related stems that carry no real identity
+  'movie', 'clip', 'sample', 'trailer', 'preview', 'teaser', 'intro',
+  'outro', 'recap', 'feature', 'bonus', 'extra', 'deleted',
+  'ep', 'episode', 'part', 'scene', 'cut', 'version', 'final',
+  // Short single/two-letter stems (Vimeo/YouTube/archive paths)
+  'v', 'm', 'a', 's', 'p', 'f', 'd', 't', 'x',
+  // CDN-tree patterns
+  'vod', 'live', 'dash', 'hls', 'cdn', 'edge', 'origin', 'static',
 ])
+
+/** Bare-numeric / short alphanumeric stems (Vimeo-style IDs). */
+const GENERIC_STEM_PATTERN = /^(?:v\d+|[a-z]?\d{1,4})$/i
+
+function isGenericStem(stem) {
+  if (!stem) return true
+  if (GENERIC_FILENAMES.has(stem)) return true
+  if (GENERIC_STEM_PATTERN.test(stem)) return true
+  return false
+}
 
 export async function allCaptures() {
   const obj = await chrome.storage.local.get(KEY)

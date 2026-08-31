@@ -99,6 +99,10 @@ export function submitResource(entry) {
       filename: entry.filename ?? null,
       pageUrl: entry.pageUrl ?? null,
       pageTitle: entry.pageTitle ?? null,
+      // Phase 14: optional media-identity summary (title + source + confidence).
+      // The full candidate list stays in the extension; the backend stores only
+      // the winner and surfaces it in the Remote Imports UI.
+      mediaIdentity: entry.mediaIdentity ?? null,
       // Safe context only — the backend's strict schema rejects cookie/keys.
       requestContext: entry.requestContext ?? null,
     },

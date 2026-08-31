@@ -15,6 +15,7 @@ const state = {
   importStatus: 'idle',    // idle | submitting | success | error
   importMsg: '',
   options: null,           // { folders, storageAccounts, workers }
+  debug: false,            // Phase 14: 9drive.debug storage flag
 }
 
 // ── Message API ─────────────────────────────────────────────────────────────
@@ -155,12 +156,13 @@ function renderCaptureCard(capture) {
   const thumb = capture.thumbnail
     ? `<img class="thumb" src="${escAttr(capture.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
     : ''
+  const sourceChip = sourceChipHtml(capture)
 
   div.innerHTML = `
     <div class="card-header">
       ${thumb}
       <div>
-        <div class="card-name">${icon} ${esc(name)}</div>
+        <div class="card-name">${icon} ${esc(name)}${sourceChip}</div>
         <div class="card-meta">
           <span>${esc(dt)}</span>
           ${capture.quality ? `<span>Quality: ${esc(capture.quality)}</span>` : ''}
@@ -182,6 +184,67 @@ function renderCaptureCard(capture) {
   const srcBtn = div.querySelector('[data-act="source"]')
   if (srcBtn) srcBtn.onclick = () => chrome.tabs.create({ url: capture.pageUrl })
   return div
+}
+
+/** Human-friendly source label for the card chip. */
+const SOURCE_LABELS = {
+  'jsonld-videoobject-name': 'JSON-LD',
+  'jsonld-videoobject-headline': 'JSON-LD',
+  'player-config-title': 'player',
+  'player-config-name': 'player',
+  'api-metadata-title': 'API',
+  'api-metadata-name': 'API',
+  'dom-video-title': 'page',
+  'dom-video-aria-label': 'page',
+  'dom-video-data-title': 'page',
+  'dom-video-data-name': 'page',
+  'og-title': 'og:title',
+  'og-video-title': 'og:video:title',
+  'twitter-title': 'twitter:title',
+  'meta-itemprop-name': 'page',
+  'media-title': '<video title>',
+  'page-title': 'document.title',
+  'cd-filename-star': 'Content-Disposition',
+  'cd-filename': 'Content-Disposition',
+  'download-attr': 'download attr',
+  'final-url': 'URL',
+  'request-url': 'URL',
+  'custom-filename': 'custom',
+  'url-basename-non-generic': 'URL',
+  'url-basename-generic': 'URL',
+  'fallback': 'fallback',
+  'generic-playlist': 'URL',
+}
+
+function sourceChipHtml(capture) {
+  // Only show a chip for "real identity" sources, not URL basenames.
+  const candidates = capture?.mediaIdentity?.identity?.candidates
+  if (!Array.isArray(candidates) || candidates.length === 0) return ''
+  const top = candidates[0]
+  if (!top || !top.source) return ''
+  const label = SOURCE_LABELS[top.source]
+  if (!label) return ''
+  if (['final-url', 'request-url', 'url-basename-non-generic', 'url-basename-generic', 'fallback', 'generic-playlist'].includes(top.source)) {
+    return ''
+  }
+  const conf = Number.isFinite(top.confidence) ? ` · ${top.confidence}` : ''
+  return `<span class="source-chip" title="${esc(top.value ?? '')} (${esc(top.source)}${conf})">from ${esc(label)}</span>`
+}
+
+function sourceListHtml(capture) {
+  const candidates = capture?.mediaIdentity?.identity?.candidates
+  if (!Array.isArray(candidates) || candidates.length === 0) return ''
+  // Top 3 distinct sources, scored.
+  const seen = new Set()
+  const top = []
+  for (const c of candidates) {
+    if (!c || !c.source || !c.value) continue
+    if (seen.has(c.source)) continue
+    seen.add(c.source)
+    top.push(c)
+    if (top.length >= 3) break
+  }
+  return top.map((c) => `<li><span class="src">${esc(SOURCE_LABELS[c.source] ?? c.source)}</span><span class="score">${Number.isFinite(c.confidence) ? c.confidence : '–'}</span></li>`).join('')
 }
 
 function renderHlsGroup(group) {
@@ -259,6 +322,18 @@ function renderForm() {
   const ctx = $('#ctxIndicator')
   const hasCtx = capture.requestContext && capture.requestContext.attached
   ctx.hidden = !hasCtx
+
+  // Phase 14: about-this-name panel — show the top 3 candidate sources.
+  const about = $('#aboutName')
+  const aboutList = $('#aboutNameList')
+  const sources = sourceListHtml(capture)
+  if (sources) {
+    aboutList.innerHTML = sources
+    about.hidden = false
+  } else {
+    aboutList.innerHTML = ''
+    about.hidden = true
+  }
 
   // Status message
   const msg = $('#dlgMsg')
@@ -420,6 +495,31 @@ $('#dlgCancel').onclick = cancelImport
 $('#dlgStart').onclick = startImport
 $('#clearAll').onclick = clearAll
 
+// ── Phase 14: debug log toggle ──────────────────────────────────────────────
+
+async function loadDebugFlag() {
+  try {
+    const obj = await chrome.storage.local.get('9drive.debug')
+    state.debug = obj['9drive.debug'] === '1'
+  } catch { state.debug = false }
+  paintDebugToggle()
+}
+
+function paintDebugToggle() {
+  const btn = $('#debugToggle')
+  if (!btn) return
+  btn.classList.toggle('on', state.debug)
+  btn.textContent = state.debug ? 'Debug log: ON' : 'Debug log'
+}
+
+$('#debugToggle').addEventListener('click', async () => {
+  state.debug = !state.debug
+  paintDebugToggle()
+  try { await send({ type: 'SET_DEBUG', enabled: state.debug }) } catch { /* ignore */ }
+  try { await chrome.storage.local.set({ '9drive.debug': state.debug ? '1' : '0' }) } catch { /* ignore */ }
+})
+
 // ── Init ────────────────────────────────────────────────────────────────────
 
+void loadDebugFlag()
 refreshState()

@@ -23,6 +23,21 @@
 
 export const SOURCES = {
   CUSTOM_FILENAME: 'custom-filename',
+  // ── New identity-driven sources (Phase 14: Media Identity) ─────────────
+  JSONLD_VIDEOOBJECT_NAME: 'jsonld-videoobject-name',
+  JSONLD_VIDEOOBJECT_HEADLINE: 'jsonld-videoobject-headline',
+  PLAYER_CONFIG_TITLE: 'player-config-title',
+  PLAYER_CONFIG_NAME: 'player-config-name',
+  API_METADATA_TITLE: 'api-metadata-title',
+  API_METADATA_NAME: 'api-metadata-name',
+  DOM_VIDEO_TITLE: 'dom-video-title',
+  DOM_VIDEO_ARIA_LABEL: 'dom-video-aria-label',
+  DOM_VIDEO_DATA_TITLE: 'dom-video-data-title',
+  DOM_VIDEO_DATA_NAME: 'dom-video-data-name',
+  OG_VIDEO_TITLE: 'og-video-title',
+  META_ITEMPROP_NAME: 'meta-itemprop-name',
+  URL_BASENAME_NON_GENERIC: 'url-basename-non-generic',
+  // ── Existing sources (preserved for legacy callers + tests) ──────────
   CD_FILENAME_STAR: 'cd-filename-star',
   CD_FILENAME: 'cd-filename',
   DOWNLOAD_ATTR: 'download-attr',
@@ -38,15 +53,30 @@ export const SOURCES = {
 
 export const SOURCE_SCORES = {
   [SOURCES.CUSTOM_FILENAME]: 1000,
+  // ── New identity-driven sources (Phase 14) ─────────────────────────────
+  [SOURCES.JSONLD_VIDEOOBJECT_NAME]: 100,
+  [SOURCES.JSONLD_VIDEOOBJECT_HEADLINE]: 95,
+  [SOURCES.PLAYER_CONFIG_TITLE]: 92,
+  [SOURCES.PLAYER_CONFIG_NAME]: 88,
+  [SOURCES.API_METADATA_TITLE]: 85,
+  [SOURCES.API_METADATA_NAME]: 82,
+  [SOURCES.DOM_VIDEO_TITLE]: 75,
+  [SOURCES.DOM_VIDEO_ARIA_LABEL]: 72,
+  [SOURCES.DOM_VIDEO_DATA_TITLE]: 70,
+  [SOURCES.DOM_VIDEO_DATA_NAME]: 70,
+  [SOURCES.OG_VIDEO_TITLE]: 65,
+  [SOURCES.META_ITEMPROP_NAME]: 60,
+  [SOURCES.URL_BASENAME_NON_GENERIC]: 25,
+  // ── Existing sources (preserved for legacy callers + tests) ──────────
   [SOURCES.CD_FILENAME_STAR]: 100,
   [SOURCES.CD_FILENAME]: 95,
   [SOURCES.DOWNLOAD_ATTR]: 90,
   [SOURCES.FINAL_URL]: 80,
   [SOURCES.REQUEST_URL]: 70,
   [SOURCES.MEDIA_TITLE]: 65,
-  [SOURCES.OG_TITLE]: 60,
-  [SOURCES.TWITTER_TITLE]: 55,
-  [SOURCES.PAGE_TITLE]: 50,
+  [SOURCES.OG_TITLE]: 65,
+  [SOURCES.TWITTER_TITLE]: 60,
+  [SOURCES.PAGE_TITLE]: 45,
   [SOURCES.GENERIC_PLAYLIST]: 10,
   [SOURCES.FALLBACK]: 0,
 }
@@ -324,28 +354,64 @@ function withOutputExtension(name) {
 
 // ── Main resolver ──────────────────────────────────────────────────────────
 
-const MEDIA_TITLE_SOURCES = [
-  [SOURCES.MEDIA_TITLE, 'mediaTitle'],
-  [SOURCES.OG_TITLE, 'ogTitle'],
-  [SOURCES.TWITTER_TITLE, 'twitterTitle'],
-  [SOURCES.PAGE_TITLE, 'title'],
-] // title priority for metadata-derived names
-
-function titleCandidates(metadata) {
-  if (!metadata || typeof metadata !== 'object') return []
-  const out = []
-  for (const [source, key] of MEDIA_TITLE_SOURCES) {
-    const raw = metadata[key]
-    if (raw && typeof raw === 'string') {
-      const cleaned = removeSiteSuffix(raw)
-      if (cleaned) out.push(FilenameCandidate(cleaned, source, SOURCE_SCORES[source]))
-    }
-  }
-  return out
-}
-
 function isHlsLike(type) {
   return type === 'hls' || type === 'dash'
+}
+
+// Title-source set: any candidate whose source is in this set is treated as
+// a "real" identity (vs. a URL basename or transport header) and gets the
+// HLS quality-label append on the container swap.
+const TITLE_SOURCES = new Set([
+  // Legacy
+  SOURCES.MEDIA_TITLE, SOURCES.OG_TITLE, SOURCES.TWITTER_TITLE, SOURCES.PAGE_TITLE,
+  // Phase 14 — Media Identity
+  SOURCES.JSONLD_VIDEOOBJECT_NAME, SOURCES.JSONLD_VIDEOOBJECT_HEADLINE,
+  SOURCES.PLAYER_CONFIG_TITLE, SOURCES.PLAYER_CONFIG_NAME,
+  SOURCES.API_METADATA_TITLE, SOURCES.API_METADATA_NAME,
+  SOURCES.DOM_VIDEO_TITLE, SOURCES.DOM_VIDEO_ARIA_LABEL,
+  SOURCES.DOM_VIDEO_DATA_TITLE, SOURCES.DOM_VIDEO_DATA_NAME,
+  SOURCES.OG_VIDEO_TITLE, SOURCES.META_ITEMPROP_NAME,
+])
+
+/**
+ * Score candidates, penalize generic names, sort, and finalize the filename
+ * (HLS container swap, sanitize). Used by both the legacy and the new
+ * identity-driven entry points.
+ */
+function scoreAndFinalize(candidates, { type, quality }) {
+  // Penalize generic/technical names (master.m3u8, 1080.mp4, ...) — they must
+  // never dominate a better metadata- or header-derived name.
+  const scored = candidates.map((c) =>
+    isGenericName(c.value) && c.source !== SOURCES.CUSTOM_FILENAME
+      ? FilenameCandidate(c.value, c.source, Math.min(c.score, SOURCE_SCORES[SOURCES.GENERIC_PLAYLIST]))
+      : c,
+  )
+
+  // Sort by score descending (stable: first-collected wins ties).
+  scored.sort((a, b) => b.score - a.score)
+  const best = scored[0]
+
+  // HLS/DASH: the output is remuxed server-side, so the stored/display name
+  // must carry the output container extension, never a playlist suffix.
+  let filename = best.value
+  if (isHlsLike(type) && best.source !== SOURCES.CUSTOM_FILENAME) {
+    if (TITLE_SOURCES.has(best.source)) {
+      // Title-derived (page/metadata title, site suffix already stripped by
+      // titleCandidates) → append the quality label if available.
+      filename = withOutputExtension(best.value + (quality ? ` ${quality}` : ''))
+    } else {
+      // URL / Content-Disposition / download-attr derived → just swap the
+      // playlist or media extension for the output container.
+      filename = withOutputExtension(best.value)
+    }
+  }
+
+  const safe = sanitizeFilename(filename)
+
+  // Safe dev-only diagnostics (never URLs, cookies, tokens, or secrets).
+  console.debug(`[filename-resolver] selectedSource=${best.source} score=${best.score} resourceType=${type ?? ''} quality=${quality ?? ''} result=${safe}`)
+
+  return { filename: safe, source: best.source, candidates: scored }
 }
 
 /**
@@ -357,7 +423,7 @@ function isHlsLike(type) {
  * @param {string|null} opts.downloadAttr  HTML `download` attribute value
  * @param {string|null} opts.requestUrl  original request URL
  * @param {string|null} opts.finalUrl  final URL after redirects
- * @param {object|null} opts.pageMetadata  { title, ogTitle, twitterTitle, mediaTitle }
+ * @param {object|null} opts.pageMetadata  { title, ogTitle, twitterTitle, mediaTitle, ogVideoTitle, itempropName, thumbnail, duration, resolution, quality }
  * @param {string} opts.type  'hls' | 'dash' | 'video' | 'document' | ...
  * @param {string|null} opts.quality  extracted quality label (e.g. '1080p')
  * @returns {{ filename: string, source: string, candidates: Array }}
@@ -390,46 +456,121 @@ export function resolveFilename({ customFilename, contentDisposition, downloadAt
   const requestName = requestUrl ? filenameFromUrl(requestUrl) : ''
   if (requestName) candidates.push(FilenameCandidate(requestName, SOURCES.REQUEST_URL, SOURCE_SCORES[SOURCES.REQUEST_URL]))
 
-  // 6. Page metadata titles.
-  candidates.push(...titleCandidates(pageMetadata))
+  // 6. Page metadata titles (legacy + Phase 14 extended fields).
+  candidates.push(...extendedPageMetadataCandidates(pageMetadata))
 
   // 7. Fallback — never empty.
   if (candidates.length === 0) {
     candidates.push(FilenameCandidate('captured-file', SOURCES.FALLBACK, SOURCE_SCORES[SOURCES.FALLBACK]))
   }
 
-  // Penalize generic/technical names (master.m3u8, 1080.mp4, ...) — they must
-  // never dominate a better metadata- or header-derived name.
-  const scored = candidates.map((c) =>
-    isGenericName(c.value) && c.source !== SOURCES.CUSTOM_FILENAME
-      ? FilenameCandidate(c.value, c.source, Math.min(c.score, SOURCE_SCORES[SOURCES.GENERIC_PLAYLIST]))
-      : c,
-  )
+  return scoreAndFinalize(candidates, { type, quality })
+}
 
-  // Sort by score descending (stable: first-collected wins ties).
-  scored.sort((a, b) => b.score - a.score)
-  const best = scored[0]
+/**
+ * Extended page-metadata title candidates. Includes the legacy 4 fields
+ * (mediaTitle / ogTitle / twitterTitle / title) and the new Phase 14 fields
+ * (ogVideoTitle, itempropName) that the content script can stash into
+ * pageMetadata directly. The richer identity sources (JSON-LD, player
+ * config, API, DOM video) flow through the new resolveFromMediaIdentity()
+ * path and are NOT inlined here.
+ */
+function extendedPageMetadataCandidates(metadata) {
+  if (!metadata || typeof metadata !== 'object') return []
+  const out = []
+  const pairs = [
+    [SOURCES.MEDIA_TITLE, 'mediaTitle'],
+    [SOURCES.OG_TITLE, 'ogTitle'],
+    [SOURCES.OG_VIDEO_TITLE, 'ogVideoTitle'],
+    [SOURCES.TWITTER_TITLE, 'twitterTitle'],
+    [SOURCES.META_ITEMPROP_NAME, 'itempropName'],
+    [SOURCES.PAGE_TITLE, 'title'],
+  ]
+  for (const [source, key] of pairs) {
+    const raw = metadata[key]
+    if (raw && typeof raw === 'string') {
+      const cleaned = removeSiteSuffix(raw)
+      if (cleaned) out.push(FilenameCandidate(cleaned, source, SOURCE_SCORES[source]))
+    }
+  }
+  return out
+}
 
-  // HLS/DASH: the output is remuxed server-side, so the stored/display name
-  // must carry the output container extension, never a playlist suffix.
-  const TITLE_SOURCES = new Set([SOURCES.MEDIA_TITLE, SOURCES.OG_TITLE, SOURCES.TWITTER_TITLE, SOURCES.PAGE_TITLE])
-  let filename = best.value
-  if (isHlsLike(type) && best.source !== SOURCES.CUSTOM_FILENAME) {
-    if (TITLE_SOURCES.has(best.source)) {
-      // Title-derived (page/metadata title, site suffix already stripped by
-      // titleCandidates) → append the quality label if available.
-      filename = withOutputExtension(best.value + (quality ? ` ${quality}` : ''))
-    } else {
-      // URL / Content-Disposition / download-attr derived → just swap the
-      // playlist or media extension for the output container.
-      filename = withOutputExtension(best.value)
+/**
+ * Resolve a filename from a full MediaIdentity object. The identity already
+ * contains all scored candidates from JSON-LD / player / API / DOM / page
+ * metadata; the resolver applies generic-name demotion, HLS container swap,
+ * and the custom-filename lock.
+ *
+ * @param {object} identity  Output of extractMediaIdentity()
+ * @param {object} [opts]
+ * @param {string|null} [opts.customFilename]  explicit user override
+ * @param {string|null} [opts.contentDisposition]
+ * @param {string|null} [opts.downloadAttr]
+ * @param {string|null} [opts.requestUrl]
+ * @param {string|null} [opts.finalUrl]
+ * @param {string}      [opts.type]   — resource type
+ * @param {string|null} [opts.quality]
+ * @returns {{ filename: string, source: string, confidence: number, candidates: Array }}
+ */
+export function resolveFromMediaIdentity(identity, opts = {}) {
+  const type = opts.type ?? identity?.type ?? null
+  const quality = opts.quality ?? identity?.quality ?? null
+  const candidates = []
+
+  // 1. Explicit user override — absolute priority.
+  const custom = opts.customFilename ?? null
+  if (custom && String(custom).trim()) {
+    candidates.push(FilenameCandidate(String(custom).trim(), SOURCES.CUSTOM_FILENAME, SOURCE_SCORES[SOURCES.CUSTOM_FILENAME]))
+  }
+
+  // 2. Content-Disposition.
+  const cd = parseContentDispositionFilename(opts.contentDisposition ?? null)
+  if (cd) {
+    const isStar = /filename\*=/i.test(opts.contentDisposition)
+    candidates.push(FilenameCandidate(cd, isStar ? SOURCES.CD_FILENAME_STAR : SOURCES.CD_FILENAME, isStar ? SOURCE_SCORES[SOURCES.CD_FILENAME_STAR] : SOURCE_SCORES[SOURCES.CD_FILENAME]))
+  }
+
+  // 3. HTML download attribute.
+  if (opts.downloadAttr && String(opts.downloadAttr).trim()) {
+    candidates.push(FilenameCandidate(String(opts.downloadAttr).trim(), SOURCES.DOWNLOAD_ATTR, SOURCE_SCORES[SOURCES.DOWNLOAD_ATTR]))
+  }
+
+  // 4-5. URL basenames — both final and request, generic-aware.
+  const finalName = opts.finalUrl ? filenameFromUrl(opts.finalUrl) : ''
+  if (finalName) {
+    const src = isGenericName(finalName) ? SOURCES.FINAL_URL : SOURCES.URL_BASENAME_NON_GENERIC
+    candidates.push(FilenameCandidate(finalName, src, SOURCE_SCORES[src] ?? SOURCE_SCORES[SOURCES.FINAL_URL]))
+  }
+  const requestName = opts.requestUrl ? filenameFromUrl(opts.requestUrl) : ''
+  if (requestName) {
+    const src = isGenericName(requestName) ? SOURCES.REQUEST_URL : SOURCES.URL_BASENAME_NON_GENERIC
+    candidates.push(FilenameCandidate(requestName, src, SOURCE_SCORES[src] ?? SOURCE_SCORES[SOURCES.REQUEST_URL]))
+  }
+
+  // 6. Identity candidates — already scored by extractMediaIdentity.
+  if (identity && Array.isArray(identity.identity?.candidates)) {
+    for (const c of identity.identity.candidates) {
+      if (!c.value) continue
+      const source = c.source
+      if (!Object.values(SOURCES).includes(source)) continue
+      // Skip fallback source 0-score candidates — they only exist to keep the
+      // list non-empty for debug; the final result is never them.
+      if (source === SOURCES.FALLBACK) continue
+      const score = SOURCE_SCORES[source] ?? c.confidence ?? 0
+      candidates.push(FilenameCandidate(c.value, source, score))
     }
   }
 
-  const safe = sanitizeFilename(filename)
+  // 7. Fallback — never empty.
+  if (candidates.length === 0) {
+    candidates.push(FilenameCandidate('captured-file', SOURCES.FALLBACK, SOURCE_SCORES[SOURCES.FALLBACK]))
+  }
 
-  // Safe dev-only diagnostics (never URLs, cookies, tokens, or secrets).
-  console.debug(`[filename-resolver] selectedSource=${best.source} score=${best.score} resourceType=${type ?? ''} quality=${quality ?? ''} result=${safe}`)
-
-  return { filename: safe, source: best.source, candidates: scored }
+  const result = scoreAndFinalize(candidates, { type, quality })
+  return {
+    ...result,
+    confidence: identity?.identity?.selectedConfidence ?? 0,
+    selectedSource: result.source,
+  }
 }

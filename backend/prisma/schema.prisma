@@ -592,6 +592,14 @@ model CapturedResource {
   // Safe context only (referer/origin/userAgent) — cookies are NEVER accepted;
   // values validated + encrypted at rest, booleans-only across the API.
   requestContextEncrypted String?       @map("request_context_encrypted") @db.Text
+  // ── Phase 14: Media Identity (extension-side scoring, top-level fields only).
+  // The full candidates list stays in the extension; the backend only persists
+  // the winner so the Remote Imports UI can show "from JSON-LD" / etc. All
+  // three fields default to safe empty values so legacy rows + the wire
+  // continue to validate.
+  mediaIdentityTitle      String?       @map("media_identity_title") @db.VarChar(512)
+  mediaIdentitySource     String?       @map("media_identity_source") @db.VarChar(64)
+  mediaIdentityConfidence Int           @default(0) @map("media_identity_confidence")
   // pending | consumed | expired | deleted
   status                  String        @default("pending") @db.VarChar(16)
   detectedAt              DateTime      @default(now()) @map("detected_at")

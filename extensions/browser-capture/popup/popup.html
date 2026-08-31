@@ -142,6 +142,7 @@
       <h1>9Drive Capture</h1>
     </div>
     <div style="display:flex;gap:6px;align-items:center">
+      <button id="debugToggle" class="debug-toggle" title="Show filename scoring log in the service worker console">Debug log</button>
       <button id="clearAll" hidden class="clear-btn">Clear All</button>
       <span id="conn" class="badge off">Not connected</span>
     </div>
@@ -162,6 +163,34 @@
   <div id="captureList">
     <div class="empty" id="empty">No captured media yet.<br>Play or open a video/PDF to detect it.</div>
   </div>
+
+  <!-- Phase 14: about-this-name panel (shown in the import dialog when the
+       capture has a richer identity attached). -->
+  <style>
+    .about-name {
+      font-size: 11px; color: var(--text-dim); margin-top: 8px;
+      border-top: 1px dashed var(--border); padding-top: 6px;
+    }
+    .about-name summary { cursor: pointer; font-weight: 600; color: var(--text-label); }
+    .about-name .source-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+    .about-name .source-list li { display: flex; justify-content: space-between; gap: 8px; }
+    .about-name .source-list .src { font-family: ui-monospace, SFMono-Regular, monospace; }
+    .about-name .source-list .score { font-variant-numeric: tabular-nums; color: var(--text); }
+    .source-chip {
+      display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 99px;
+      background: #ecfeff; color: #0e7490; font-weight: 600; margin-left: 6px;
+    }
+    @media (prefers-color-scheme: dark) { .source-chip { background: #164e63; color: #a5f3fc; } }
+    .debug-toggle {
+      font-size: 11px; padding: 4px 8px; border: 1px solid var(--border);
+      border-radius: 99px; background: var(--bg-alt); color: var(--text-label);
+      cursor: pointer; font-weight: 500;
+    }
+    .debug-toggle.on { background: #fef9c3; color: #854d0e; border-color: #fde68a; }
+    @media (prefers-color-scheme: dark) {
+      .debug-toggle.on { background: #422006; color: #fde68a; border-color: #854d0e; }
+    }
+  </style>
 
   <!-- Import form (inline, shown when a capture is selected) -->
   <div id="importForm" hidden>
@@ -188,6 +217,10 @@
       <span><span class="dot on"></span>User-Agent</span>
     </div>
     <div id="dlgMsg" class="msg"></div>
+    <details id="aboutName" class="about-name" hidden>
+      <summary>About this name</summary>
+      <ul class="source-list" id="aboutNameList"></ul>
+    </details>
   </div>
 
   <!-- Sticky footer (shown when import form is open) -->

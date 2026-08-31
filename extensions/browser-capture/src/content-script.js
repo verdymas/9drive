@@ -121,6 +121,94 @@ function absoluteUrl(href) {
   }
 }
 
+// ── Media Identity (Phase 14) ──────────────────────────────────────────────
+//
+// Dynamic-imported so the content script can stay as a plain non-module script
+// (matches the existing manifest.json). The install + first collection kick
+// off as soon as the page is interactive; the result is pushed to the SW
+// exactly like the existing PAGE_METADATA_PUSH.
+
+let _identityModules = null
+async function loadIdentityModules() {
+  if (_identityModules) return _identityModules
+  const [collectors, identity] = await Promise.all([
+    import('./metadata-collectors.js'),
+    import('./media-identity.js'),
+  ])
+  _identityModules = { ...collectors, ...identity }
+  return _identityModules
+}
+
+let _apiCaptureInstalled = false
+async function ensureApiCapture() {
+  if (_apiCaptureInstalled) return
+  const m = await loadIdentityModules()
+  try { m.installApiCapture() } catch { /* never break the page */ }
+  _apiCaptureInstalled = true
+}
+
+const IDENTITY_KEY_PREFIX = 'mediaIdentity:'
+
+/**
+ * Run all metadata collectors + identity scoring, stash the union into
+ * chrome.storage.session under mediaIdentity:<pageUrl>, and push to the SW.
+ * Called on initial load, on loadedmetadata, on the deferred timeouts, and
+ * from the MutationObserver.
+ */
+async function stashMediaIdentity() {
+  try {
+    const m = await loadIdentityModules()
+    await ensureApiCapture()
+    const collected = m.collectAllMetadata()
+    const baseMeta = collectPageMetadata()
+    const ogVideoTitle = document.querySelector('meta[property="og:video:title"]')?.getAttribute('content') || null
+    const itempropName = document.querySelector('meta[itemprop="name"]')?.getAttribute('content') || null
+    const identity = m.extractMediaIdentity({
+      jsonLd: collected.jsonLd,
+      playerConfigs: collected.playerConfigs,
+      apiMetadata: collected.apiMetadata,
+      videoElements: collected.videoElements,
+      pageMetadata: { ...baseMeta, ogVideoTitle, itempropName },
+      finalUrl: location.href,
+      requestUrl: location.href,
+      type: null,
+      quality: baseMeta?.quality ?? null,
+    })
+    const key = IDENTITY_KEY_PREFIX + stripQuery(location.href)
+    const payload = {
+      identity,
+      baseMeta,
+      ogVideoTitle,
+      itempropName,
+      collectedAt: Date.now(),
+    }
+    await chrome.storage.session.set({ [key]: payload })
+    try {
+      chrome.runtime.sendMessage({ type: 'MEDIA_IDENTITY_PUSH', pageUrl: location.href, payload }, () => {
+        void chrome.runtime.lastError
+      })
+    } catch {
+      /* extension context invalidated — re-resolve on next popup open */
+    }
+    // Also refresh the legacy pageMetadata stash so the existing SW flow
+    // (which still uses the pageMetadata shape) gets the richer mediaTitle.
+    const enrichedLegacy = m.mediaIdentityToPageMetadata(identity)
+    if (enrichedLegacy) {
+      const pageKey = PAGE_KEY_PREFIX + stripQuery(location.href)
+      try {
+        await chrome.storage.session.set({ [pageKey]: enrichedLegacy })
+      } catch { /* ignore */ }
+    }
+  } catch {
+    /* metadata identity is best-effort; never block the legacy path */
+  }
+}
+
+function scheduleMediaIdentityCollection(delayMs = 0) {
+  if (delayMs <= 0) { void stashMediaIdentity(); return }
+  setTimeout(() => { void stashMediaIdentity() }, delayMs)
+}
+
 /** Stash every `<a download>` filename, keyed by its absolute URL. */
 async function stashDownloadAttrs() {
   try {
@@ -139,11 +227,38 @@ async function stashDownloadAttrs() {
 stashPageMetadata()
 stashDownloadAttrs()
 
+// Phase 14: kick the richer identity collection on the same triggers, plus a
+// few new ones (window load, 2s + 5s timeouts for SPAs that hydrate after
+// first paint, head/body mutation observer for late JSON-LD + <video>).
+scheduleMediaIdentityCollection(0)
+if (document.readyState !== 'complete') {
+  window.addEventListener('load', () => scheduleMediaIdentityCollection(0), { once: true })
+}
+scheduleMediaIdentityCollection(2000)
+scheduleMediaIdentityCollection(5000)
+
+try {
+  const debouncedIdentity = (() => {
+    let t = null
+    return () => {
+      if (t) clearTimeout(t)
+      t = setTimeout(() => { t = null; scheduleMediaIdentityCollection(0) }, 250)
+    }
+  })()
+  const headObserver = new MutationObserver(debouncedIdentity)
+  if (document.head) headObserver.observe(document.head, { childList: true, subtree: true })
+  const bodyObserver = new MutationObserver(debouncedIdentity)
+  if (document.body) bodyObserver.observe(document.body, { childList: true, subtree: true })
+} catch {
+  /* MutationObserver unavailable on this page */
+}
+
 // SPA players insert <video> after load — re-stash once it has real metadata
 // (duration/resolution become available after loadedmetadata).
 document.addEventListener('loadedmetadata', (e) => {
   if (e.target instanceof HTMLVideoElement || e.target instanceof HTMLAudioElement) {
     void stashPageMetadata()
+    scheduleMediaIdentityCollection(0)
   }
 }, true)
 

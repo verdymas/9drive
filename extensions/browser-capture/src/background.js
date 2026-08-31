@@ -8,9 +8,10 @@
  * Remote Import pipeline.
  */
 import { classifyResource, displayTypeFor, extractQuality, filenameFromUrl } from './classify.js'
-import { resolveFilename, parseContentDispositionFilename } from './filename-resolver.js'
+import { resolveFilename, parseContentDispositionFilename, resolveFromMediaIdentity } from './filename-resolver.js'
 import { addCapture, allCaptures, clearAllCaptures, countPending, displayUrlOf, pruneAgainstServer, removeCapture, saveCaptures, updateCapture } from './store.js'
 import { getConfig, heartbeat, submitResource, deleteServerResource, setConfig, resolveApiRoot, requestTo } from './api.js'
+import { formatDebugReport } from './media-identity.js'
 
 const EXT_VERSION = chrome.runtime.getManifest().version
 
@@ -122,13 +123,16 @@ chrome.webRequest.onHeadersReceived.addListener(
     // Page metadata + download attribute collected by the content script.
     let pageMetadata = null
     let downloadAttr = null
+    let identityPayload = null
     if (pageUrl) {
       try {
         const p = new URL(pageUrl)
         if (p.protocol === 'http:' || p.protocol === 'https:') {
           const metaKey = `pageMetadata:${p.origin}${p.pathname}`
-          const sessionData = await chrome.storage.session.get(metaKey)
+          const identityKey = `mediaIdentity:${p.origin}${p.pathname}`
+          const sessionData = await chrome.storage.session.get([metaKey, identityKey])
           pageMetadata = sessionData[metaKey] ?? null
+          identityPayload = sessionData[identityKey] ?? null
         }
       } catch { /* non-http initiator */ }
     }
@@ -147,15 +151,31 @@ chrome.webRequest.onHeadersReceived.addListener(
     // a number scraped from the URL basename.
     const quality = pageMetadata?.quality || extractQuality(filenameFromUrl(finalUrl))
 
-    const result = resolveFilename({
-      requestUrl: originalUrl,
-      finalUrl,
-      contentDisposition: headers.get('content-disposition'),
-      downloadAttr,
-      pageMetadata,
-      type: cls.type,
-      quality,
-    })
+    let result
+    let mediaIdentity = identityPayload?.identity ?? null
+    if (mediaIdentity) {
+      result = resolveFromMediaIdentity(mediaIdentity, {
+        contentDisposition: headers.get('content-disposition'),
+        downloadAttr,
+        requestUrl: originalUrl,
+        finalUrl,
+        type: cls.type,
+        quality,
+      })
+    } else {
+      result = resolveFilename({
+        requestUrl: originalUrl,
+        finalUrl,
+        contentDisposition: headers.get('content-disposition'),
+        downloadAttr,
+        pageMetadata,
+        type: cls.type,
+        quality,
+      })
+    }
+    if (mediaIdentity) {
+      void logIdentityDebug(result, { type: cls.type, finalUrl, quality, id: null }, mediaIdentity)
+    }
 
     // Forensic-acceptance debug summary: which metadata source won, with safe
     // fields only (no URLs, cookies, Authorization, signed query values, or
@@ -192,9 +212,14 @@ chrome.webRequest.onHeadersReceived.addListener(
       estimatedSize: size,
       sizeSource: size != null ? 'content-length' : null,
       quality,
-      thumbnail: pageMetadata?.thumbnail ?? null,
-      duration: pageMetadata?.duration ?? null,
+      thumbnail: pageMetadata?.thumbnail ?? mediaIdentity?.thumbnail ?? null,
+      duration: pageMetadata?.duration ?? mediaIdentity?.duration ?? null,
       customFilename: null,
+      // Phase 14: media identity (when present) carries the source + confidence
+      // and lets the popup show "from JSON-LD" / "from og:title" / etc.
+      mediaIdentity: mediaIdentity ?? null,
+      mediaIdentitySource: mediaIdentity?.identity?.selectedSource ?? null,
+      mediaIdentityConfidence: mediaIdentity?.identity?.selectedConfidence ?? 0,
       status: 'detected',
       ts: Date.now(),
     }
@@ -219,13 +244,17 @@ chrome.webRequest.onHeadersReceived.addListener(
 // never overwrite it. Existing meaningful values are preserved; a later event
 // that fills in a previously-null field upgrades the suggested filename in
 // place, then the badge is updated so the popup reflects it immediately.
-async function recheckPendingCaptures(pageUrl) {
+async function recheckPendingCaptures(pageUrl, identityPayload = null) {
   let p
   try { p = new URL(pageUrl); if (p.protocol !== 'http:' && p.protocol !== 'https:') return } catch { return }
   const metaKey = `pageMetadata:${p.origin}${p.pathname}`
   const session = await chrome.storage.session.get([metaKey]).catch(() => ({}))
   const meta = session[metaKey]
-  if (!meta) return
+  // Phase 14: when the content script pushed a richer identity payload, use it
+  // directly instead of re-scoring. The push already ran extractMediaIdentity,
+  // so the resolver consumes the pre-scored candidates.
+  const identity = identityPayload?.identity ?? null
+  if (!meta && !identity) return
 
   const list = await allCaptures()
   let changed = false
@@ -241,23 +270,46 @@ async function recheckPendingCaptures(pageUrl) {
 
     // Merge: existing meaningful value wins over null/undefined/empty.
     const mergedMeta = mergeMetadata(row.pageMetadata, meta)
-    const better = isRicherMetadata(mergedMeta, row.pageMetadata)
+    const better = isRicherMetadata(mergedMeta, row.pageMetadata) || Boolean(identity)
     if (!better) continue
 
-    const result = resolveFilename({
-      requestUrl: row.originalUrl ?? row.url,
-      finalUrl: row.finalUrl ?? row.url,
-      contentDisposition: row.contentDisposition ?? null,
-      downloadAttr: row.downloadAttr ?? null,
-      pageMetadata: mergedMeta,
-      type: row.type,
-      quality: mergedMeta.quality ?? extractQuality(filenameFromUrl(row.url)),
-    })
+    let result
+    if (identity) {
+      // Richer path: MediaIdentity already scored JSON-LD / player / API / DOM
+      // candidates. The resolver applies generic-name demotion, HLS container
+      // swap, and the custom-filename lock. URL basenames from the request
+      // remain candidates as a last-resort fallback.
+      result = resolveFromMediaIdentity(identity, {
+        customFilename: row.customFilename ?? null,
+        contentDisposition: row.contentDisposition ?? null,
+        downloadAttr: row.downloadAttr ?? null,
+        requestUrl: row.originalUrl ?? row.url,
+        finalUrl: row.finalUrl ?? row.url,
+        type: row.type,
+        quality: row.quality ?? extractQuality(filenameFromUrl(row.url)),
+      })
+      if (row.id) void logIdentityDebug(result, row, identity)
+    } else {
+      result = resolveFilename({
+        requestUrl: row.originalUrl ?? row.url,
+        finalUrl: row.finalUrl ?? row.url,
+        contentDisposition: row.contentDisposition ?? null,
+        downloadAttr: row.downloadAttr ?? null,
+        pageMetadata: mergedMeta,
+        type: row.type,
+        quality: mergedMeta.quality ?? extractQuality(filenameFromUrl(row.url)),
+      })
+    }
     if (result.filename === row.filename) {
       row.pageMetadata = mergedMeta
       row.thumbnail = mergedMeta.thumbnail ?? row.thumbnail
       row.duration = mergedMeta.duration ?? row.duration
       row.quality = mergedMeta.quality ?? row.quality
+      if (identity) {
+        row.mediaIdentity = identity
+        row.mediaIdentitySource = identity?.identity?.selectedSource ?? null
+        row.mediaIdentityConfidence = identity?.identity?.selectedConfidence ?? 0
+      }
       changed = true
       continue
     }
@@ -268,6 +320,9 @@ async function recheckPendingCaptures(pageUrl) {
       thumbnail: mergedMeta.thumbnail ?? row.thumbnail,
       duration: mergedMeta.duration ?? row.duration,
       quality: mergedMeta.quality ?? row.quality,
+      mediaIdentity: identity ?? row.mediaIdentity ?? null,
+      mediaIdentitySource: identity?.identity?.selectedSource ?? row.mediaIdentitySource ?? null,
+      mediaIdentityConfidence: identity?.identity?.selectedConfidence ?? row.mediaIdentityConfidence ?? 0,
       ts: Date.now(),
     })
     changed = true
@@ -276,6 +331,27 @@ async function recheckPendingCaptures(pageUrl) {
     await saveCaptures(list)
     await updateBadge()
   }
+}
+
+/**
+ * Multi-line debug logger — opt-in via `chrome.storage.local['9drive.debug']`.
+ * Never logs URLs (only hosts), response bodies, request headers, cookies, or
+ * Authorization values. Disabled by default.
+ */
+async function logIdentityDebug(result, row, identity) {
+  try {
+    const flag = await chrome.storage.local.get('9drive.debug').catch(() => ({}))
+    if (flag['9drive.debug'] !== '1') return
+  } catch { return }
+  let finalUrlHost = ''
+  try { finalUrlHost = new URL(row.finalUrl ?? row.url).hostname } catch { /* ignore */ }
+  const report = formatDebugReport(identity, {
+    resourceType: row.type,
+    finalUrlHost,
+    quality: row.quality ?? null,
+    filename: result.filename,
+  })
+  console.debug(report)
 }
 
 /** Field-by-field merge that keeps the existing value when it's already meaningful. */
@@ -318,6 +394,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse?.({ ok: true })
     return false
   }
+  // Phase 14: richer identity push (JSON-LD / player / API / DOM media) —
+  // same late-re-resolution flow, but the resolver consumes the full
+  // MediaIdentity object so the highest-confidence source wins.
+  if (msg?.type === 'MEDIA_IDENTITY_PUSH' && typeof msg.pageUrl === 'string') {
+    void recheckPendingCaptures(msg.pageUrl, msg.payload ?? null)
+    sendResponse?.({ ok: true })
+    return false
+  }
+  // Phase 14: popup debug toggle.
+  if (msg?.type === 'SET_DEBUG' && typeof msg.enabled === 'boolean') {
+    chrome.storage.local.set({ '9drive.debug': msg.enabled ? '1' : '0' })
+    sendResponse?.({ ok: true })
+    return false
+  }
 })
 
 async function syncCapture(entry, safeContext = {}) {
@@ -329,6 +419,17 @@ async function syncCapture(entry, safeContext = {}) {
       filename: entry.filename,
       pageUrl: entry.pageUrl,
       pageTitle: entry.pageMetadata?.title ?? null,
+      // Phase 14: send a compact media-identity summary so the backend can
+      // surface "from JSON-LD" / "from og:title" in the Remote Imports UI.
+      // The full candidates array stays in the extension — only the winner
+      // crosses the wire.
+      mediaIdentity: entry.mediaIdentity
+        ? {
+            title: entry.mediaIdentity?.title ?? null,
+            source: entry.mediaIdentitySource ?? entry.mediaIdentity?.identity?.selectedSource ?? null,
+            confidence: entry.mediaIdentityConfidence ?? entry.mediaIdentity?.identity?.selectedConfidence ?? 0,
+          }
+        : null,
       requestContext: safeContext,
     })
     if (serverRow?.id) await updateCaptureByRemoteId(entry, { remoteId: serverRow.id })

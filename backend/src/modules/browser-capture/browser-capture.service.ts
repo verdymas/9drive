@@ -164,7 +164,25 @@ export type SubmitResourceInput = {
   filename?: string | null
   pageUrl?: string | null
   pageTitle?: string | null
+  // Phase 14: compact media-identity summary. Title + source + confidence.
+  mediaIdentity?: { title?: string | null; source?: string | null; confidence?: number | null } | null
   requestContext?: Partial<RemoteImportRequestContext> | null
+}
+
+/** Phase 14: cap the title length to match the DB column. */
+const MEDIA_IDENTITY_TITLE_MAX = 512
+const MEDIA_IDENTITY_SOURCE_MAX = 64
+const MEDIA_IDENTITY_CONFIDENCE_MAX = 100
+
+function sanitizeMediaIdentity(input: SubmitResourceInput['mediaIdentity']) {
+  if (!input || typeof input !== 'object') return { title: null, source: null, confidence: 0 }
+  const title = typeof input.title === 'string' ? input.title.replace(/[\r\n\t]+/g, ' ').trim().slice(0, MEDIA_IDENTITY_TITLE_MAX) || null : null
+  const source = typeof input.source === 'string' ? input.source.trim().slice(0, MEDIA_IDENTITY_SOURCE_MAX) || null : null
+  const rawConfidence = Number(input.confidence)
+  const confidence = Number.isFinite(rawConfidence)
+    ? Math.max(0, Math.min(MEDIA_IDENTITY_CONFIDENCE_MAX, Math.round(rawConfidence)))
+    : 0
+  return { title, source, confidence }
 }
 
 /**
@@ -199,6 +217,7 @@ export async function submitCapturedResource(input: SubmitResourceInput) {
 
   const filename = sanitizeCapturedFilename(input.filename ?? deriveFilenameFromUrl(parsedUrl))
   const pageTitle = input.pageTitle ? input.pageTitle.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 512) : null
+  const mediaIdentity = sanitizeMediaIdentity(input.mediaIdentity)
 
   // Cookie never crosses the capture boundary — strip before validation.
   const requestContext = validateRequestContext(stripSensitiveContext(input.requestContext))
@@ -216,6 +235,14 @@ export async function submitCapturedResource(input: SubmitResourceInput) {
         // A re-detection may carry a fresher page title / context.
         pageTitle: pageTitle ?? existing.pageTitle,
         requestContextEncrypted: requestContext ? encryptRequestContext(requestContext) : existing.requestContextEncrypted,
+        // Phase 14: only upgrade identity fields when the new value has a
+        // higher confidence than the existing one. A null/lower-confidence
+        // incoming value never overwrites a richer record.
+        mediaIdentityTitle: mediaIdentity.title ?? existing.mediaIdentityTitle,
+        mediaIdentitySource: mediaIdentity.source ?? existing.mediaIdentitySource,
+        mediaIdentityConfidence: mediaIdentity.confidence > (existing.mediaIdentityConfidence ?? 0)
+          ? mediaIdentity.confidence
+          : (existing.mediaIdentityConfidence ?? 0),
       },
     })
     return serializeCapturedResource(refreshed)
@@ -233,6 +260,9 @@ export async function submitCapturedResource(input: SubmitResourceInput) {
       pageUrl: input.pageUrl ? input.pageUrl.slice(0, 4096) : null,
       pageTitle,
       requestContextEncrypted: requestContext ? encryptRequestContext(requestContext) : null,
+      mediaIdentityTitle: mediaIdentity.title,
+      mediaIdentitySource: mediaIdentity.source,
+      mediaIdentityConfidence: mediaIdentity.confidence,
       status: 'pending',
       expiresAt: new Date(Date.now() + CAPTURED_RESOURCE_TTL_MS),
     },

@@ -134,6 +134,13 @@ const submitSchema = z.object({
   filename: z.string().max(255).nullable().optional(),
   pageUrl: z.string().max(4096).nullable().optional(),
   pageTitle: z.string().max(512).nullable().optional(),
+  // Phase 14: Media Identity summary from the extension. Top-level fields
+  // only — the full candidates list stays in the extension.
+  mediaIdentity: z.object({
+    title: z.string().max(512).nullable().optional(),
+    source: z.string().max(64).nullable().optional(),
+    confidence: z.number().int().min(0).max(100).optional(),
+  }).nullable().optional(),
   requestContext: resourceContextSchema,
 }).strict()
 
