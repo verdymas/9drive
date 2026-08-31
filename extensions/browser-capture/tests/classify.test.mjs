@@ -32,6 +32,11 @@ const cases = [
   // Image
   ['https://cdn.example.com/pic.png', null, 'image', null],
   ['https://cdn.example.com/photo.jpg', 'image/jpeg', 'image', null],
+  ['https://cdn.example.com/favicon.ico', null, 'image', null],
+  // Other (gated by the "Other Files" filter)
+  ['https://cdn.example.com/setup.exe', null, 'other', null],
+  ['https://cdn.example.com/data.csv', null, 'other', null],
+  ['https://cdn.example.com/font.woff2', null, 'other', null],
   // Suppressed: segments and media internals
   ['https://cdn.example.com/hls/seg-0001.ts', null, null, null],
   ['https://cdn.example.com/hls/chunk.m4s', null, null, null],
@@ -110,6 +115,7 @@ assert.equal(displayTypeFor('video', null), 'Video')
 assert.equal(displayTypeFor('audio', null), 'Audio')
 assert.equal(displayTypeFor('image', null), 'Image')
 assert.equal(displayTypeFor('archive', null), 'Archive')
+assert.equal(displayTypeFor('other', null), 'Other')
 assert.equal(displayTypeFor('document', 'application/pdf'), 'PDF Document')
 assert.equal(displayTypeFor('document', 'application/msword'), 'Document')
 assert.equal(displayTypeFor('document', null), 'Document')

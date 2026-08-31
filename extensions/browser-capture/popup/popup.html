@@ -123,6 +123,28 @@
     }
     .clear-btn:hover { background: var(--danger-bg); }
 
+    /* ── Capture Settings (collapsible panel) ───────────── */
+    .settings-details {
+      flex-shrink: 0; padding: 0 14px 8px; border-bottom: 1px solid var(--border);
+    }
+    .settings-details > summary {
+      cursor: pointer; font-size: 12px; font-weight: 600; color: var(--text-label);
+      padding: 8px 0; list-style: none; user-select: none;
+    }
+    .settings-details > summary::before {
+      content: '▸'; display: inline-block; margin-right: 6px; transition: transform 0.15s;
+    }
+    .settings-details[open] > summary::before { transform: rotate(90deg); }
+    .filter-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px;
+      padding: 4px 0 2px;
+    }
+    .filter-grid label {
+      display: flex; align-items: center; gap: 6px; font-size: 12px;
+      color: var(--text); cursor: pointer;
+    }
+    .filter-grid input[type="checkbox"] { cursor: pointer; }
+
     /* ── Status messages ────────────────────────────────── */
     .msg { font-size: 12px; margin-top: 6px; }
     .msg.ok { color: var(--success); }
@@ -163,6 +185,20 @@
   <div id="captureList">
     <div class="empty" id="empty">No captured media yet.<br>Play or open a video/PDF to detect it.</div>
   </div>
+
+  <!-- Capture Settings (collapsible) -->
+  <details id="captureSettings" class="settings-details">
+    <summary>Capture Settings</summary>
+    <div class="filter-grid">
+      <label><input type="checkbox" data-filter="video"> Video</label>
+      <label><input type="checkbox" data-filter="hls"> HLS Stream (.m3u8)</label>
+      <label><input type="checkbox" data-filter="dash"> DASH Stream (.mpd)</label>
+      <label><input type="checkbox" data-filter="audio"> Audio</label>
+      <label><input type="checkbox" data-filter="documents"> Documents (PDF, DOCX, XLSX)</label>
+      <label><input type="checkbox" data-filter="images"> Images</label>
+      <label><input type="checkbox" data-filter="other"> Other Files</label>
+    </div>
+  </details>
 
   <!-- Phase 14: about-this-name panel (shown in the import dialog when the
        capture has a richer identity attached). -->

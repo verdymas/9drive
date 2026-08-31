@@ -4,17 +4,29 @@
  * user-provided 9Drive backend origin (set during first-run pairing).
  */
 
+import { DEFAULT_FILTERS } from './filters.js'
+
 const CFG_KEY = '9drive.config'
 
 export async function getConfig() {
   const obj = await chrome.storage.local.get(CFG_KEY)
-  return obj[CFG_KEY] ?? { baseUrl: null, apiBase: null, deviceToken: null, deviceName: null }
+  const cfg = obj[CFG_KEY] ?? { baseUrl: null, apiBase: null, deviceToken: null, deviceName: null }
+  // Always expose a complete capture-filter set (defaults merged) so readers
+  // never have to worry about missing keys.
+  return { ...cfg, captureFilters: { ...DEFAULT_FILTERS, ...(cfg.captureFilters ?? {}) } }
 }
 
 export async function setConfig(patch) {
   const cfg = { ...(await getConfig()), ...patch }
   await chrome.storage.local.set({ [CFG_KEY]: cfg })
   return cfg
+}
+
+/** Merge a partial capture-filter patch (e.g. { images: true }) and persist. */
+export async function setCaptureFilters(patch) {
+  const cfg = await getConfig()
+  const captureFilters = { ...cfg.captureFilters, ...patch }
+  return setConfig({ captureFilters })
 }
 
 export async function clearConnection() {

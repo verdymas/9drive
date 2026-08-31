@@ -5,6 +5,7 @@
  * No framework; chrome popups are tiny — imperative DOM is fastest and clearest.
  */
 import { groupCaptures, displayTypeFor, urlQualityLabel } from '../src/classify.js'
+import { getConfig, setCaptureFilters } from '../src/api.js'
 
 const $ = (sel) => document.querySelector(sel)
 
@@ -440,14 +441,11 @@ async function removeCapture(id) {
 // ── Clear all ────────────────────────────────────────────────────────────────
 
 async function clearAll() {
-  const ok = confirm('Clear all captured files?\n\nThis only removes the capture list.\nIt does not delete files from 9Drive storage.')
-  if (!ok) return
   await send({ type: 'clearAll' })
-  state.captures = []
   state.selectedId = null
   state.importStatus = 'idle'
   state.importMsg = ''
-  render()
+  await refreshState()
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -519,7 +517,29 @@ $('#debugToggle').addEventListener('click', async () => {
   try { await chrome.storage.local.set({ '9drive.debug': state.debug ? '1' : '0' }) } catch { /* ignore */ }
 })
 
+// ── Capture Settings (filter checkboxes) ────────────────────────────────────
+
+/** Paint each `[data-filter]` checkbox from the persisted config. */
+async function paintFilters() {
+  try {
+    const cfg = await getConfig()
+    const filters = cfg.captureFilters
+    for (const box of document.querySelectorAll('#captureSettings input[type="checkbox"][data-filter]')) {
+      const key = box.dataset.filter
+      if (key in filters) box.checked = Boolean(filters[key])
+    }
+  } catch { /* ignore — checkboxes keep their HTML defaults */ }
+}
+
+/** Single delegated change listener: persist the new value immediately. */
+document.querySelector('#captureSettings')?.addEventListener('change', async (e) => {
+  const box = e.target
+  if (!(box instanceof HTMLInputElement) || box.type !== 'checkbox' || !box.dataset.filter) return
+  try { await setCaptureFilters({ [box.dataset.filter]: box.checked }) } catch { /* ignore */ }
+})
+
 // ── Init ────────────────────────────────────────────────────────────────────
 
 void loadDebugFlag()
+void paintFilters()
 refreshState()

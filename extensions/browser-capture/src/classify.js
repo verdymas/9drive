@@ -14,7 +14,9 @@ const VIDEO_EXT = /\.(m3u8|mpd|mp4|webm|m4v|mkv|mov)(?:$|[?#])/i
 const AUDIO_EXT = /\.(mp3|m4a|aac|oga|ogg|opus|wav|flac|aiff?|wma)(?:$|[?#])/i
 const DOC_EXT = /\.(pdf|docx?|xlsx?|pptx?|epub)(?:$|[?#])/i
 const ARCHIVE_EXT = /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|zst|iso|tar\.gz|tar\.bz2|tar\.xz|tar\.zst)(?:$|[?#])/i
-const IMAGE_EXT = /\.(jpe?g|png|gif|webp|avif|heic|bmp|tiff?|svg)(?:$|[?#])/i
+const IMAGE_EXT = /\.(jpe?g|png|gif|webp|avif|heic|bmp|tiff?|svg|ico)(?:$|[?#])/i
+// Downloadable-but-unclassified files (other): opt-in via the "Other Files" filter.
+const OTHER_EXT = /\.(exe|msi|dmg|pkg|apk|ipa|bin|csv|tsv|txt|md|json|xml|ttf|otf|woff2?|eot|psd|ai|indd|xcf)(?:$|[?#])/i
 
 /** MIME → capture type. null = not capturable. */
 export function classifyMime(mime) {
@@ -71,6 +73,7 @@ export function classifyResource(url, mime) {
   if (byMime === 'archive' || extArchive) return { type: 'archive', sub: null }
   if (byMime === 'image' || extImage) return { type: 'image', sub: null }
   if (byMime === 'document' || extDoc) return { type: 'document', sub: null }
+  if (OTHER_EXT.test(u.pathname)) return { type: 'other', sub: null }
   return null
 }
 
@@ -142,6 +145,7 @@ export function displayTypeFor(type, mime) {
   if (type === 'audio') return 'Audio'
   if (type === 'image') return 'Image'
   if (type === 'archive') return 'Archive'
+  if (type === 'other') return 'Other'
   if (type === 'document') {
     const m = (mime || '').toLowerCase()
     return m === 'application/pdf' ? 'PDF Document' : 'Document'

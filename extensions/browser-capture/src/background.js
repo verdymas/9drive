@@ -10,6 +10,7 @@
 import { classifyResource, displayTypeFor, extractQuality, filenameFromUrl } from './classify.js'
 import { resolveFilename, parseContentDispositionFilename, resolveFromMediaIdentity } from './filename-resolver.js'
 import { addCapture, allCaptures, clearAllCaptures, countPending, displayUrlOf, pruneAgainstServer, removeCapture, saveCaptures, updateCapture } from './store.js'
+import { isTypeAllowed } from './filters.js'
 import { getConfig, heartbeat, submitResource, deleteServerResource, setConfig, resolveApiRoot, requestTo } from './api.js'
 import { formatDebugReport } from './media-identity.js'
 
@@ -58,6 +59,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     const cls = classifyResource(info.linkUrl, null)
     if (!cls || cls.sub === 'segment') return // unsupported link — ignore silently
     const cfg = await getConfig()
+    if (!isTypeAllowed(cls.type, cfg.captureFilters)) return
     const result = resolveFilename({ requestUrl: info.linkUrl, finalUrl: info.linkUrl })
     const detectedName = result.filename
     const entry = {
@@ -100,6 +102,7 @@ chrome.webRequest.onHeadersReceived.addListener(
 
     const cfg = await getConfig()
     if (!cfg.baseUrl || !cfg.deviceToken) return // not connected → skip silently
+    if (!isTypeAllowed(cls.type, cfg.captureFilters)) return // capture filter disabled this type
 
     const pageUrl = details.originUrl ?? details.initiator ?? null
     // Safe request context only (spec Phase 04): the referrer page as Referer
@@ -546,6 +549,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: true })
         return
       case 'clearAll': {
+        // Best-effort server cleanup mirrors per-item Remove (offline-safe,
+        // fire-and-forget so the popup round-trip stays instant), then wipe
+        // the local list and reset the badge.
+        const captures = await allCaptures()
+        for (const c of captures) {
+          if (c.remoteId) void deleteServerResource(c.remoteId).catch(() => undefined)
+        }
         await clearAllCaptures()
         await updateBadge()
         sendResponse({ ok: true })

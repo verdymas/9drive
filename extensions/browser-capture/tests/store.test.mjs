@@ -83,4 +83,13 @@ const urls = kept.map((c) => displayUrlOf(c.url))
 assert.ok(urls.includes('https://cdn.com/video.mp4'), 'pending set matched by display URL')
 pass += 1
 
+// ── clearAllCaptures wipes the whole list ───────────────────────────────────
+
+const { clearAllCaptures } = await import('../src/store.js')
+await addCapture({ ...base, url: 'https://cdn.com/clear-me.mp4' })
+assert.equal((await allCaptures()).length, 4, 'captures exist before clear')
+await clearAllCaptures()
+assert.equal((await allCaptures()).length, 0, 'clear all empties the store')
+pass += 2
+
 console.log(`store: ${pass} checks passed`)
