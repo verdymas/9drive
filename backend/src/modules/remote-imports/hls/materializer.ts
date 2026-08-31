@@ -152,6 +152,16 @@ export async function downloadResource(
         (res.body as unknown as { on: (event: 'error', listener: () => void) => void }).on('error', () => undefined)
       }
       const handle = await fsp.open(targetLocalPath, 'w')
+      // Truncation guard: when the server advertises a Content-Length AND is
+      // not compressing the body, the bytes we read MUST match — a short
+      // download is a corrupt segment by definition.
+      const declared = (() => {
+        const cl = res.headers['content-length']
+        const enc = (res.headers['content-encoding'] ?? '').toLowerCase()
+        if (!cl || enc === 'gzip' || enc === 'br' || enc === 'deflate') return null
+        const n = Number(cl)
+        return Number.isFinite(n) && n >= 0 ? BigInt(n) : null
+      })()
       try {
         for await (const chunk of res.body) {
           if (opts.signal?.aborted) throw new Error('ABORTED')
@@ -160,6 +170,9 @@ export async function downloadResource(
             throw new AppError(HLS_ERROR_CODES.HLS_SEGMENT_TOO_LARGE, HLS_ERROR_MESSAGES.HLS_SEGMENT_TOO_LARGE, 413)
           }
           await handle.write(chunk)
+        }
+        if (declared !== null && written !== declared) {
+          throw truncatedDownloadError(opts.kind)
         }
       } finally {
         await handle.close()

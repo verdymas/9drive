@@ -20,6 +20,7 @@
  * no internal path or URL is ever part of a message.
  */
 import path from 'node:path'
+import fsp from 'node:fs/promises'
 import { env } from '../../../config/env.js'
 import { AppError } from '../../../utils/app-error.js'
 import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './errors.js'
@@ -32,8 +33,9 @@ import { verifyOutput, type MediaVerification } from './verify.js'
 import { ensureJobDir, segmentLocalName } from './materializer.js'
 import { writeResumeMarker } from './job-dir.js'
 import { assertChildAccessible, type RemoteImportRequestContext } from '../request-context.js'
-import type { NormalizedSegment } from './segments.js'
+import { buildRewrittenPlaylist, type NormalizedSegment } from './segments.js'
 import { hlsDerivedFileName, fileNameHasExtension } from './output.js'
+import { validateSegmentFile, type SegmentValidation, selectConcatSegments } from './segment-validator.js'
 
 export type HlsSelection = {
   variantId: string | null | undefined
@@ -324,14 +326,23 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
   //      HLS_MP4_STREAM_COPY_UNSUPPORTED suggesting MKV (§16) — never a
   //      silent transcode, never a silent container swap.
   //   3. any auto/MKV copy failure → re-encode (H.264 + AAC).
-  //   4. re-encode failure → concat-raw-TS copy: the HLS demuxer refusal is
-  //      often a playlist/segment quirk while the raw MPEG-TS payload is fine
-  //      — the lenient forced `-f mpegts` demuxer (200M probes) syncs onto it.
+  //   4. re-encode failure → repair-and-retry: if any segment is invalid
+  //      (HTML error page, missing sync, wrong packet size), drop those
+  //      segments and remux the cleaned playlist. The HLS demuxer handles
+  //      per-segment packet sizes, so the [mpegts] changing packet size
+  //      log is harmless here — only a corrupt or wrong-content segment
+  //      can defeat the playlist path.
+  //   5. concat-raw-TS copy: the HLS demuxer refusal is often a
+  //      playlist/segment quirk while the raw MPEG-TS payload is fine — the
+  //      lenient forced `-f mpegts` demuxer (200M probes) syncs onto it. Only
+  //      attempted when every remaining segment is a real MPEG-TS / M2TS
+  //      payload with a uniform packet size and PAT/PMT in segment 1.
   // A conversion always succeeds or we fail; the marker is written on a
   // terminal failure so a convert-only retry can reuse the downloaded segments.
-  const runRemux = async (forContainer: 'mkv' | 'mp4'): Promise<ffmpeg.FfmpegRunResult> => {
+  const runRemux = async (forContainer: 'mkv' | 'mp4', playlistPath: string = video.localPlaylistPath): Promise<ffmpeg.FfmpegRunResult> => {
     try {
-      return await ffmpeg.runFfmpegRemux(video.localPlaylistPath, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
+      await ffmpeg.probeMediaInput(playlistPath, 'playlist').catch(() => undefined)
+      return await ffmpeg.runFfmpegRemux(playlistPath, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
     } catch (error) {
       // Auto-selected MKV that fails to copy-mux → re-encode as a last resort.
       // (Auto never resolves to MP4 anymore — `recommendContainer` returns MKV
@@ -356,6 +367,45 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
     try {
       return await ffmpeg.runFfmpegReencode(video.localPlaylistPath, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
     } catch (error) {
+      return runRepairAndRetry(forContainer, error)
+    }
+  }
+
+  // Repair-and-retry (remux fix §4): if any materialized segment is invalid
+  // or mismatched, write a new local playlist that references only the valid
+  // segments and retry the HLS demuxer remux on it. Only attempted for raw
+  // (unkeyed, no-init-map, no-byterange, no-discontinuity) streams — exactly
+  // the shape the next step (raw-concat) can consume as a last resort.
+  // NOTE: `NormalizedSegment.key` is ALWAYS an object (`normalizeKey` returns
+  // a null-valued shape) — check `key.uri`, not the object itself.
+  const canConcatRawTs = (): boolean =>
+    allVideoSegments.every((s) => !s.map && !s.byterange && !s.key?.uri) && !allVideoSegments.some((s) => s.discontinuity)
+
+  const runRepairAndRetry = async (forContainer: 'mkv' | 'mp4', originalError: unknown): Promise<ffmpeg.FfmpegRunResult> => {
+    if (!canConcatRawTs()) return runConcatTsCopy(forContainer, originalError)
+    const localPaths = allVideoSegments.map((s) => path.join(jobDir, segmentLocalName('video', s.index)))
+    const validations: SegmentValidation[] = []
+    for (let i = 0; i < localPaths.length; i += 1) {
+      validations.push(await validateSegmentFile(localPaths[i], { index: i + 1 }))
+    }
+    const selectionResult = selectConcatSegments(validations)
+    // Nothing to repair: jump to the raw-concat path.
+    if (selectionResult.payload.length === 0 || (selectionResult.payload.length === validations.length && selectionResult.uniform)) {
+      return runConcatTsCopy(forContainer, originalError)
+    }
+    const keepIndexes = new Set(selectionResult.payload.map((v) => v.index))
+    const repairedSegments = allVideoSegments.filter((s) => keepIndexes.has(s.index))
+    if (repairedSegments.length === 0) return runConcatTsCopy(forContainer, originalError)
+    const repairedPlaylist = path.join(jobDir, 'video.repaired.m3u8')
+    const localFor = (s: NormalizedSegment) => path.join(jobDir, segmentLocalName('video', s.index))
+    const keyLocalFor = () => path.join(jobDir, 'video-key-000001.bin')
+    const mapLocalFor = () => path.join(jobDir, 'video-init-000001.mp4')
+    const body = buildRewrittenPlaylist(repairedSegments, localFor, keyLocalFor, mapLocalFor)
+    await fsp.writeFile(repairedPlaylist, body, 'utf8')
+    console.log(`[hls-remux] repair-playlist segments=${repairedSegments.length}/${allVideoSegments.length} dropped=${selectionResult.dropped.length} packetSizes=${selectionResult.packetSizes.join(',')}`)
+    try {
+      return await ffmpeg.runFfmpegRemux(repairedPlaylist, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
+    } catch (error) {
       return runConcatTsCopy(forContainer, error)
     }
   }
@@ -365,11 +415,6 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
   // is a standalone MPEG-TS file — no init maps, byteranges, key URIs or
   // discontinuities (a discontinuity invalidates the raw concat; those streams
   // go through the HLS demuxer which honors the discontinuity markers).
-  // NOTE: `NormalizedSegment.key` is ALWAYS an object (`normalizeKey` returns
-  // a null-valued shape) — check `key.uri`, not the object itself.
-  const canConcatRawTs = (): boolean =>
-    allVideoSegments.every((s) => !s.map && !s.byterange && !s.key?.uri) && !allVideoSegments.some((s) => s.discontinuity)
-
   const runConcatTsCopy = async (forContainer: 'mkv' | 'mp4', originalError: unknown): Promise<ffmpeg.FfmpegRunResult> => {
     if (!canConcatRawTs()) return writeMarkerAndRethrow(originalError)
     const segmentPaths = allVideoSegments.map((s) => path.join(jobDir, segmentLocalName('video', s.index)))

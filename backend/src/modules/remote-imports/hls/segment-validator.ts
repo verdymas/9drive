@@ -196,7 +196,7 @@ export function classifySegment(buf: Buffer, opts: { encrypted?: boolean } = {})
  * is sufficient for layout/PAT-PMT detection — full-body reads happen only in
  * the concat payload assembly.
  */
-export async function validateSegmentFile(filePath: string, opts: { index: number; encrypted?: boolean } = {}): Promise<SegmentValidation> {
+export async function validateSegmentFile(filePath: string, opts: { index?: number; encrypted?: boolean } = {}): Promise<SegmentValidation> {
   let handle: fsp.FileHandle | null = null
   try {
     handle = await fsp.open(filePath, 'r')
@@ -204,7 +204,7 @@ export async function validateSegmentFile(filePath: string, opts: { index: numbe
     const { bytesRead } = await handle.read(head, 0, head.length, 0)
     const stats = await handle.stat()
     return {
-      index: opts.index,
+      index: opts.index ?? 0,
       sizeBytes: stats.size,
       classification: classifySegment(head.subarray(0, bytesRead), { encrypted: opts.encrypted }),
     }

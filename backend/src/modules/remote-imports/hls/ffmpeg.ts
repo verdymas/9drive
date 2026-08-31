@@ -20,6 +20,7 @@ import path from 'node:path'
 import { env } from '../../../config/env.js'
 import { AppError } from '../../../utils/app-error.js'
 import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './errors.js'
+import { selectConcatSegments, validateSegmentFile, type SegmentValidation, type TsLayout } from './segment-validator.js'
 
 export type FfmpegProgress = { percent: number | null; speed: string | null }
 
@@ -318,14 +319,26 @@ export async function runFfmpegRemux(
  * When the HLS *demuxer* refuses the playlist/segments (a non-TS first segment,
  * a quirk in one segment), the raw payload itself may still be fine — the
  * lenient `mpegts` demuxer skips garbage and syncs onto the stream where the
- * HLS demuxer hard-fails. We concat the local TS segments ourselves (shell `cat`
- * is safe on a fixed concatenation, unlike glob expansion — none of the
- * segment filenames are untrusted input), then force `-f mpegts` on the
- * payload with doubled probe buffers exactly like the script. If this copy
- * also fails, the caller reports HLS_CONCAT_TS_COPY_FAILED (the terminal
- * conversion error) — the pipeline's final re-encode attempt is not
- * re-attempted, since the HLS demuxer failure that started this chain is
- * independent of the codec.
+ * HLS demuxer hard-fails. We concat the local TS segments ourselves (a known
+ * local file → known local file copy is safe — none of the segment paths are
+ * untrusted input), then force `-f mpegts` on the payload with doubled probe
+ * buffers exactly like the script. If this copy also fails, the caller reports
+ * HLS_CONCAT_TS_COPY_FAILED (the terminal conversion error) — the pipeline's
+ * final re-encode attempt is not re-attempted, since the HLS demuxer failure
+ * that started this chain is independent of the codec.
+ *
+ * Concatenation is now STREAMD (1 MiB copy) instead of `fsp.readFile` per
+ * segment — a 2-hour HLS import's first segment can be 256 MiB, and the old
+ * path double-buffered the whole stream. A validation gate enforces:
+ *   - every segment classified as a real MPEG-TS / M2TS payload (no HTML/JSON
+ *     error pages, no fMP4, no ciphertext),
+ *   - a single, uniform packet size (188 / 192 / 204 / 208) across the whole
+ *     payload — mixing them is the classic `[mpegts] changing packet size …
+ *     could not find codec parameters` failure,
+ *   - the first payload segment carries a PAT/PMT (codec parameters live there).
+ *
+ * Dropped segments are reported in the error meta as safe counts + index
+ * ranges — never paths, never URLs.
  *
  * Only usable when every segment was materialized as a standalone MPEG-TS file
  * with no init-map/byterange dependencies (discontinuities also make the
@@ -348,19 +361,54 @@ export async function runFfmpegConcatTsCopy(
 ): Promise<FfmpegRunResult> {
   verifyFfmpegAvailable()
 
-  // Concatenate the segments into a single raw MPEG-TS payload. Fixed
-  // concatenation of known local paths — no shell, no globs, no untrusted
-  // input in any argument position.
-  const payloadPath = path.join(cwd, 'concat-payload.ts')
-  const handle = await fsp.open(payloadPath, 'w')
-  try {
-    for (const segmentPath of segmentPaths) {
-      const segment = await fsp.readFile(segmentPath)
-      await handle.write(segment)
-    }
-  } finally {
-    await handle.close()
+  // ── Validation gate (remux fix §3). ───────────────────────────────────────
+  // `selectConcatSegments` is pure: same `segmentPaths` → same selection.
+  // A failure here means the source actually mixed packet sizes, sent an
+  // error page for one segment, or the first segment was header-less — the
+  // exact class of problems the old `cat *.ts` pipeline silently propagated
+  // to FFmpeg as a "could not find codec parameters" failure.
+  const validations: SegmentValidation[] = []
+  for (let i = 0; i < segmentPaths.length; i += 1) {
+    validations.push(await validateSegmentFile(segmentPaths[i], { index: i + 1 }))
   }
+  const selection = selectConcatSegments(validations)
+  if (selection.payload.length === 0) {
+    const meta = describeConcatFailure(validations, selection)
+    throw Object.assign(new AppError(HLS_ERROR_CODES.HLS_CONCAT_TS_COPY_FAILED, HLS_ERROR_MESSAGES.HLS_CONCAT_TS_COPY_FAILED, 500), { meta })
+  }
+  const droppedSummary = selection.dropped.length > 0 ? ` dropped=${selection.dropped.length} packetSizes=${selection.packetSizes.join(',')}` : ''
+  console.log(`[hls-remux] concat-gate segments=${validations.length} payload=${selection.payload.length} uniform=${selection.uniform}${droppedSummary}`)
+
+  // ── Stream the payload: 1 MiB read → 1 MiB write per pass. ───────────────
+  const payloadPath = path.join(cwd, 'concat-payload.ts')
+  const payloadHandle = await fsp.open(payloadPath, 'w')
+  try {
+    for (const v of selection.payload) {
+      const localName = path.basename(segmentPaths[v.index - 1])
+      console.log(`[hls-remux] concat-stream segment=${localName} size=${v.sizeBytes}`)
+      const src = await fsp.open(segmentPaths[v.index - 1], 'r')
+      try {
+        const buf = Buffer.alloc(1024 * 1024)
+        let pos = 0
+        while (true) {
+          const { bytesRead } = await src.read(buf, 0, buf.length, pos)
+          if (bytesRead === 0) break
+          await payloadHandle.write(buf.subarray(0, bytesRead))
+          pos += bytesRead
+        }
+      } finally {
+        await src.close().catch(() => undefined)
+      }
+    }
+  } catch (error) {
+    await payloadHandle.close().catch(() => undefined)
+    await fsp.rm(payloadPath, { force: true }).catch(() => undefined)
+    throw error
+  }
+  await payloadHandle.close()
+
+  // ── Input probe (diagnostic only, never throws). ─────────────────────────
+  await probeMediaInput(payloadPath, 'rawts').catch(() => undefined)
 
   const args = [
     '-nostdin',
@@ -385,12 +433,78 @@ export async function runFfmpegConcatTsCopy(
     // NOTE: `runFfmpegProcess` spawns the args VERBATIM — the output path must
     // be appended here (the remux caller does `[...baseArgs, outputPartPath]`).
     return await runFfmpegProcess([...args, outputPartPath], outputPartPath, { cwd, signal, onProgress })
+  } catch (error) {
+    // Attach a safe summary to the terminal failure — never paths, never URLs.
+    if (error instanceof AppError && (error as { code?: string }).code === HLS_ERROR_CODES.HLS_REMUX_FAILED) {
+      const meta = describeConcatFailure(validations, selection)
+      if (meta) (error as AppError & { meta?: string }).meta = `${(error as AppError & { meta?: string }).meta ?? ''}${meta}`.trim()
+    }
+    throw error
   } finally {
     // The payload is scratch — never leave it in the job dir (the output
     // `.part` file stays for the caller to rename on success).
     await fsp.rm(payloadPath, { force: true }).catch(() => undefined)
   }
 }
+
+/** Safe failure summary for the concat gate — counts + index ranges only. */
+function describeConcatFailure(validations: SegmentValidation[], selection: ReturnType<typeof selectConcatSegments>): string {
+  const kinds = new Map<string, number>()
+  for (const v of validations) {
+    const c = v.classification
+    const key = c.kind === 'mpegts' || c.kind === 'm2ts' ? `${c.kind}/${c.layout.packetSize}` : c.kind
+    kinds.set(key, (kinds.get(key) ?? 0) + 1)
+  }
+  const dropped = selection.dropped.length > 0 ? ` droppedIndexes=${selection.dropped.slice(0, 16).join(',')}${selection.dropped.length > 16 ? '…' : ''}` : ''
+  return `[concat-gate] kinds=${[...kinds.entries()].map(([k, n]) => `${k}:${n}`).join(',')} packetSizes=${selection.packetSizes.join(',')} uniform=${selection.uniform} payload=${selection.payload.length}/${validations.length}${dropped}`
+}
+
+/** Public safe summary used by callers (and tests) — never logs paths. */
+export function describeConcatPayloadForLogs(payload: { validations: SegmentValidation[]; selection: ReturnType<typeof selectConcatSegments> }): string {
+  return describeConcatFailure(payload.validations, payload.selection)
+}
+
+/**
+ * Run ffprobe on the input the remux is about to consume. Diagnostic only:
+ * never throws, never returns sensitive fields. The summary is logged AND
+ * attached as a safe one-liner for the failure path of the surrounding
+ * remux (helps the operator tell "no PAT/PMT" from "mismatched packet size"
+ * without re-running anything).
+ */
+export async function probeMediaInput(
+  inputPath: string,
+  mode: 'playlist' | 'rawts',
+): Promise<{ format: string | null; video: string | null; audio: string | null; durationSeconds: number | null; ok: boolean; reason?: string }> {
+  if (!execFileExists(env.REMOTE_IMPORT_FFPROBE_PATH)) {
+    return { format: null, video: null, audio: null, durationSeconds: null, ok: false, reason: 'ffprobe-missing' }
+  }
+  const args =
+    mode === 'rawts'
+      ? ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', '-f', 'mpegts', inputPath]
+      : ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', '-allowed_extensions', 'm3u8,ts,mp4,bin', inputPath]
+  const timeoutMs = 15_000
+  try {
+    const { stdout } = await runBinary(env.REMOTE_IMPORT_FFPROBE_PATH, args, timeoutMs, () => undefined)
+    const parsed = JSON.parse(stdout) as { format?: { format_name?: string; duration?: string }; streams?: Array<{ codec_type?: string; codec_name?: string }> }
+    const format = parsed.format?.format_name ?? null
+    const duration = (() => {
+      const d = Number(parsed.format?.duration)
+      return Number.isFinite(d) && d > 0 ? d : null
+    })()
+    const video = parsed.streams?.find((s) => s.codec_type === 'video')?.codec_name ?? null
+    const audio = parsed.streams?.find((s) => s.codec_type === 'audio')?.codec_name ?? null
+    const ok = Boolean(format)
+    console.log(`[hls-remux] input-probe mode=${mode} input=${path.basename(inputPath)} format=${format ?? 'unknown'} video=${video ?? 'none'} audio=${audio ?? 'none'} duration=${duration ?? 'unknown'} valid=${ok}`)
+    return { format, video, audio, durationSeconds: duration, ok }
+  } catch (error) {
+    const reason = error instanceof AppError ? error.code : 'probe-failed'
+    console.warn(`[hls-remux] input-probe mode=${mode} input=${path.basename(inputPath)} reason=${reason}`)
+    return { format: null, video: null, audio: null, durationSeconds: null, ok: false, reason }
+  }
+}
+
+/** Re-export the layout type for callers that build remediation paths. */
+export type { TsLayout }
 
 /**
  * Run FFmpeg against the local rewritten playlist with a REAL encode

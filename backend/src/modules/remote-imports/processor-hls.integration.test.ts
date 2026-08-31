@@ -846,4 +846,47 @@ describe('HLS remote import end-to-end (fixture)', () => {
     // stored context and re-downloaded the same segments — without repasting.
     expect(plainSegmentRequests).toBe(afterFirstRun + plainSegBytes.length)
   })
+
+  it('rejects an HTML error-page segment at the download-time gate (never reaches FFmpeg)', async () => {
+    if (!fixtureDir) return // skipped (no ffmpeg)
+    validationSpy.validateRemoteUrl.mockReset()
+    validationSpy.resolveAndValidateHost.mockReset()
+    validationSpy.validateRemoteUrl.mockImplementation(async (raw: string) => new URL(raw))
+    validationSpy.resolveAndValidateHost.mockImplementation(async (host: string) => host)
+
+    const importId = 'import-hls-corrupt'
+    const job = { data: { importId, attempt: 1 }, id: 'job-1' } as unknown as Job<RemoteImportJobData>
+    const { encryptText } = await import('../../utils/crypto.js')
+    const row = mockRow(importId)
+    row.sourceType = 'hls_media'
+    row.sourceUrlEncrypted = encryptText(`${baseUrl}/plain.m3u8`)
+    prisma.remoteImport.findUnique = vi.fn(async () => row)
+    const updateMock = prisma.remoteImport.update as ReturnType<typeof vi.fn>
+    updateMock.mockClear()
+    await fsp.rm(hlsJobDir(row.userId, importId), { recursive: true, force: true })
+
+    // Wrap the request listener so EVERY /pseg<digit>.ts request is answered
+    // with a 200 HTML body. The download-time segment gate must catch this
+    // and fail the import with HLS_SEGMENT_INVALID before any remux path runs.
+    // (A 4xx/5xx is rejected at the HTTP layer; a 200 HTML page is the
+    // realistic case — a CDN returning a login/error page with a 200 status.)
+    const realServer = server
+    const originalListener = realServer.listeners('request')[0] as (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void
+    realServer.removeAllListeners('request')
+    realServer.on('request', (req, res) => {
+      const p = new URL(req.url ?? '/', 'http://x').pathname
+      if (/^\/pseg\d+\.ts$/.test(p)) {
+        res.writeHead(200, { 'Content-Type': 'text/html', 'Content-Length': '46' })
+        res.end('<!doctype html><html><body>error</body></html>')
+        return
+      }
+      originalListener(req, res)
+    })
+
+    await processRemoteImportJob(job)
+
+    const failed = updateMock.mock.calls.find((call) => call[0]?.data?.status === 'failed')
+    expect(failed).toBeDefined()
+    expect(failed?.[0]?.data?.errorCode).toBe('HLS_SEGMENT_INVALID')
+  })
 })

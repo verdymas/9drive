@@ -93,6 +93,15 @@ export class SecureRemoteFetcher {
     const handle = await fsp.open(targetPath, 'w')
     let written = 0n
     const maxBytes = opts.maxBytes ?? BigInt(5 * 1024 * 1024 * 1024)
+    // Truncation guard: only when the body is NOT compressed (the transport may
+    // already have decoded; some relays do, some don't — match the source).
+    const declared = (() => {
+      const cl = res.headers?.['content-length']
+      const enc = ((res.headers?.['content-encoding'] ?? '') as string).toLowerCase()
+      if (!cl || enc === 'gzip' || enc === 'br' || enc === 'deflate') return null
+      const n = Number(cl)
+      return Number.isFinite(n) && n >= 0 ? BigInt(n) : null
+    })()
     try {
       const iterable = typeof res.body === 'string' ? (async function* () { yield Buffer.from(res.body as string) })() : (res.body as AsyncIterable<Uint8Array>)
       for await (const chunk of iterable) {
@@ -103,6 +112,9 @@ export class SecureRemoteFetcher {
           throw new AppError('HLS_SEGMENT_TOO_LARGE', 'The remote file exceeds the maximum allowed size.', 413)
         }
         await handle.write(buf)
+      }
+      if (declared !== null && written !== declared) {
+        throw new AppError('HLS_SEGMENT_DOWNLOAD_FAILED', 'The remote file was truncated.', 502)
       }
     } finally {
       await handle.close()
