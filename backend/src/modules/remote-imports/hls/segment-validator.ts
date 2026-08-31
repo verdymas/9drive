@@ -33,9 +33,13 @@ const MIN_SYNC_RATIO = 0.7
 
 export type TsLayout = {
   packetSize: 188 | 192 | 204 | 208
-  /** Byte offset of the 0x47 sync byte within each packet (4 for M2TS). */
+  /** Offset of the 0x47 sync byte within each packet (0 for raw TS, 4 for M2TS). */
   syncOffset: number
-  /** Fraction of packets whose first byte is the sync byte (0..1). */
+  /** Absolute byte offset of the first complete packet boundary.
+   *  Packet k starts at `baseOffset + k * packetSize`.
+   *  The sync byte for packet k is at `baseOffset + syncOffset + k * packetSize`. */
+  baseOffset: number
+  /** Fraction of packets whose sync byte matched 0x47 (0..1). */
   syncScore: number
 }
 
@@ -43,6 +47,8 @@ export type SegmentClassification =
   | { kind: 'mpegts'; layout: TsLayout; hasPatPmt: boolean }
   | { kind: 'm2ts'; layout: TsLayout; hasPatPmt: boolean }
   | { kind: 'fmp4'; brand: string }
+  /** fMP4 media fragment (starts with `moof`) — not standalone TS, not init. */
+  | { kind: 'moof' }
   /** Keyed (AES-128) segment — raw bytes are ciphertext, nothing to check. */
   | { kind: 'ciphertext' }
   | { kind: 'invalid'; reason: 'empty' | 'html' | 'json' | 'xml' | 'no-sync' | 'too-short' }
@@ -67,31 +73,56 @@ const LAYOUT_CANDIDATES: Array<{ packetSize: TsLayout['packetSize']; syncOffset:
 ]
 
 /**
- * Detect the dominant MPEG-TS packet layout by counting 0x47 sync bytes at
- * each candidate stride over the first 64 KiB. Ties keep the earlier (more
- * standard) candidate. Returns null when no layout clears the threshold.
+ * Detect the dominant MPEG-TS packet layout by scanning every candidate stride
+ * and base offset for the best 0x47 sync hit rate over the first 64 KiB. This
+ * mirrors FFmpeg's mpegts demuxer approach: scan for sync, check consecutive
+ * syncs at the stride, lock onto the alignment with the highest score.
+ *
+ * The key difference from the original code: it scans ALL candidate base
+ * offsets (not just assuming sync starts at byte 0), applies syncOffset when
+ * checking sync bytes (so M2TS at offset 4 is checked at buf[base+4+k*stride],
+ * not buf[base+k*stride]), and requires 2 consecutive sync bytes to lock
+ * before scoring (preventing false positives on stray 0x47 bytes).
  */
 export function detectTsLayout(buf: Buffer): TsLayout | null {
   const scanLength = Math.min(buf.length, HEAD_SCAN_BYTES)
+  if (scanLength < 64) return null
+
   let best: TsLayout | null = null
   let bestHits = 0
 
   for (const { packetSize, syncOffset } of LAYOUT_CANDIDATES) {
-    if (scanLength - syncOffset < packetSize) continue
-    const fullPackets = Math.floor((scanLength - syncOffset) / packetSize)
-    if (fullPackets < 2) continue
-    let hits = 0
-    for (let k = 0; k < fullPackets; k += 1) {
-      if (buf[syncOffset + k * packetSize] === SYNC_BYTE) hits += 1
-    }
-    if (hits < MIN_SYNC_HITS) continue
-    const score = hits / fullPackets
-    if (score < MIN_SYNC_RATIO) continue
-    // Strictly-greater hits: the candidate order breaks ties, so the most
-    // standard layout wins when two strides both fit the stream.
-    if (hits > bestHits) {
-      best = { packetSize, syncOffset, syncScore: score }
-      bestHits = hits
+    // For each candidate (packetSize, syncOffset), scan every possible base
+    // offset within the first 4096 bytes. The base is the absolute position
+    // of the first complete packet boundary — the sync byte sits at
+    // base + syncOffset.
+    const maxBase = Math.min(scanLength - packetSize, 4096)
+    for (let base = 0; base <= maxBase; base += 1) {
+      // The sync byte for this candidate is at `base + syncOffset`.
+      const syncPos = base + syncOffset
+      if (buf[syncPos] !== SYNC_BYTE) continue
+
+      // Require 2 consecutive syncs at the stride to lock onto this alignment.
+      const sync2 = syncPos + packetSize
+      if (sync2 >= scanLength || buf[sync2] !== SYNC_BYTE) continue
+
+      // Full scan: count hits from the aligned base.
+      const fullPackets = Math.floor((scanLength - base) / packetSize)
+      if (fullPackets < 2) continue
+      let hits = 0
+      for (let k = 0; k < fullPackets; k += 1) {
+        if (buf[base + syncOffset + k * packetSize] === SYNC_BYTE) hits += 1
+      }
+      if (hits < MIN_SYNC_HITS) continue
+      const score = hits / fullPackets
+      if (score < MIN_SYNC_RATIO) continue
+      // Strictly greater hits: the candidate order breaks ties, keeping the
+      // more standard layout (earlier in LAYOUT_CANDIDATES) when two
+      // alignments both fit.
+      if (hits > bestHits) {
+        best = { packetSize, syncOffset, baseOffset: base, syncScore: score }
+        bestHits = hits
+      }
     }
   }
   return best
@@ -104,27 +135,29 @@ export function detectTsLayout(buf: Buffer): TsLayout | null {
  * "could not find codec parameters".
  */
 export function hasPatPmt(buf: Buffer, layout: TsLayout): boolean {
-  const { packetSize, syncOffset } = layout
-  if (buf.length - syncOffset < packetSize) return false
-  const packetCount = Math.min(MAX_PACKETS_SCANNED, Math.floor((buf.length - syncOffset) / packetSize))
+  const { packetSize, syncOffset, baseOffset = 0 } = layout
+  if (buf.length - baseOffset < packetSize) return false
+  const packetCount = Math.min(MAX_PACKETS_SCANNED, Math.floor((buf.length - baseOffset) / packetSize))
 
   const pmtPids = new Set<number>()
   for (let k = 0; k < packetCount; k += 1) {
-    const p = syncOffset + k * packetSize
-    if (buf[p] !== SYNC_BYTE) continue
-    const pusi = (buf[p + 1] >> 6) & 1
+    const p = baseOffset + k * packetSize
+    // Sync byte at p + syncOffset; header bytes start at p + syncOffset + 1.
+    if (buf[p + syncOffset] !== SYNC_BYTE) continue
+    const h = p + syncOffset // header base
+    const pusi = (buf[h + 1] >> 6) & 1
     if (!pusi) continue
-    const pid = ((buf[p + 1] & 0x1f) << 8) | buf[p + 2]
+    const pid = ((buf[h + 1] & 0x1f) << 8) | buf[h + 2]
     if (pid !== 0x0000) continue
-    const payload = sectionPayloadStart(buf, p, packetSize)
+    const payload = sectionPayloadStart(buf, h, packetSize)
     if (payload < 0) continue
     const section = payload + 1 + buf[payload] // pointer_field
-    if (section + 7 >= p + packetSize) continue
+    if (section + 7 >= h + packetSize) continue
     if (buf[section] !== 0x00) continue // table_id PAT
     const sectionLength = ((buf[section + 1] & 0x0f) << 8) | buf[section + 2]
     // Entries start after the 8-byte section header; the section ends at
     // 3 + section_length, the last 4 bytes being the CRC.
-    const entriesEnd = Math.min(section + 3 + sectionLength - 4, p + packetSize - 2)
+    const entriesEnd = Math.min(section + 3 + sectionLength - 4, h + packetSize - 2)
     for (let e = section + 8; e + 3 < entriesEnd; e += 4) {
       const programNumber = (buf[e] << 8) | buf[e + 1]
       const pmtPid = ((buf[e + 2] & 0x1f) << 8) | buf[e + 3]
@@ -135,15 +168,16 @@ export function hasPatPmt(buf: Buffer, layout: TsLayout): boolean {
 
   // Confirm at least one PMT packet (matching PID, table_id 0x02).
   for (let k = 0; k < packetCount; k += 1) {
-    const p = syncOffset + k * packetSize
-    if (buf[p] !== SYNC_BYTE) continue
-    const pid = ((buf[p + 1] & 0x1f) << 8) | buf[p + 2]
+    const p = baseOffset + k * packetSize
+    const h = p + syncOffset
+    if (buf[h] !== SYNC_BYTE) continue
+    const pid = ((buf[h + 1] & 0x1f) << 8) | buf[h + 2]
     if (!pmtPids.has(pid)) continue
-    if (((buf[p + 1] >> 6) & 1) === 0) continue
-    const payload = sectionPayloadStart(buf, p, packetSize)
+    if (((buf[h + 1] >> 6) & 1) === 0) continue
+    const payload = sectionPayloadStart(buf, h, packetSize)
     if (payload < 0) continue
     const section = payload + 1 + buf[payload]
-    if (section < p + packetSize && buf[section] === 0x02) return true
+    if (section < h + packetSize && buf[section] === 0x02) return true
   }
   return false
 }
@@ -183,6 +217,16 @@ export function classifySegment(buf: Buffer, opts: { encrypted?: boolean } = {})
   if (buf.length >= 8 && buf.subarray(4, 8).toString('latin1') === 'ftyp') {
     const brand = buf.subarray(8, 12).toString('latin1').replace(/\0.*$/, '')
     return { kind: 'fmp4', brand }
+  }
+
+  // fMP4 media fragments start with `moof` (movie fragment) — a real HLS
+  // segment in fMP4 format. Without this, a common fMP4 stream would be
+  // misclassified as `no-sync` and silently dropped from the concat payload
+  // (concatenating raw fMP4 fragments is wrong anyway, but the HLS demuxer
+  // handles them natively, so the concat path should never be reached for
+  // fMP4 in the first place — the detection here is diagnostic only).
+  if (buf.length >= 12 && buf.subarray(4, 8).toString('latin1') === 'moof') {
+    return { kind: 'moof' }
   }
 
   const layout = detectTsLayout(buf)

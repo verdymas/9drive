@@ -91,7 +91,7 @@ async function runBinary(bin: string, args: string[], timeoutMs: number, onProgr
       clearTimeout(timer)
       if (code === 0) resolve({ stdout, stderr })
       else {
-        const err = new AppError(HLS_ERROR_CODES.FFMPEG_NOT_AVAILABLE, `FFmpeg exited with code ${code}.`, 500)
+        const err = new AppError(HLS_ERROR_CODES.HLS_FFMPEG_FAILED, `FFmpeg exited with code ${code}.`, 500)
         ;(err as AppError & { meta?: string }).meta = stderr.slice(-2000)
         reject(err)
       }

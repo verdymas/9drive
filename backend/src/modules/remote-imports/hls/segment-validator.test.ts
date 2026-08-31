@@ -119,6 +119,29 @@ describe('detectTsLayout', () => {
     expect(layout!.packetSize).toBe(204)
   })
 
+  it('detects TS even with a garbage prefix before the first sync byte', () => {
+    // Real-world segments often begin with a few bytes of garbage, a partial
+    // packet, or a timestamp prefix before the first 0x47 sync byte. The
+    // detector must anchor on the FIRST sync byte, not buf[0].
+    const ts = makeTs(Array.from({ length: 16 }, () => Buffer.alloc(100, 0xff)))
+    const garbage = Buffer.from([0x00, 0x01, 0x02, 0x47, 0x00]) // contains a stray 0x47 too
+    const buf = Buffer.concat([garbage, ts])
+    const layout = detectTsLayout(buf)
+    expect(layout).not.toBeNull()
+    expect(layout!.packetSize).toBe(188)
+    expect(layout!.syncOffset).toBe(0)
+  })
+
+  it('detects M2TS with a garbage prefix', () => {
+    const ts = makeTs(Array.from({ length: 16 }, () => Buffer.alloc(100, 0xff)), { packetSize: 192, syncOffset: 4 })
+    const garbage = Buffer.from([0x00, 0x01, 0x02])
+    const buf = Buffer.concat([garbage, ts])
+    const layout = detectTsLayout(buf)
+    expect(layout).not.toBeNull()
+    expect(layout!.packetSize).toBe(192)
+    expect(layout!.syncOffset).toBe(4)
+  })
+
   it('returns null for random bytes (no sync pattern)', () => {
     const buf = Buffer.alloc(64 * 1024)
     for (let i = 0; i < buf.length; i += 1) buf[i] = (i * 17) & 0xff
