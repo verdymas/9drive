@@ -341,7 +341,8 @@ export async function runHlsPipeline(opts: HlsPipelineOptions): Promise<HlsPipel
   // terminal failure so a convert-only retry can reuse the downloaded segments.
   const runRemux = async (forContainer: 'mkv' | 'mp4', playlistPath: string = video.localPlaylistPath): Promise<ffmpeg.FfmpegRunResult> => {
     try {
-      await ffmpeg.probeMediaInput(playlistPath, 'playlist').catch(() => undefined)
+      // `runFfmpegRemux` self-probes (stream-level diagnostics + selection
+      // summary) — no separate probe here to avoid double-probing the playlist.
       return await ffmpeg.runFfmpegRemux(playlistPath, outputPartPath(forContainer), forContainer, jobDir, signal, onFfmpegProgress, mediaSeconds)
     } catch (error) {
       // Auto-selected MKV that fails to copy-mux → re-encode as a last resort.

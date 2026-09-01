@@ -210,6 +210,14 @@ function runFfmpegProcess(args: string[], outputPartPath: string, opts: { cwd: s
 const DEMUXER_ARGS = ['-analyzeduration', '100M', '-probesize', '100M']
 
 /**
+ * Stream-copy mapping for the output muxer: only video, audio and subtitles.
+ * Matroska rejects data/unknown/private MPEG-TS streams ("Only audio, video,
+ * and subtitles are supported for Matroska.") — the `?` keeps each map
+ * optional so audio-only / video-only sources still remux.
+ */
+export const SUPPORTED_STREAM_MAP_ARGS = ['-map', '0:v?', '-map', '0:a?', '-map', '0:s?']
+
+/**
  * Raw-payload demux flags — the code_example_convert.sh "repair" step doubles
  * the probe buffers so the forced `mpegts` demuxer can sync onto a large or
  * garbage-prefixed MPEG-TS payload where default-sized probing would fail.
@@ -267,6 +275,9 @@ export async function runFfmpegRemux(
   totalDurationSeconds?: number,
 ): Promise<FfmpegRunResult> {
   verifyFfmpegAvailable()
+  // Diagnostic only — never throws, never fails a remux because an
+  // unsupported (data/private) stream exists.
+  const probe = await probeMediaStreams(inputPlaylistPath, 'playlist').catch(() => null)
   const baseArgs = [
     '-nostdin',
     '-hide_banner',
@@ -280,7 +291,7 @@ export async function runFfmpegRemux(
     // key (or `.mp4` init map) is refused ("Unable to open key file").
     '-allowed_extensions', 'm3u8,ts,mp4,bin',
     '-i', inputPlaylistPath,
-    '-map', '0',
+    ...SUPPORTED_STREAM_MAP_ARGS,
     '-c', 'copy',
     ...(container === 'mp4' ? ['-movflags', '+faststart'] : []),
     // The output path is `output.<ext>.part` — FFmpeg cannot infer the muxer
@@ -292,6 +303,12 @@ export async function runFfmpegRemux(
   try {
     return await runFfmpegProcess([...baseArgs, outputPartPath], outputPartPath, { cwd, signal, onProgress, totalDurationSeconds })
   } catch (error) {
+    // Attach a safe stream-selection summary before any retry so both the
+    // first failure and the retry failure carry it.
+    if (error instanceof AppError && error.code === HLS_ERROR_CODES.HLS_REMUX_FAILED) {
+      const summary = summarizeStreamSelection(probe)
+      if (summary) (error as AppError & { meta?: string }).meta = `${(error as AppError & { meta?: string }).meta ?? ''}${summary}`.trim()
+    }
     // Timestamp/DTS problem → ONE retry with the named compatibility profile.
     if (error instanceof AppError && error.code === HLS_ERROR_CODES.HLS_REMUX_FAILED && looksLikeTimestampIssue((error as AppError & { meta?: string }).meta ?? '')) {
       try {
@@ -408,7 +425,7 @@ export async function runFfmpegConcatTsCopy(
   await payloadHandle.close()
 
   // ── Input probe (diagnostic only, never throws). ─────────────────────────
-  await probeMediaInput(payloadPath, 'rawts').catch(() => undefined)
+  const rawProbe = await probeMediaStreams(payloadPath, 'rawts').catch(() => null)
 
   const args = [
     '-nostdin',
@@ -422,7 +439,7 @@ export async function runFfmpegConcatTsCopy(
     // demuxer hard-fails.
     '-f', 'mpegts',
     '-i', payloadPath,
-    '-map', '0',
+    ...SUPPORTED_STREAM_MAP_ARGS,
     '-c', 'copy',
     ...(container === 'mp4' ? ['-movflags', '+faststart'] : []),
     '-f', container === 'mp4' ? 'mp4' : 'matroska',
@@ -436,7 +453,7 @@ export async function runFfmpegConcatTsCopy(
   } catch (error) {
     // Attach a safe summary to the terminal failure — never paths, never URLs.
     if (error instanceof AppError && (error as { code?: string }).code === HLS_ERROR_CODES.HLS_REMUX_FAILED) {
-      const meta = describeConcatFailure(validations, selection)
+      const meta = `${summarizeStreamSelection(rawProbe)} ${describeConcatFailure(validations, selection)}`.trim()
       if (meta) (error as AppError & { meta?: string }).meta = `${(error as AppError & { meta?: string }).meta ?? ''}${meta}`.trim()
     }
     throw error
@@ -465,18 +482,64 @@ export function describeConcatPayloadForLogs(payload: { validations: SegmentVali
 }
 
 /**
- * Run ffprobe on the input the remux is about to consume. Diagnostic only:
- * never throws, never returns sensitive fields. The summary is logged AND
- * attached as a safe one-liner for the failure path of the surrounding
- * remux (helps the operator tell "no PAT/PMT" from "mismatched packet size"
- * without re-running anything).
+ * One detected input stream with the remux decision. `reason` is present only
+ * when the stream is skipped.
  */
-export async function probeMediaInput(
-  inputPath: string,
-  mode: 'playlist' | 'rawts',
-): Promise<{ format: string | null; video: string | null; audio: string | null; durationSeconds: number | null; ok: boolean; reason?: string }> {
+export type ProbedMediaStream = {
+  index: number
+  codecType: string | null
+  codecName: string | null
+  selected: boolean
+  reason?: string
+}
+
+/** Result of probing the input the remux is about to consume. */
+export type MediaStreamProbe = {
+  inputBasename: string
+  mode: 'playlist' | 'rawts'
+  format: string | null
+  durationSeconds: number | null
+  videoCodec: string | null
+  audioCodec: string | null
+  streams: ProbedMediaStream[]
+  ok: boolean
+  reason?: string
+}
+
+type FfprobeStream = { index?: number; codec_type?: string; codec_name?: string }
+
+/**
+ * Decide which input streams the remux keeps. Matroska supports only video,
+ * audio and subtitles — data/unknown/private MPEG-TS streams are skipped.
+ * Pure (array in → decision out) so the logic is unit-testable without any
+ * binary. Unsupported streams never fail a remux.
+ */
+export function selectRemuxStreams(streams: FfprobeStream[]): ProbedMediaStream[] {
+  return streams.map((s, position) => {
+    const codecType = s.codec_type ?? null
+    const selected = codecType === 'video' || codecType === 'audio' || codecType === 'subtitle'
+    const item: ProbedMediaStream = {
+      index: s.index ?? position,
+      codecType,
+      codecName: s.codec_name ?? null,
+      selected,
+    }
+    if (!selected) item.reason = 'unsupported_for_matroska'
+    return item
+  })
+}
+
+/**
+ * Run ffprobe on the input the remux is about to consume and log every stream
+ * with its selection decision. Diagnostic only: never throws, never returns
+ * sensitive fields. The summary is logged AND attached as a safe one-liner for
+ * the failure path of the surrounding remux (helps the operator tell "data
+ * stream dropped" from "no PAT/PMT" without re-running anything). Logs the
+ * basename only — never full paths, URLs or secrets.
+ */
+export async function probeMediaStreams(inputPath: string, mode: 'playlist' | 'rawts'): Promise<MediaStreamProbe> {
   if (!execFileExists(env.REMOTE_IMPORT_FFPROBE_PATH)) {
-    return { format: null, video: null, audio: null, durationSeconds: null, ok: false, reason: 'ffprobe-missing' }
+    return { inputBasename: path.basename(inputPath), mode, format: null, durationSeconds: null, videoCodec: null, audioCodec: null, streams: [], ok: false, reason: 'ffprobe-missing' }
   }
   const args =
     mode === 'rawts'
@@ -485,22 +548,48 @@ export async function probeMediaInput(
   const timeoutMs = 15_000
   try {
     const { stdout } = await runBinary(env.REMOTE_IMPORT_FFPROBE_PATH, args, timeoutMs, () => undefined)
-    const parsed = JSON.parse(stdout) as { format?: { format_name?: string; duration?: string }; streams?: Array<{ codec_type?: string; codec_name?: string }> }
+    const parsed = JSON.parse(stdout) as { format?: { format_name?: string; duration?: string }; streams?: FfprobeStream[] }
     const format = parsed.format?.format_name ?? null
     const duration = (() => {
       const d = Number(parsed.format?.duration)
       return Number.isFinite(d) && d > 0 ? d : null
     })()
-    const video = parsed.streams?.find((s) => s.codec_type === 'video')?.codec_name ?? null
-    const audio = parsed.streams?.find((s) => s.codec_type === 'audio')?.codec_name ?? null
-    const ok = Boolean(format)
-    console.log(`[hls-remux] input-probe mode=${mode} input=${path.basename(inputPath)} format=${format ?? 'unknown'} video=${video ?? 'none'} audio=${audio ?? 'none'} duration=${duration ?? 'unknown'} valid=${ok}`)
-    return { format, video, audio, durationSeconds: duration, ok }
+    const selected = selectRemuxStreams(parsed.streams ?? [])
+    const videoCodec = selected.find((s) => s.codecType === 'video')?.codecName ?? null
+    const audioCodec = selected.find((s) => s.codecType === 'audio')?.codecName ?? null
+    const probe: MediaStreamProbe = {
+      inputBasename: path.basename(inputPath),
+      mode,
+      format,
+      durationSeconds: duration,
+      videoCodec,
+      audioCodec,
+      streams: selected,
+      ok: Boolean(format),
+    }
+    console.log(`[hls-remux] streams input=${probe.inputBasename} mode=${mode} format=${format ?? 'unknown'} duration=${duration ?? 'unknown'} video=${videoCodec ?? 'none'} audio=${audioCodec ?? 'none'}`)
+    for (const s of selected) {
+      console.log(
+        `[hls-remux] streams ${s.index}: type=${s.codecType ?? 'unknown'} codec=${s.codecName ?? 'unknown'} selected=${s.selected}${s.reason ? ` reason=${s.reason}` : ''}`,
+      )
+    }
+    return probe
   } catch (error) {
     const reason = error instanceof AppError ? error.code : 'probe-failed'
-    console.warn(`[hls-remux] input-probe mode=${mode} input=${path.basename(inputPath)} reason=${reason}`)
-    return { format: null, video: null, audio: null, durationSeconds: null, ok: false, reason }
+    console.warn(`[hls-remux] streams input=${path.basename(inputPath)} mode=${mode} reason=${reason}`)
+    return { inputBasename: path.basename(inputPath), mode, format: null, durationSeconds: null, videoCodec: null, audioCodec: null, streams: [], ok: false, reason }
   }
+}
+
+/**
+ * Safe one-line stream-selection summary for failure meta — counts only, no
+ * paths, URLs or secrets. Returns '' when the probe failed or was not run.
+ */
+export function summarizeStreamSelection(probe: MediaStreamProbe | null): string {
+  if (!probe || !probe.ok || probe.streams.length === 0) return ''
+  const selectedCount = probe.streams.filter((s) => s.selected).length
+  const skipped = probe.streams.length - selectedCount
+  return `[streams] selected=${selectedCount}/${probe.streams.length} skipped=${skipped}`
 }
 
 /** Re-export the layout type for callers that build remediation paths. */
@@ -539,7 +628,7 @@ export async function runFfmpegReencode(
     ...DEMUXER_ARGS,
     '-allowed_extensions', 'm3u8,ts,mp4,bin',
     '-i', inputPlaylistPath,
-    '-map', '0',
+    ...SUPPORTED_STREAM_MAP_ARGS,
     // H.264 + AAC so the output plays everywhere (VLC, MP) — mirror the
     // known-good script's re-encode flags; yuv420p for max device compatibility.
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p',
