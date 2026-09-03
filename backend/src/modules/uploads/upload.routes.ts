@@ -14,10 +14,12 @@ import { getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service
 import { buildS3ObjectKey, getS3ConfigForAccount, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
 import { getTelegramConfig, uploadTelegramDocument } from '../telegram/telegram.service.js'
 import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
+import { buildInitialCaption } from '../telegram/telegram-caption.service.js'
 import { createAuditLog } from '../../utils/audit.js'
 import { planBatchUploads } from './storage-routing.service.js'
 import { resolveUploadPlacement } from '../storage/upload-placement.service.js'
 import { resolveUploadParent } from '../storage/provider-folder.service.js'
+import { logicalPathForFileId } from '../files/file-logical-path.js'
 
 export const uploadRouter = Router()
 
@@ -89,7 +91,13 @@ async function finalizeNonGoogleUpload(opts: {
       data: { userId, connectedAccountId: account.id, folderId, provider: 'telegram', providerFileId: 'pending', name: fileName, mimeType, sizeBytes, status: 'uploading' },
     })
     try {
-      const remoteId = await uploadTelegramDocument(config, { filePath: tmpPath, name: fileName, mimeType, sizeBytes: Number(sizeBytes) })
+      const stableId = provisionalFile.id
+      // Stamp the stable id BEFORE the upload so the caption carries the
+      // identity the very first time the message is observed.
+      await prisma.file.update({ where: { id: provisionalFile.id }, data: { telegramStableId: stableId } })
+      const logicalPath = await logicalPathForFileId(userId, provisionalFile.id)
+      const caption = buildInitialCaption(stableId, logicalPath)
+      const remoteId = await uploadTelegramDocument(config, { filePath: tmpPath, name: fileName, mimeType, sizeBytes: Number(sizeBytes), caption: caption ?? undefined })
       return await prisma.file.update({ where: { id: provisionalFile.id }, data: { providerFileId: remoteId, status: 'active' } })
     } catch (error) {
       await prisma.file.update({ where: { id: provisionalFile.id }, data: { status: 'deleted', deletedAt: new Date() } }).catch(() => undefined)

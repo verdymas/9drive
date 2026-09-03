@@ -460,10 +460,15 @@ export async function testTelegramConnection(config: ConnectionConfig): Promise<
  * `telegram://<channel>/<message>` remote id. Fails with
  * `TELEGRAM_STORAGE_TARGET_NOT_CONFIGURED` when no channel is configured —
  * never uploads anywhere else.
+ *
+ * `opts.caption` overrides the filename-derived caption. The 9Drive upload
+ * path passes a `9drive:id=…` + `9drive:path=…` caption so the message can be
+ * re-ingested by id. When omitted, the caption falls back to the filename
+ * (legacy behaviour preserved for tests / manual callers).
  */
 export async function uploadTelegramDocument(
   config: TelegramConfig,
-  opts: { filePath: string; name: string; mimeType: string; sizeBytes: number; onProgress?: (pct: number) => void },
+  opts: { filePath: string; name: string; mimeType: string; sizeBytes: number; caption?: string; onProgress?: (pct: number) => void },
 ): Promise<string> {
   return withTelegramClient(config, async (client) => {
     const te = await loadTelegram()
@@ -474,9 +479,10 @@ export async function uploadTelegramDocument(
     if (!isStorageChannelCandidate(channel)) {
       throw new AppError('TELEGRAM_CHANNEL_UNAVAILABLE', 'The configured Telegram storage channel is not a private broadcast channel.', 410)
     }
+    const caption = (opts.caption ?? opts.name).slice(0, 1024)
     const sent = await client.sendFile(channel as never, {
       file: opts.filePath as never,
-      caption: opts.name.slice(0, 1024),
+      caption,
       forceDocument: true,
       attributes: [new te.Api.DocumentAttributeFilename({ fileName: opts.name }) as never],
       ...(opts.onProgress ? { progressCallback: opts.onProgress } : {}),

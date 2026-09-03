@@ -17,6 +17,29 @@ import { GetObjectCommand } from '@aws-sdk/client-s3'
 import { Readable } from 'node:stream'
 import { ZipArchive } from 'archiver'
 import { createAuditLog } from '../../utils/audit.js'
+import { logicalPathForFileId } from './file-logical-path.js'
+
+/**
+ * Best-effort Telegram caption refresh. Invoked after rename/move on a
+ * Telegram-backed file. Resolves the current logical path from the DB,
+ * loads the storage config, and asks the caption service to re-encode
+ * + `editMessage`. Errors are caught by the caller (never block the
+  // route response) and the next ingest reconciles any drift.
+ */
+async function refreshTelegramCaption(userId: string, fileId: string): Promise<void> {
+  const file = await prisma.file.findFirst({
+    where: { id: fileId, userId, provider: 'telegram' },
+    select: { id: true, name: true, connectedAccountId: true, telegramStableId: true },
+  })
+  if (!file || !file.telegramStableId) return
+  const [logicalPath, config] = await Promise.all([
+    logicalPathForFileId(userId, fileId),
+    getTelegramConfig(file.connectedAccountId, userId).catch(() => null),
+  ])
+  if (!config) return
+  const { updateTelegramDocumentCaption } = await import('../telegram/telegram-caption.service.js')
+  await updateTelegramDocumentCaption(userId, { id: file.id, name: file.name, telegramStableId: file.telegramStableId }, config, logicalPath)
+}
 
 
 
@@ -113,6 +136,7 @@ fileRouter.patch('/batch', async (req: AuthRequest, res, next) => {
     let moved = 0
     let providerMoved = 0
     let providerFailed = 0
+    const movedTelegramFileIds: string[] = []
     for (const file of files) {
       try {
         if (destFolderId) {
@@ -139,6 +163,8 @@ fileRouter.patch('/batch', async (req: AuthRequest, res, next) => {
             } else {
               console.info(`[file-move] S3 object for ${file.id} stays at its legacy flat key (no physical move)`)
             }
+          } else if (file.provider === 'telegram') {
+            movedTelegramFileIds.push(file.id)
           }
         }
         await prisma.file.update({ where: { id: file.id }, data: { folderId: destFolderId } })
@@ -150,6 +176,17 @@ fileRouter.patch('/batch', async (req: AuthRequest, res, next) => {
     }
 
     await createAuditLog(req.user!.id, 'MOVE_FILES', 'file', undefined, { count: moved, folderId: destFolderId })
+
+    // Telegram caption refresh — best-effort, fires after the DB move
+    // commits so the logical-path resolver sees the new folder. The DB is
+    // the source of truth; a Telegram edit failure doesn't block the
+    // response (the next ingest reconciles).
+    for (const fileId of movedTelegramFileIds) {
+      void refreshTelegramCaption(req.user!.id, fileId).catch((error) => {
+        console.error('[telegram-caption] failed to refresh caption after PATCH /files/batch', error?.message || error)
+      })
+    }
+
     return res.json({ status: 'ok', moved, providerMoved, providerFailed })
   } catch (error) {
     return next(error)
@@ -362,6 +399,16 @@ fileRouter.patch('/:id', async (req: AuthRequest, res, next) => {
 
     const updated = await prisma.file.update({ where: { id: file.id }, data: { ...(body.name ? { name: body.name } : {}), ...(body.folderId !== undefined ? { folderId: body.folderId } : {}) }, include: { connectedAccount: { select: { id: true, email: true, provider: true } }, folder: { select: { id: true, name: true } } } })
     await createAuditLog(req.user!.id, 'UPDATE_FILE', 'file', updated.id, { name: updated.name, updates: body })
+
+    // Telegram caption refresh — best-effort, never blocks the response.
+    // The 9Drive DB is the source of truth; a stale caption is reconciled
+    // on the next ingest.
+    if (updated.provider === 'telegram' && (body.name || body.folderId !== undefined)) {
+      void refreshTelegramCaption(req.user!.id, updated.id).catch((error) => {
+        console.error('[telegram-caption] failed to refresh caption after PATCH /files/:id', error?.message || error)
+      })
+    }
+
     return res.json({ file: { ...updated, sizeBytes: updated.sizeBytes.toString() } })
   } catch (error) {
     return next(error)

@@ -282,6 +282,13 @@ model File {
   // = never stamped (legacy row) — never treated as missing. Deliberately NOT
   // a foreign key: compared, never joined.
   lastSeenSyncRunId  String?            @map("last_seen_sync_run_id") @db.VarChar(36)
+  // 9Drive stable logical identity (mirrors the `9drive:id=` caption field on
+  // Telegram storage documents). Survives re-uploads, channel moves, and
+  // filename changes — independent of `providerFileId`. Null for legacy rows
+  // and for non-Telegram providers; the Telegram ingest stamps it on the
+  // first caption it sees. The DB is the source of truth for the logical
+  // filesystem; this column is the stable key that 9Drive metadata uses.
+  telegramStableId  String?            @map("telegram_stable_id") @db.VarChar(36)
   createdAt          DateTime           @default(now()) @map("created_at")
   updatedAt          DateTime           @updatedAt @map("updated_at")
   deletedAt          DateTime?          @map("deleted_at")
@@ -299,6 +306,10 @@ model File {
   @@index([folderId])
   @@index([providerFileId])
   @@index([connectedAccountId, status, lastSeenSyncRunId])
+  // 9Drive logical-identity lookup: ingest by `9drive:id=<stableId>` resolves
+  // to one row per user; the composite covers that without leaking the
+  // nullable column into a global unique index.
+  @@index([userId, telegramStableId])
   @@map("files")
 }
 
