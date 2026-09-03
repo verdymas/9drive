@@ -563,8 +563,18 @@ export async function deleteTelegramDocuments(config: CredentialsSource, remoteI
  * Open a Telegram document for byte streaming (batch download / zip export).
  * Returns the async iterable plus a `close()` that MUST be awaited when the
  * consumer is done (it disconnects the short-lived client).
+ *
+ * `iterDownload` natively supports byte offsets (it calls
+ * `Api.upload.getFile` with `precise: true`, so the offset is exact), so a
+ * byte range can be streamed without downloading the whole document. Pass
+ * `offset` to start mid-file and `limit` (bytes) to stop after that many
+ * bytes. When omitted the whole document is streamed (offset 0).
  */
-export async function openTelegramDocument(config: CredentialsSource, remoteId: string) {
+export async function openTelegramDocument(
+  config: CredentialsSource,
+  remoteId: string,
+  opts: { offset?: number; limit?: number } = {},
+) {
   const client = await createTelegramClient(config)
   await client.connect()
   try {
@@ -577,7 +587,11 @@ export async function openTelegramDocument(config: CredentialsSource, remoteId: 
     }
     return {
       remoteId,
-      stream: client.iterDownload(message.media as never, { requestSize: 512 * 1024 }) as AsyncIterable<Buffer>,
+      stream: client.iterDownload(message.media as never, {
+        requestSize: 512 * 1024,
+        offset: opts.offset ?? 0,
+        limit: opts.limit,
+      }) as AsyncIterable<Buffer>,
       close: () => client.disconnect().catch(() => undefined),
     }
   } catch (error) {

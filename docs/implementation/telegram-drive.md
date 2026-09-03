@@ -61,14 +61,14 @@ database stays the source of truth for the virtual file tree — Telegram is
   batch ZIP downloads and folder-level physical deletes have Telegram branches.
 - WebDAV (read-only, see `docs/audits/telegram-webdav-jellyfin-playback-audit.md`)
   serves both Google Drive- and Telegram Drive-backed files through a single
-  endpoint. Because Telegram's `iterDownload` is a forward-only chunked stream
-  and does not accept a Range header, the WebDAV branch in
-  `streamProviderFileToReadable` materializes the requested Telegram file to a
-  per-session temp file under `os.tmpdir()` and then serves byte ranges with
-  `fs.createReadStream({ start, end })`. The temp file is cleaned up when the
-  stream ends, is closed by the consumer, or errors. This gives Jellyfin and
-  rclone full Range / 206 / `Content-Range` support on Telegram-backed files
-  while keeping memory bounded to the streamed chunk.
+  endpoint. `streamProviderFileToReadable` forwards HTTP byte ranges straight
+  into teleproto's `iterDownload` via `openTelegramDocument`'s `offset`/`limit`
+  options (`Api.upload.getFile` with `precise: true` gives exact server-side
+  byte offsets), then trims the library's final chunk overshoot so the response
+  body is exactly the requested range. No temp file, no full-file pre-download:
+  headers flush immediately and memory stays bounded to the 512 KB download
+  chunks, which gives Jellyfin and rclone full Range / 206 / `Content-Range`
+  support on Telegram-backed files.
 
 ## 9Drive metadata in Telegram messages
 

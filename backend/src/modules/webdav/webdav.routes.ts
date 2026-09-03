@@ -2,6 +2,7 @@ import { Router, type Request } from 'express'
 import { v2 } from 'webdav-server'
 import { requireWebDavAuth } from './webdav-auth.middleware.js'
 import { env } from '../../config/env.js'
+import { AppError } from '../../utils/app-error.js'
 import { streamProviderFileToReadable, VirtualFileSystem } from './webdav-virtual-fs.js'
 import PropfindCommand from 'webdav-server/lib/server/v2/commands/Propfind.js'
 import { Workflow } from 'webdav-server/lib/helper/Workflow.js'
@@ -57,10 +58,7 @@ async function streamFile(ctx: v2.HTTPRequestContext, fs: VirtualFileSystem): Pr
   const range = parseRange(rangeHeader ?? '', size)
 
   // RFC 9110 §14.1.2: a single satisfiable-range request that starts at or
-  // past the resource size is `416 Range Not Satisfiable`. Previously this
-  // controller silently fell back to a 200 with the full body, which is wrong
-  // now that the Telegram branch can serve partial bytes from a tmp file and
-  // `fs.createReadStream` would throw `ERR_OUT_OF_RANGE` on `start >= size`.
+  // past the resource size is `416 Range Not Satisfiable`.
   if (rangeHeader && !range && size > 0 && /^bytes=/i.test(rangeHeader)) {
     ctx.setCode(v2.HTTPCodes.RequestedRangeNotSatisfiable)
     ctx.response.setHeader('Content-Range', `bytes */${size}`)
@@ -75,9 +73,18 @@ async function streamFile(ctx: v2.HTTPRequestContext, fs: VirtualFileSystem): Pr
   ctx.response.setHeader('Last-Modified', file.updatedAt.toUTCString())
 
   const stream = await streamProviderFileToReadable(file, range ? `bytes=${range.start}-${range.end}` : undefined)
-  stream.on('error', () => {
-    ctx.setCode(v2.HTTPCodes.InternalServerError)
-    ctx.response.destroy()
+  stream.on('error', (error: unknown) => {
+    // Provider errors are classified into AppErrors (404 for missing objects,
+    // 401 for revoked sessions, 429 for flood waits, …). Once headers have been
+    // sent the connection can no longer carry a different status, so we destroy
+    // it — the client sees a truncated response, which is the correct signal.
+    const status = error instanceof AppError ? error.status : v2.HTTPCodes.InternalServerError
+    if (!ctx.response.headersSent) {
+      ctx.setCode(status)
+      ctx.exit()
+    } else {
+      ctx.response.destroy()
+    }
   })
   if (range) {
     ctx.setCode(v2.HTTPCodes.PartialContent)
@@ -106,8 +113,9 @@ function getHandler(): HTTPMethod {
       }
       streamFile(ctx, fs).catch((error) => {
         console.error('[webdav] GET failed:', error)
+        const status = error instanceof AppError ? error.status : v2.HTTPCodes.InternalServerError
         if (!ctx.response.headersSent) {
-          ctx.setCode(v2.HTTPCodes.InternalServerError)
+          ctx.setCode(status)
           ctx.exit()
         } else {
           ctx.response.destroy()

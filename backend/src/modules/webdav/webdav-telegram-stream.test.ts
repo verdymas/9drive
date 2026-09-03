@@ -1,23 +1,20 @@
 /**
  * WebDAV Telegram provider stream tests.
  *
- * Verifies the new `telegram` branch in `streamProviderFileToReadable`:
- *   - full GET streams the full Telegram bytes
- *   - Range GET streams only the requested slice (206 semantics)
- *   - the temp file is cleaned up on end, close, and error
- *   - missing / failed Telegram downloads surface as rejections / errors
- *   - unknown size falls back to a direct passthrough stream
- *
- * The real temp directory under `os.tmpdir()` is used (no fs mocking) so the
- * end-to-end shape of the function is exercised, including the
- * `pipeline(iter, createWriteStream)` step.
+ * Verifies the `telegram` branch in `streamProviderFileToReadable` streams the
+ * requested byte window directly from Telegram via `iterDownload`'s native
+ * offset/limit (NO temp file, NO full-file pre-download):
+ *   - full GET streams the entire file
+ *   - Range GET streams only the requested window (206 semantics)
+ *   - open-ended range streams to EOF
+ *   - the trimming generator cuts the final overshoot chunk (the library's
+ *     `limit` is approximate, rounded up to whole request chunks)
+ *   - `download.close()` always runs (end, error, early destroy)
+ *   - missing / failed Telegram downloads surface as stable AppErrors
  */
 
 import { Readable } from 'node:stream'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { AppError } from '../../utils/app-error.js'
 import type { File, ConnectedAccount } from '@prisma/client'
 
@@ -66,40 +63,42 @@ function makeTelegramFile(overrides: Partial<File & { connectedAccount: Connecte
   return { ...base, ...overrides, connectedAccount: { id: 'acc-1', userId: 'user-1', provider: 'telegram' } as ConnectedAccount } as File & { connectedAccount: ConnectedAccount }
 }
 
-function asyncIterableFromBuffer(buffer: Buffer, chunkSize = 256): AsyncIterable<Buffer> {
+/**
+ * Emulate teleproto's `iterDownload` semantics: yields chunks starting at
+ * `opts.offset`, in `requestSize` chunks, and MAY overshoot the requested
+ * byte window by up to one chunk (because the library's `limit` is
+ * approximate and rounded up to whole request chunks). It also respects an
+ * overall `limit` (rounded up to whole chunks), like the real library.
+ */
+function iterDownloadLike(buffer: Buffer, opts: { offset?: number; limit?: number; requestSize?: number } = {}) {
+  const requestSize = opts.requestSize ?? 512 * 1024
+  const start = opts.offset ?? 0
+  const hardLimit = opts.limit !== undefined ? start + Math.ceil(opts.limit / requestSize) * requestSize : undefined
   return (async function* () {
-    for (let i = 0; i < buffer.length; i += chunkSize) {
-      yield buffer.subarray(i, Math.min(i + chunkSize, buffer.length))
+    for (let i = start; i < buffer.length; i += requestSize) {
+      if (hardLimit !== undefined && i >= hardLimit) return
+      yield buffer.subarray(i, Math.min(i + requestSize, buffer.length))
     }
   })()
 }
 
-function makeDownload(bytes: Buffer) {
+function makeDownload(bytes: Buffer, opts: { offset?: number; limit?: number } = {}) {
   return {
     remoteId: 'telegram://-100123/42',
-    stream: asyncIterableFromBuffer(bytes),
+    stream: iterDownloadLike(bytes, opts),
     close: vi.fn(async () => undefined),
   }
 }
 
-let workdir: string
+// Capture the opts the WebDAV layer passed to openTelegramDocument.
+let capturedOpts: { offset?: number; limit?: number } | undefined
 
-beforeEach(async () => {
-  vi.clearAllMocks()
-  // After clearAllMocks, re-establish the prisma stub since we don't actually
-  // call it in these tests (getTelegramConfig is mocked directly).
-  h.getTelegramConfig.mockResolvedValue({
-    connectedAccountId: 'acc-1',
-    apiIdEncrypted: 'x',
-    apiHashEncrypted: 'y',
-    sessionEncrypted: 'z',
+function stubOpenDocument(bytes: Buffer) {
+  h.openTelegramDocument.mockImplementation(async (_config: unknown, _remoteId: string, opts: { offset?: number; limit?: number } = {}) => {
+    capturedOpts = opts
+    return makeDownload(bytes, opts)
   })
-  workdir = await mkdtemp(join(tmpdir(), '9drive-webdav-test-'))
-})
-
-afterEach(async () => {
-  await rm(workdir, { recursive: true, force: true })
-})
+}
 
 async function readAll(stream: Readable): Promise<Buffer> {
   const chunks: Buffer[] = []
@@ -109,45 +108,35 @@ async function readAll(stream: Readable): Promise<Buffer> {
   return Buffer.concat(chunks)
 }
 
-async function expectTempFileDeleted(stream: Readable, deadlineMs = 2000): Promise<void> {
-  // The cleanup runs on 'end' / 'close' / 'error'. We rely on the stream having
-  // surfaced 'end' before this is called (the caller awaits the body), and
-  // then poll for the file to disappear. A short timeout is acceptable — the
-  // unlink is fire-and-forget.
-  const start = Date.now()
-  // The temp file path is not exposed, so we infer cleanup by waiting for the
-  // 'close' event with a small grace period.
-  await new Promise<void>((resolve) => {
-    let done = false
-    const finish = () => {
-      if (done) return
-      done = true
-      resolve()
-    }
-    if (stream.destroyed) return finish()
-    stream.once('close', finish)
-    setTimeout(finish, deadlineMs - (Date.now() - start))
+beforeEach(() => {
+  vi.clearAllMocks()
+  capturedOpts = undefined
+  h.getTelegramConfig.mockResolvedValue({
+    connectedAccountId: 'acc-1',
+    apiIdEncrypted: 'x',
+    apiHashEncrypted: 'y',
+    sessionEncrypted: 'z',
   })
-}
+})
 
 describe('streamProviderFileToReadable — telegram branch', () => {
   it('streams the full file when no Range is requested', async () => {
     const bytes = Buffer.from('hello-telegram'.repeat(100))
-    h.openTelegramDocument.mockResolvedValue(makeDownload(bytes))
+    stubOpenDocument(bytes)
 
     const file = makeTelegramFile({ sizeBytes: BigInt(bytes.length) })
     const stream = await streamProviderFileToReadable(file)
     const out = await readAll(stream)
 
     expect(out.equals(bytes)).toBe(true)
+    // No range ⇒ start at offset 0, no byte limit.
+    expect(capturedOpts).toEqual({ offset: 0, limit: undefined })
     expect(h.openTelegramDocument).toHaveBeenCalledTimes(1)
-    await expectTempFileDeleted(stream)
   })
 
-  it('serves only the requested byte slice when Range is provided', async () => {
-    const bytes = Buffer.alloc(1024, 'A')
-    for (let i = 0; i < bytes.length; i += 2) bytes[i] = 0x42 // 'B'
-    h.openTelegramDocument.mockResolvedValue(makeDownload(bytes))
+  it('streams only the requested byte slice when Range is provided', async () => {
+    const bytes = Buffer.alloc(2048, 0x41) // 'A'
+    stubOpenDocument(bytes)
 
     const file = makeTelegramFile({ sizeBytes: BigInt(bytes.length) })
     const stream = await streamProviderFileToReadable(file, 'bytes=10-19')
@@ -155,12 +144,12 @@ describe('streamProviderFileToReadable — telegram branch', () => {
 
     expect(out.length).toBe(10)
     expect(out.equals(bytes.subarray(10, 20))).toBe(true)
-    await expectTempFileDeleted(stream)
+    expect(capturedOpts).toEqual({ offset: 10, limit: 10 })
   })
 
-  it('serves an open-ended range to end-of-file', async () => {
+  it('streams an open-ended range to end-of-file', async () => {
     const bytes = Buffer.from('abcdefghijklmnopqrstuvwxyz')
-    h.openTelegramDocument.mockResolvedValue(makeDownload(bytes))
+    stubOpenDocument(bytes)
 
     const file = makeTelegramFile({ sizeBytes: BigInt(bytes.length) })
     const stream = await streamProviderFileToReadable(file, 'bytes=10-')
@@ -168,12 +157,12 @@ describe('streamProviderFileToReadable — telegram branch', () => {
 
     expect(out.length).toBe(bytes.length - 10)
     expect(out.equals(bytes.subarray(10))).toBe(true)
-    await expectTempFileDeleted(stream)
+    expect(capturedOpts).toEqual({ offset: 10, limit: bytes.length - 10 })
   })
 
   it('clips an over-shooting end to size-1', async () => {
     const bytes = Buffer.from('0123456789')
-    h.openTelegramDocument.mockResolvedValue(makeDownload(bytes))
+    stubOpenDocument(bytes)
 
     const file = makeTelegramFile({ sizeBytes: BigInt(bytes.length) })
     const stream = await streamProviderFileToReadable(file, 'bytes=0-9999')
@@ -181,26 +170,74 @@ describe('streamProviderFileToReadable — telegram branch', () => {
 
     expect(out.length).toBe(10)
     expect(out.equals(bytes)).toBe(true)
-    await expectTempFileDeleted(stream)
+    expect(capturedOpts).toEqual({ offset: 0, limit: 10 })
   })
 
-  it('does not buffer the whole file into a single Buffer in memory', async () => {
-    // We use a 2 MB payload chunked into small iter chunks and assert the
-    // returned Readable is backed by a real file (has `path` and `bytesRead`).
-    const bytes = Buffer.alloc(2 * 1024 * 1024, 0x37)
-    h.openTelegramDocument.mockResolvedValue(makeDownload(bytes))
+  it('trims the final overshoot chunk to the exact requested window', async () => {
+    // 3 whole 300-byte chunks. Request bytes 0-400 ⇒ limit 401, which the real
+    // library rounds up to the next whole 300-byte chunk (yields 600 bytes).
+    // The trimming generator must stop at exactly 401 bytes.
+    const bytes = Buffer.alloc(900, 0x42)
+    const download = {
+      remoteId: 'telegram://-100123/42',
+      stream: (async function* () {
+        yield bytes.subarray(0, 300)
+        yield bytes.subarray(300, 600)
+        yield bytes.subarray(600, 900) // overshoot
+      })(),
+      close: vi.fn(async () => undefined),
+    }
+    h.openTelegramDocument.mockResolvedValue(download)
 
     const file = makeTelegramFile({ sizeBytes: BigInt(bytes.length) })
-    const stream = await streamProviderFileToReadable(file, 'bytes=0-1023')
-    expect((stream as unknown as { path?: string }).path).toMatch(/9drive-webdav-/)
-
+    const stream = await streamProviderFileToReadable(file, 'bytes=0-400')
     const out = await readAll(stream)
-    expect(out.length).toBe(1024)
-    expect(out.equals(bytes.subarray(0, 1024))).toBe(true)
-    await expectTempFileDeleted(stream)
+
+    expect(out.length).toBe(401)
+    expect(out.equals(bytes.subarray(0, 401))).toBe(true)
+    expect(download.close).toHaveBeenCalled()
   })
 
-  it('rejects when the Telegram object is missing (TELEGRAM_FILE_NOT_FOUND)', async () => {
+  it('calls download.close() when the consumer destroys the stream early', async () => {
+    const bytes = Buffer.alloc(10 * 1024 * 1024, 0x11)
+    const download = makeDownload(bytes)
+    h.openTelegramDocument.mockResolvedValue(download)
+
+    const file = makeTelegramFile({ sizeBytes: BigInt(bytes.length) })
+    const stream = await streamProviderFileToReadable(file)
+
+    // Destroy before reading anything — the generator's finally must run close().
+    stream.destroy()
+    await vi.waitFor(() => expect(download.close).toHaveBeenCalled())
+  })
+
+  it('emits an error when the Telegram stream fails mid-download and maps it to an AppError', async () => {
+    async function* failing() {
+      yield Buffer.from('partial-')
+      throw new Error('connection reset')
+    }
+    const download = {
+      remoteId: 'telegram://-100123/42',
+      stream: failing(),
+      close: vi.fn(async () => undefined),
+    }
+    h.openTelegramDocument.mockResolvedValue(download)
+
+    const file = makeTelegramFile({ sizeBytes: 100n })
+    const stream = await streamProviderFileToReadable(file)
+
+    const seen: unknown[] = []
+    stream.on('error', (err) => seen.push(err))
+    stream.resume()
+    await vi.waitFor(() => expect(seen.length).toBe(1))
+
+    // Mid-stream raw errors are classified into a stable AppError (the
+    // generic fallback in classifyTelegramError returns status 502).
+    expect(seen[0]).toBeInstanceOf(AppError)
+    expect(download.close).toHaveBeenCalled()
+  })
+
+  it('rejects with a 404 AppError when the Telegram object is missing', async () => {
     h.openTelegramDocument.mockRejectedValue(
       new AppError('TELEGRAM_FILE_NOT_FOUND', 'The Telegram document could not be found.', 404),
     )
@@ -212,69 +249,41 @@ describe('streamProviderFileToReadable — telegram branch', () => {
     })
   })
 
-  it('rejects with a sanitized error when the Telegram provider errors mid-stream', async () => {
-    async function* failing() {
-      yield Buffer.from('first')
-      throw new Error('connection reset')
-    }
-    h.openTelegramDocument.mockResolvedValue({
-      remoteId: 'telegram://-100123/42',
-      stream: failing(),
-      close: vi.fn(async () => undefined),
-    })
+  it('rejects with a 401 AppError for a revoked session', async () => {
+    h.openTelegramDocument.mockRejectedValue(
+      new AppError('TELEGRAM_SESSION_INVALID', 'Telegram session is invalid.', 401),
+    )
 
-    const file = makeTelegramFile({ sizeBytes: 100n })
-    await expect(streamProviderFileToReadable(file)).rejects.toThrow(/connection reset/)
+    const file = makeTelegramFile()
+    await expect(streamProviderFileToReadable(file)).rejects.toMatchObject({
+      code: 'TELEGRAM_SESSION_INVALID',
+      status: 401,
+    })
   })
 
-  it('streams directly when size is unknown (no tmp file is created)', async () => {
-    const bytes = Buffer.from('unknown-size-payload')
-    const download = makeDownload(bytes)
-    h.openTelegramDocument.mockResolvedValue(download)
+  it('rejects with a 429 AppError for flood waits', async () => {
+    h.openTelegramDocument.mockRejectedValue(
+      new AppError('TELEGRAM_FLOOD_WAIT', 'Telegram requested a temporary wait. Retry after 30 seconds.', 429),
+    )
 
-    const file = makeTelegramFile({ sizeBytes: 0n })
-    const stream = await streamProviderFileToReadable(file)
+    const file = makeTelegramFile()
+    await expect(streamProviderFileToReadable(file)).rejects.toMatchObject({
+      code: 'TELEGRAM_FLOOD_WAIT',
+      status: 429,
+    })
+  })
+
+  it('streams correctly when the range does not start at byte 0', async () => {
+    const bytes = Buffer.alloc(4096)
+    for (let i = 0; i < bytes.length; i++) bytes[i] = i % 256
+    stubOpenDocument(bytes)
+
+    const file = makeTelegramFile({ sizeBytes: BigInt(bytes.length) })
+    const stream = await streamProviderFileToReadable(file, 'bytes=1000-1999')
     const out = await readAll(stream)
 
-    expect(out.equals(bytes)).toBe(true)
-    // The returned stream is a Readable.from() over the async iterable, not a
-    // file-backed Readable.
-    expect((stream as unknown as { path?: string }).path).toBeUndefined()
-    expect(download.close).toHaveBeenCalled()
-  })
-
-  it('invokes the Telegram client close on stream end (tmp-file path)', async () => {
-    const bytes = Buffer.from('cleanup-test')
-    const download = makeDownload(bytes)
-    h.openTelegramDocument.mockResolvedValue(download)
-
-    const file = makeTelegramFile({ sizeBytes: BigInt(bytes.length) })
-    const stream = await streamProviderFileToReadable(file)
-    await readAll(stream)
-
-    expect(download.close).toHaveBeenCalled()
-  })
-})
-
-// Optional: verify the real tmp file matches the streamed content. (Covered
-// transitively by the "streams the full file" test; kept as a one-liner here
-// for documentation value.)
-describe('streamProviderFileToReadable — tmp file lifecycle', () => {
-  it('writes the full Telegram bytes to the temp file before slicing', async () => {
-    const bytes = Buffer.alloc(4096, 0xab)
-    h.openTelegramDocument.mockResolvedValue(makeDownload(bytes))
-
-    const file = makeTelegramFile({ sizeBytes: BigInt(bytes.length) })
-    const stream = await streamProviderFileToReadable(file, 'bytes=100-199')
-    const path = (stream as unknown as { path: string }).path
-    expect(path).toMatch(/9drive-webdav-/)
-
-    const onDisk = await readFile(path)
-    expect(onDisk.length).toBe(bytes.length)
-    expect(onDisk.equals(bytes)).toBe(true)
-    const s = await stat(path)
-    expect(s.size).toBe(bytes.length)
-
-    await readAll(stream)
+    expect(out.length).toBe(1000)
+    expect(out.equals(bytes.subarray(1000, 2000))).toBe(true)
+    expect(capturedOpts).toEqual({ offset: 1000, limit: 1000 })
   })
 })

@@ -1,18 +1,12 @@
 import { GetObjectCommand } from '@aws-sdk/client-s3'
 import type { ConnectedAccount, File, Folder } from '@prisma/client'
-import { randomUUID } from 'node:crypto'
-import { createReadStream, createWriteStream } from 'node:fs'
-import { unlink } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { pipeline } from 'node:stream/promises'
 import { Readable, type Writable } from 'node:stream'
 import { v2 } from 'webdav-server'
 import { prisma } from '../../config/prisma.js'
 import { googleDownloadExportMimeTypes, normalizeHeaders } from '../files/stream-google-file.js'
 import { getAuthedGoogleClient } from '../google/google.service.js'
 import { createS3Client, getS3ConfigForAccount } from '../s3/s3.service.js'
-import { getTelegramConfig, openTelegramDocument } from '../telegram/telegram.service.js'
+import { classifyTelegramError, getTelegramConfig, openTelegramDocument } from '../telegram/telegram.service.js'
 
 const { FileSystem, LocalLockManager, LocalPropertyManager, ResourceType } = v2
 
@@ -446,67 +440,98 @@ export async function streamProviderFileToReadable(file: FileWithAccount, range?
 }
 
 /**
- * Telegram does not support server-side Range — `iterDownload` is a forward-only
- * chunked MTProto stream. To honor HTTP Range for Jellyfin playback/seeking, we
- * download the file once to a unique temp file under `os.tmpdir()` and then
- * serve byte ranges with `fs.createReadStream({ start, end })`. The temp file is
- * deleted automatically when the returned stream ends, is closed by the
- * consumer, or errors out.
+ * Stream a Telegram document's bytes to a Node Readable, honoring HTTP Range.
  *
- * If the file's size is unknown, we cannot satisfy ranges; the controller will
- * already have requested the full body, so we stream the Telegram iterable
- * directly without a temp file.
+ * `openTelegramDocument` passes `offset`/`limit` straight into teleproto's
+ * `iterDownload`, which invokes `Api.upload.getFile({ offset, limit,
+ * precise: true })` — Telegram supports exact byte offsets server-side, so a
+ * range request downloads only its window plus at most one overshoot chunk
+ * (the library's `limit` is approximate, rounded up to whole 512 KB request
+ * chunks). The generator below trims that final overshoot so the WebDAV
+ * response body is exactly the requested range.
+ *
+ * Response headers flush immediately because no full-file pre-download or
+ * temp file is involved; memory stays bounded to the 512 KB chunks.
  */
 async function streamTelegramFileToReadable(file: FileWithAccount, range?: string): Promise<Readable> {
-  const config = await getTelegramConfig(file.connectedAccountId)
-  const download = await openTelegramDocument(config, file.providerFileId)
+  try {
+    const config = await getTelegramConfig(file.connectedAccountId)
+    const size = Number(file.sizeBytes ?? 0n)
+    const { start, end } = parseRangeHeader(range, size)
+    const byteCount = end !== undefined ? end - start + 1 : undefined
 
-  const size = Number(file.sizeBytes ?? 0n)
-  const { start, end } = parseRangeHeader(range, size)
-
-  // No range and no known size: stream the Telegram iterable directly so we
-  // don't create a zero-byte temp file.
-  if (!range && size <= 0) {
-    const iter = Readable.from(download.stream as AsyncIterable<Buffer>)
-    iter.on('end', () => { void download.close() })
-    iter.on('close', () => { void download.close() })
-    iter.on('error', () => { void download.close() })
-    return iter
+    // `openTelegramDocument` throws `AppError('TELEGRAM_FILE_NOT_FOUND', …, 404)`
+    // when the message/document is gone, and may throw session/network errors.
+    // Errors here propagate to the route's catch → mapped from AppError.status.
+    const download = await openTelegramDocument(config, file.providerFileId, {
+      offset: start,
+      limit: byteCount,
+    })
+    const out = Readable.from(trimmedDownload(download, byteCount))
+    // Node's Readable.from() does not finalize (call return() on) the source
+    // generator if the stream is destroyed before its first pull, so the
+    // generator's `finally` (which calls download.close()) would never run and
+    // the MTProto client would leak. Attach a close handler as a safety net —
+    // download.close() is idempotent (client.disconnect().catch()).
+    out.on('close', () => {
+      void download.close()
+    })
+    return out
+  } catch (error) {
+    // Classify Telegram-specific errors into stable AppErrors (404 for missing
+    // objects, 401 for revoked sessions, 429 for flood waits) so the WebDAV
+    // controller stays provider-agnostic.
+    const classified = classifyTelegramError(error)
+    throw classified
   }
-
-  const tmpPath = join(tmpdir(), `9drive-webdav-${file.id}-${process.pid}-${randomUUID()}.bin`)
-
-  // Materialize the Telegram download to disk, then slice. `pipeline` propagates
-  // Telegram errors so the surrounding `stream.on('error', …)` in the route
-  // surfaces a 500.
-  await pipeline(Readable.from(download.stream as AsyncIterable<Buffer>), createWriteStream(tmpPath))
-  // close() is idempotent and only runs after the pipeline finishes; errors
-  // during pipeline are rethrown by `pipeline` itself, which already cleaned up.
-  void download.close()
-
-  const slice = end !== undefined ? { start, end } : { start }
-  const out = createReadStream(tmpPath, slice)
-
-  const cleanup = () => {
-    unlink(tmpPath).catch(() => undefined)
-  }
-  out.on('end', cleanup)
-  out.on('close', cleanup)
-  out.on('error', cleanup)
-
-  return out
 }
 
 /**
- * Parse an HTTP `Range: bytes=START-END` header into `{ start, end }` for use
- * with `fs.createReadStream({ start, end })`. `end` is inclusive in HTTP but
- * `createReadStream` treats it as exclusive, so we add 1.
+ * Wrap `download.stream` so the returned Readable ends exactly at the requested
+ * byte window and always calls `download.close()` (MTProto disconnect) on end,
+ * error, or early consumer destroy.
+ */
+async function* trimmedDownload(
+  download: { stream: AsyncIterable<Buffer>; close: () => Promise<unknown> },
+  byteCount?: number,
+): AsyncGenerator<Buffer> {
+  try {
+    let remaining = byteCount
+    for await (const chunk of download.stream) {
+      if (remaining === undefined) {
+        yield chunk
+        continue
+      }
+      if (chunk.length <= remaining) {
+        remaining -= chunk.length
+        yield chunk
+        if (remaining === 0) return
+      } else {
+        yield chunk.subarray(0, remaining)
+        return
+      }
+    }
+  } catch (error) {
+    // Mid-stream Telegram errors (revoked session, flood wait, connection
+    // reset) are classified here so the generic WebDAV controller only ever
+    // sees stable AppErrors, not raw RPC details.
+    throw classifyTelegramError(error)
+  } finally {
+    // Runs on natural end, thrown stream errors, and when `Readable.from`
+    // calls `return()` on this generator (consumer destroys the stream early).
+    await download.close()
+  }
+}
+
+/**
+ * Parse an HTTP `Range: bytes=START-END` header into `{ start, end }` where
+ * `end` is INCLUSIVE (HTTP semantics; matches how the WebDAV controller sets
+ * `Content-Range`).
  *
  * - Returns `{ start: 0, end: undefined }` when no range is requested.
  * - Returns `{ start, end: size - 1 }` when the suffix range is open-ended.
- * - Returns `{ start: size }` (i.e. start === end+1) for unsatisfiable ranges;
- *   the route layer should never invoke this branch with a known-unsatisfiable
- *   range because it will set 416 first.
+ * - Returns `{ start: size, end: size - 1 }` for unsatisfiable ranges (start
+ *   >= size); the route layer returns 416 before this branch runs.
  */
 function parseRangeHeader(range: string | undefined, size: number): { start: number; end: number | undefined } {
   if (!range || size <= 0) return { start: 0, end: undefined }
