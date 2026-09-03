@@ -10,6 +10,8 @@ import { scanS3Folders } from './sync-s3.js'
 import { mapWithConcurrency } from './map-with-concurrency.js'
 import { syncGoogleQuota, ensureGoogleAppFolder } from '../google/google.service.js'
 import { syncS3Quota } from '../s3/s3.service.js'
+import { runTelegramSync } from '../telegram/telegram-sync.service.js'
+import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
 import type { ConnectedAccount } from '@prisma/client'
 
 /**
@@ -83,12 +85,45 @@ export async function runAccountSync(userId: string, connectedAccountId: string)
       await runS3Scan(ctx, cancelled)
     } else if (account.provider === 'telegram') {
       // Telegram is flat blob storage and the DB is the source of truth.
-      // Recovery/reconciliation is a separate, non-destructive index op
-      // (POST /telegram/accounts/:id/index); the missing-reconciler below must
-      // never run against the channel history (documents may exist without a
-      // DB row only because 9Drive has not indexed them).
-      await completeSyncRun(run.id, stats)
-      return { accountId: account.id, provider: account.provider, status: 'completed', runId: run.id, stats }
+      // `runTelegramSync` does three things safely:
+      //   1. Classifies every channel document by `providerFileId` against
+      //      a snapshot of rows that existed before the run started.
+      //   2. Fetches captions for orphans and routes them through the
+      //      caption-driven ingest (`9drive:id` → `9drive:path` → recovery).
+      //   3. Flags rows from the pre-run snapshot whose Telegram message
+      //      disappeared (Pass 2). Newly-ingested orphans are NOT in the
+      //      snapshot and therefore cannot be falsely flagged as missing.
+      //
+      // The legacy comment said "the missing-reconciler below must never
+      // run against the channel history" — that referred to the global
+      // `reconcileMissing(ctx, stats)` call further down in this function,
+      // which uses `lastSeenSyncRunId` and is intentionally Telegram-blind
+      // (this branch returns before that line is reached).
+      const syncSummary = await runTelegramSync(userId, account.id, { full: !cancelled })
+      syncTelegramUsage(account.id).catch(() => undefined)
+      // Map Telegram-shaped stats onto the Google/S3-shaped `SyncStats`
+      // shape. The Telegram summary's per-strategy counters are surfaced
+      // in `errorMessage` already via the audit log; the run-level
+      // counters are still useful in the API response.
+      const telegramStats: SyncStats = {
+        ...emptyStats(),
+        filesCreated: syncSummary.importedCount,
+        filesMissing: syncSummary.missingCount,
+        // collisionsDetected keeps the same name as the Google/S3
+        // meaning; Telegram reports conflicts separately.
+        collisionsDetected: syncSummary.conflictCount,
+      }
+      return {
+        accountId: account.id,
+        provider: account.provider,
+        // The Telegram summary can be 'running' (e.g. mid-cancel) — only
+        // surface terminal statuses to the API.
+        status: syncSummary.status === 'running' ? 'cancelled' : syncSummary.status,
+        runId: syncSummary.id,
+        stats: telegramStats,
+        errorCode: syncSummary.errorCode ?? undefined,
+        errorMessage: syncSummary.errorMessage ?? undefined,
+      }
     } else {
       await failSyncRun(run.id, 'SYNC_PROVIDER_UNSUPPORTED', `Sync is not implemented for provider "${account.provider}".`)
       return { accountId: account.id, provider: account.provider, status: 'failed', runId: run.id, stats }

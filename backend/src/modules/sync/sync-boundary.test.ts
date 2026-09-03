@@ -232,6 +232,38 @@ vi.mock('../s3/s3.service.js', () => ({
   getS3ConfigForAccount: vi.fn(),
   createS3Client: vi.fn(),
 }))
+// The boundary test asserts that `POST /sync/all` does NOT call any
+// provider WRITE methods. Telegram's sync path is mocked here because
+// the in-memory prisma fake in this test does not simulate the
+// Telegram storage/sync tables — but the boundary contract is the
+// same: Telegram sync READS the channel, writes MySQL rows (or
+// orphans under `Recovered from Telegram`), and never calls
+// `provider-folder.service` write methods.
+vi.mock('../telegram/telegram-sync.service.js', () => ({
+  runTelegramSync: vi.fn(async (userId: string, accountId: string) => ({
+    id: `telegram-run-${accountId}`,
+    status: 'completed' as const,
+    startedAt: new Date(),
+    finishedAt: new Date(),
+    errorCode: null,
+    errorMessage: null,
+    durationMs: 0,
+    scannedCount: 0,
+    matchedCount: 0,
+    importedCount: 0,
+    missingCount: 0,
+    orphanCount: 0,
+    conflictCount: 0,
+    errorCount: 0,
+    matchedByIdCount: 0,
+    matchedByPathCount: 0,
+    recoveredCount: 0,
+    maxSeenMessageId: null,
+  })),
+}))
+vi.mock('../telegram/telegram-usage.service.js', () => ({
+  syncTelegramUsage: vi.fn(async () => undefined),
+}))
 
 import { runSyncAll, runAccountSync } from './sync.service.js'
 
@@ -306,10 +338,12 @@ describe('sync boundary — provider is READ-ONLY (§29/§70)', () => {
     expect(results.filter((r) => r.status === 'completed')).toHaveLength(1)
   })
 
-  it('Telegram accounts complete as a no-op (no scan, no missing cleanup, no writes)', async () => {
-    // Telegram is flat blob storage with the DB as source of truth: Sync All
-    // must NOT list the channel history or run the missing-reconciler, and it
-    // must never surface SYNC_PROVIDER_UNSUPPORTED.
+  it('Telegram accounts run through the telegram sync path without touching provider writes', async () => {
+    // Telegram is flat blob storage with the DB as source of truth. Sync All
+    // delegates to `runTelegramSync` (caption-driven orphan ingest + Pass 2
+    // reconciliation against the pre-run snapshot). The boundary contract
+    // is unchanged: Sync All must NEVER call any of the
+    // `provider-folder.service` write methods.
     h.ACCOUNTS.push(
       { id: 'acc-tg', userId: 'u1', provider: 'telegram', status: 'connected' },
       { id: 'acc-a', userId: 'u1', provider: 'google_drive', status: 'connected' },
@@ -319,13 +353,17 @@ describe('sync boundary — provider is READ-ONLY (§29/§70)', () => {
 
     const { results } = await runSyncAll('u1')
     const tg = results.find((r) => r.accountId === 'acc-tg')
+    // The Telegram run completes successfully via the mocked
+    // `runTelegramSync`. The mock returns a stub summary; the real
+    // implementation is exercised by the telegram-sync tests.
     expect(tg!.status).toBe('completed')
     expect(tg!.stats.filesDiscovered).toBe(0)
     expect(tg!.stats.filesCreated).toBe(0)
 
-    // No channel history listing (drive fake only knows Google; the telegram
-    // account's run must not have touched it), and the run row is completed.
-    expect(h.db.runs.some((r) => r.connectedAccountId === 'acc-tg' && r.status === 'completed')).toBe(true)
+    // No channel history listing on the drive fake. (The Telegram run
+    // is recorded in the `telegram_sync_runs` table by `runTelegramSync`
+    // itself, not in the Google/S3-shaped `syncRun` table — so we
+    // don't assert against `h.db.runs` here.)
     // The healthy Google account still reconciled its own tree.
     expect(h.db.files.length).toBe(1)
     for (const fn of ['ensureProviderRoot', 'createProviderFolder', 'renameProviderFolder', 'moveProviderFolder', 'deleteProviderFolder'] as const) {
