@@ -9,6 +9,8 @@ import { decryptText, encryptText } from '../../utils/crypto.js'
 import { decryptRequestContext, hopHeaderResolver, type RemoteImportRequestContext } from './request-context.js'
 import { ensureGoogleAppFolder, getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
 import { buildS3ObjectKey, getS3ConfigForAccount, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
+import { getTelegramConfig, markTelegramReauthRequired, uploadTelegramDocument } from '../telegram/telegram.service.js'
+import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
 import { resolveUploadPlacement } from '../storage/upload-placement.service.js'
 import type { RemoteImportJobData } from './queue.js'
 import { followRemoteUrl } from './url-downloader.js'
@@ -274,6 +276,27 @@ async function uploadTempFile(
     }
   }
 
+  // Telegram — upload the local temp file as a document message in the
+  // account's private storage channel. The channel is physically flat: the
+  // virtual folder tree stays in the DB and no per-file provider folder exists.
+  if (account.provider === 'telegram') {
+    const config = await getTelegramConfig(account.id, userId)
+    const uploadProgress = throttledProgressUpdater(importId, STAGES.UPLOADING)
+    const providerFileId = await uploadTelegramDocument(config, {
+      filePath: tempPartPath,
+      name: fileName,
+      mimeType,
+      sizeBytes: Number(uploadTotalBytes),
+      onProgress: (pct) => {
+        void uploadProgress({ uploadedBytes: BigInt(Math.round((pct / 100) * Number(uploadTotalBytes))).toString() })
+      },
+    })
+    // Force the final write so the bar reaches 100% the moment the upload
+    // completes (mirrors the S3 branch).
+    await prisma.remoteImport.update({ where: { id: importId }, data: { uploadedBytes: uploadTotalBytes } }).catch(() => undefined)
+    return { providerFileId, fileId: null }
+  }
+
   // Google Drive — resumable upload streams the temp file directly, records
   // the session encrypted (for crash-safe), and returns provider metadata.
   const uploadProgress = throttledProgressUpdater(importId, STAGES.UPLOADING)
@@ -427,6 +450,7 @@ async function processHlsImport(
         if (record.connectedAccountId) {
           const prov = existing.provider ?? ''
           if (prov === 's3') syncS3Quota(record.connectedAccountId).catch(() => undefined)
+          else if (prov === 'telegram') syncTelegramUsage(record.connectedAccountId).catch(() => undefined)
           else syncGoogleQuota(record.connectedAccountId).catch(() => undefined)
         }
         return { outputPath: null }
@@ -547,10 +571,11 @@ async function processHlsImport(
       const reportedBytes = downloadedBytes > 0n ? downloadedBytes : BigInt((await fsp.stat(outputPath!)).size)
       placement = await resolveUploadPlacement(userId, folderId, record.connectedAccountId, reportedBytes, undefined, 'remote-import')
     } catch (error: any) {
-      // GOOGLE_REAUTH_REQUIRED must preserve the remuxed output: write a
-      // resume marker so the job dir survives (the finally keeps the dir only
-      // while a marker exists) and the retry resumes at 'uploading' — the
-      // output file is already on disk, so no FFmpeg or segment re-download.
+      // GOOGLE_REAUTH_REQUIRED / TELEGRAM_SESSION_INVALID must preserve the
+      // remuxed output: write a resume marker so the job dir survives (the
+      // finally keeps the dir only while a marker exists) and the retry resumes
+      // at 'uploading' — the output file is already on disk, so no FFmpeg or
+      // segment re-download.
       if (error?.code === 'GOOGLE_REAUTH_REQUIRED') {
         await writeResumeMarker(jobDir, {
           version: 1,
@@ -562,6 +587,19 @@ async function processHlsImport(
           mediaDurationSeconds: mediaDurationSeconds ?? 0,
         }).catch(() => undefined)
         await markFailed(importId, 'GOOGLE_REAUTH_REQUIRED', 'Google Drive authorization expired. Reconnect the account, then retry.')
+        return null
+      }
+      if (error?.code === 'TELEGRAM_SESSION_INVALID') {
+        await writeResumeMarker(jobDir, {
+          version: 1,
+          mode: 'remux-only',
+          playlistUrl: mimeCodeSuffix === 'mp4' ? sourceUrl : sourceUrl,
+          audioPlaylistUrl: null,
+          container: mimeCodeSuffix,
+          expectAudio: Boolean(record.hlsAudioTrackId || record.sourceType === 'hls_media'),
+          mediaDurationSeconds: mediaDurationSeconds ?? 0,
+        }).catch(() => undefined)
+        await markFailed(importId, 'TELEGRAM_SESSION_INVALID', 'Telegram authorization expired. Reconnect the account, then retry.')
         return null
       }
       const code = error?.code === 'AUTOMATIC_STORAGE_NO_ELIGIBLE_ACCOUNT' ? 'NO_ACCOUNT_WITH_ENOUGH_SPACE' : (error?.code ?? 'IMPORT_FAILED')
@@ -609,6 +647,7 @@ async function processHlsImport(
     logProgress(importId, STAGES.FINISHED, 'hls import completed')
 
     if (account.provider === 's3') syncS3Quota(account.id).catch(() => undefined)
+    else if (account.provider === 'telegram') syncTelegramUsage(account.id).catch(() => undefined)
     else syncGoogleQuota(account.id).catch(() => undefined)
 
     // Success: a convert-only retry just completed — drop the marker so the
@@ -778,6 +817,13 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
     // Auth-only failures keep the local .part so a retry after reconnect can
     // resume at upload instead of re-downloading a possibly multi-GB source.
     if (code === 'GOOGLE_REAUTH_REQUIRED') keepPartForReauth = true
+    // A revoked/expired Telegram MTProto session is a permanent auth failure:
+    // mark the account for reconnect (Settings → Reconnect Telegram) and keep
+    // the part so the retry resumes at upload after reconnecting.
+    if (code === 'TELEGRAM_SESSION_INVALID' && record.connectedAccountId) {
+      await markTelegramReauthRequired(record.connectedAccountId, message).catch(() => undefined)
+      keepPartForReauth = true
+    }
   } finally {
     if (!keepPartForReauth) await removeTempFile(importId)
   }
@@ -822,10 +868,17 @@ async function continueFromPart(
   try {
     placement = await resolveUploadPlacement(userId, folderId, input.record.connectedAccountId, contentLength ?? 0n, undefined, 'remote-import')
   } catch (error: any) {
-    // GOOGLE_REAUTH_REQUIRED must preserve the local output for an
-    // upload-resume retry after the user reconnects — no temp-file deletion.
+    // GOOGLE_REAUTH_REQUIRED / TELEGRAM_SESSION_INVALID must preserve the
+    // local output for an upload-resume retry after the user reconnects —
+    // no temp-file deletion.
     if (error?.code === 'GOOGLE_REAUTH_REQUIRED') {
       await markFailed(importId, 'GOOGLE_REAUTH_REQUIRED', 'Google Drive authorization expired. Reconnect the account, then retry.')
+      const marker = new AppError('__PLACEMENT_REAUTH__', '', 0)
+      ;(marker as { placementFinalized?: boolean }).placementFinalized = true
+      throw marker
+    }
+    if (error?.code === 'TELEGRAM_SESSION_INVALID') {
+      await markFailed(importId, 'TELEGRAM_SESSION_INVALID', 'Telegram authorization expired. Reconnect the account, then retry.')
       const marker = new AppError('__PLACEMENT_REAUTH__', '', 0)
       ;(marker as { placementFinalized?: boolean }).placementFinalized = true
       throw marker
@@ -872,5 +925,6 @@ async function continueFromPart(
 
   // Quota sync (best-effort).
   if (account.provider === 's3') syncS3Quota(account.id).catch(() => undefined)
+  else if (account.provider === 'telegram') syncTelegramUsage(account.id).catch(() => undefined)
   else syncGoogleQuota(account.id).catch(() => undefined)
 }

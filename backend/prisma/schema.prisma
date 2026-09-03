@@ -9,33 +9,35 @@ datasource db {
 }
 
 model User {
-  id                   String               @id @default(uuid()) @db.Char(36)
-  name                 String               @db.VarChar(191)
-  email                String               @unique @db.VarChar(191)
-  passwordHash         String               @map("password_hash") @db.VarChar(255)
-  status               String               @default("active") @db.VarChar(32)
-  createdAt            DateTime             @default(now()) @map("created_at")
-  updatedAt            DateTime             @updatedAt @map("updated_at")
-  sessions             UserSession[]
-  authHandoffs         AuthHandoff[]
-  providerConfigs      ProviderConfig[]
-  oauthStates          OauthState[]
-  connectedAccounts    ConnectedAccount[]
-  s3StorageConfigs     S3StorageConfig[]
-  files                File[]
-  fileShares           FileShare[]
-  filePreviewTokens    FilePreviewToken[]
-  folders              Folder[]
-  uploadSessions       UploadSession[]
-  auditLogs            AuditLog[]
-  workspaceInvitesSent WorkspaceInvite[]    @relation("WorkspaceInvitesSent")
-  uploadRoutingPolicy  UploadRoutingPolicy?
-  apiKeys              ApiKey[]
-  remoteImports        RemoteImport[]
-  syncRuns             SyncRun[]
-  browserDevicePairings BrowserDevicePairing[]
-  browserDevices       BrowserDevice[]
-  capturedResources    CapturedResource[]
+  id                     String                  @id @default(uuid()) @db.Char(36)
+  name                   String                  @db.VarChar(191)
+  email                  String                  @unique @db.VarChar(191)
+  passwordHash           String                  @map("password_hash") @db.VarChar(255)
+  status                 String                  @default("active") @db.VarChar(32)
+  createdAt              DateTime                @default(now()) @map("created_at")
+  updatedAt              DateTime                @updatedAt @map("updated_at")
+  sessions               UserSession[]
+  authHandoffs           AuthHandoff[]
+  providerConfigs        ProviderConfig[]
+  oauthStates            OauthState[]
+  connectedAccounts      ConnectedAccount[]
+  s3StorageConfigs       S3StorageConfig[]
+  telegramStorageConfigs TelegramStorageConfig[]
+  telegramAuthStates     TelegramAuthState[]
+  files                  File[]
+  fileShares             FileShare[]
+  filePreviewTokens      FilePreviewToken[]
+  folders                Folder[]
+  uploadSessions         UploadSession[]
+  auditLogs              AuditLog[]
+  workspaceInvitesSent   WorkspaceInvite[]       @relation("WorkspaceInvitesSent")
+  uploadRoutingPolicy    UploadRoutingPolicy?
+  apiKeys                ApiKey[]
+  remoteImports          RemoteImport[]
+  syncRuns               SyncRun[]
+  browserDevicePairings  BrowserDevicePairing[]
+  browserDevices         BrowserDevice[]
+  capturedResources      CapturedResource[]
 
   @@map("users")
 }
@@ -175,6 +177,7 @@ model ConnectedAccount {
   storageLocations      FolderStorageLocation[]
   uploadSessions        UploadSession[]
   s3StorageConfig       S3StorageConfig?
+  telegramStorageConfig TelegramStorageConfig?
   remoteImports         RemoteImport[]
   syncRuns              SyncRun[]
 
@@ -208,6 +211,44 @@ model S3StorageConfig {
   @@map("s3_storage_configs")
 }
 
+model TelegramStorageConfig {
+  id                 String           @id @default(uuid()) @db.Char(36)
+  userId             String           @map("user_id") @db.Char(36)
+  connectedAccountId String           @unique @map("connected_account_id") @db.Char(36)
+  name               String           @db.VarChar(191)
+  apiIdEncrypted     String           @map("api_id_encrypted") @db.Text
+  apiHashEncrypted   String           @map("api_hash_encrypted") @db.Text
+  sessionEncrypted   String           @map("session_encrypted") @db.Text
+  channelId          String?          @map("channel_id") @db.VarChar(191)
+  channelTitle       String?          @map("channel_title") @db.VarChar(191)
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime         @updatedAt @map("updated_at")
+  user               User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  connectedAccount   ConnectedAccount @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("telegram_storage_configs")
+}
+
+model TelegramAuthState {
+  id                 String   @id @default(uuid()) @db.Char(36)
+  userId             String   @map("user_id") @db.Char(36)
+  connectedAccountId String?  @map("connected_account_id") @db.Char(36)
+  step               String   @default("awaiting_code") @db.VarChar(32)
+  apiIdEncrypted     String   @map("api_id_encrypted") @db.Text
+  apiHashEncrypted   String   @map("api_hash_encrypted") @db.Text
+  phoneEncrypted     String?  @map("phone_encrypted") @db.Text
+  codeHashEncrypted  String?  @map("code_hash_encrypted") @db.Text
+  sessionEncrypted   String   @map("session_encrypted") @db.Text
+  expiresAt          DateTime @map("expires_at")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("telegram_auth_states")
+}
+
 model StorageAccount {
   id                 String           @id @default(uuid()) @db.Char(36)
   connectedAccountId String           @unique @map("connected_account_id") @db.Char(36)
@@ -215,6 +256,7 @@ model StorageAccount {
   usedBytes          BigInt           @default(0) @map("used_bytes")
   availableBytes     BigInt?          @map("available_bytes")
   trashBytes         BigInt?          @map("trash_bytes")
+  fileCount          Int              @default(0) @map("file_count")
   lastSyncedAt       DateTime?        @map("last_synced_at")
   createdAt          DateTime         @default(now()) @map("created_at")
   updatedAt          DateTime         @updatedAt @map("updated_at")
@@ -554,20 +596,20 @@ model BrowserDevicePairing {
 }
 
 model BrowserDevice {
-  id               String             @id @default(uuid()) @db.Char(36)
-  userId           String             @map("user_id") @db.Char(36)
-  name             String             @db.VarChar(191)
-  browser          String             @db.VarChar(64)
-  platform         String             @db.VarChar(64)
-  extensionVersion String?            @map("extension_version") @db.VarChar(32)
+  id                String             @id @default(uuid()) @db.Char(36)
+  userId            String             @map("user_id") @db.Char(36)
+  name              String             @db.VarChar(191)
+  browser           String             @db.VarChar(64)
+  platform          String             @db.VarChar(64)
+  extensionVersion  String?            @map("extension_version") @db.VarChar(32)
   // Hashed device credential — raw token is shown once at registration/rotation.
-  deviceTokenHash  String             @unique @map("device_token_hash") @db.VarChar(255)
-  status           String             @default("active") @db.VarChar(32)
-  lastSeenAt       DateTime?          @map("last_seen_at")
-  revokedAt        DateTime?          @map("revoked_at")
-  createdAt        DateTime           @default(now()) @map("created_at")
-  updatedAt        DateTime           @updatedAt @map("updated_at")
-  user             User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceTokenHash   String             @unique @map("device_token_hash") @db.VarChar(255)
+  status            String             @default("active") @db.VarChar(32)
+  lastSeenAt        DateTime?          @map("last_seen_at")
+  revokedAt         DateTime?          @map("revoked_at")
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
   capturedResources CapturedResource[]
 
   @@index([userId])

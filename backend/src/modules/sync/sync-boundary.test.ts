@@ -306,6 +306,33 @@ describe('sync boundary — provider is READ-ONLY (§29/§70)', () => {
     expect(results.filter((r) => r.status === 'completed')).toHaveLength(1)
   })
 
+  it('Telegram accounts complete as a no-op (no scan, no missing cleanup, no writes)', async () => {
+    // Telegram is flat blob storage with the DB as source of truth: Sync All
+    // must NOT list the channel history or run the missing-reconciler, and it
+    // must never surface SYNC_PROVIDER_UNSUPPORTED.
+    h.ACCOUNTS.push(
+      { id: 'acc-tg', userId: 'u1', provider: 'telegram', status: 'connected' },
+      { id: 'acc-a', userId: 'u1', provider: 'google_drive', status: 'connected' },
+    )
+    installDriveFakes()
+    addFile('acc-a', 'app-root', 'f-a1', 'A1.mp4', '10')
+
+    const { results } = await runSyncAll('u1')
+    const tg = results.find((r) => r.accountId === 'acc-tg')
+    expect(tg!.status).toBe('completed')
+    expect(tg!.stats.filesDiscovered).toBe(0)
+    expect(tg!.stats.filesCreated).toBe(0)
+
+    // No channel history listing (drive fake only knows Google; the telegram
+    // account's run must not have touched it), and the run row is completed.
+    expect(h.db.runs.some((r) => r.connectedAccountId === 'acc-tg' && r.status === 'completed')).toBe(true)
+    // The healthy Google account still reconciled its own tree.
+    expect(h.db.files.length).toBe(1)
+    for (const fn of ['ensureProviderRoot', 'createProviderFolder', 'renameProviderFolder', 'moveProviderFolder', 'deleteProviderFolder'] as const) {
+      expect(h.providerWrites[fn]).not.toHaveBeenCalled()
+    }
+  })
+
   it('full Sync All makes ZERO provider write calls', async () => {
     h.ACCOUNTS.push(
       { id: 'acc-a', userId: 'u1', provider: 'google_drive', status: 'connected' },

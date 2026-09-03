@@ -5,6 +5,8 @@ import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
 import { getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
 import { deleteS3Object, syncS3Quota } from '../s3/s3.service.js'
+import { deleteTelegramDocuments, getTelegramConfig } from '../telegram/telegram.service.js'
+import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
 import { createAuditLog } from '../../utils/audit.js'
 import { deleteProviderFolder, ensureProviderRoot, moveProviderFolder, renameProviderFolder } from '../storage/provider-folder.service.js'
 import { ensureFolderStorageLocation } from '../storage/folder-materialization.service.js'
@@ -278,7 +280,10 @@ folderRouter.delete('/:id', async (req: AuthRequest, res, next) => {
     const syncedAccountIds = new Set<string>()
     for (const file of files) {
       try {
-        if (file.provider === 's3') {
+        if (file.provider === 'telegram') {
+          const config = await getTelegramConfig(file.connectedAccountId, req.user!.id)
+          await deleteTelegramDocuments(config, [file.providerFileId])
+        } else if (file.provider === 's3') {
           await deleteS3Object(file)
         } else {
           const auth = await getAuthedGoogleClient(file.connectedAccount)
@@ -313,6 +318,7 @@ folderRouter.delete('/:id', async (req: AuthRequest, res, next) => {
     for (const accountId of syncedAccountIds) {
       const account = await prisma.connectedAccount.findUnique({ where: { id: accountId } })
       if (account?.provider === 's3') await syncS3Quota(accountId).catch(() => undefined)
+      else if (account?.provider === 'telegram') await syncTelegramUsage(accountId).catch(() => undefined)
       else await syncGoogleQuota(accountId).catch(() => undefined)
     }
 

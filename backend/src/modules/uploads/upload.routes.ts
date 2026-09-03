@@ -1,6 +1,9 @@
 import Busboy from 'busboy'
 import type { NextFunction, Response } from 'express'
 import { Router } from 'express'
+import { createReadStream, createWriteStream } from 'fs'
+import { mkdir, stat, unlink } from 'fs/promises'
+import path from 'path'
 import { Readable } from 'stream'
 import { z } from 'zod'
 import { google } from 'googleapis'
@@ -9,6 +12,8 @@ import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
 import { getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
 import { buildS3ObjectKey, getS3ConfigForAccount, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
+import { getTelegramConfig, uploadTelegramDocument } from '../telegram/telegram.service.js'
+import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
 import { createAuditLog } from '../../utils/audit.js'
 import { planBatchUploads } from './storage-routing.service.js'
 import { resolveUploadPlacement } from '../storage/upload-placement.service.js'
@@ -31,11 +36,132 @@ function folderPrefixFor(config: { prefix: string }, providerFolderId: string) {
   return providerFolderId
 }
 
-function syncQuotaInBackground(accountId: string, sessionId: string) {
+/** Resolve the physical destination prefix/root for a non-Google provider. */
+async function resolveProviderRootOrLocation(userId: string, folderId: string | null, account: { id: string; provider: string }) {
+  if (folderId) {
+    const location = await prisma.folderStorageLocation.findFirst({
+      where: { folderId, connectedAccountId: account.id },
+    })
+    if (location) return location.providerFolderId
+    const { ensureFolderStorageLocation } = await import('../storage/folder-materialization.service.js')
+    const result = await ensureFolderStorageLocation(userId, folderId, account.id)
+    return result.location.providerFolderId
+  }
+  const { ensureProviderRoot } = await import('../storage/provider-folder.service.js')
+  return ensureProviderRoot(account as never)
+}
+
+/**
+ * Finalize a staged non-Google resumable upload (S3 or Telegram) into a
+ * provider object + an active File row. The temp file is committed only after
+ * the provider upload succeeds; provisional rows are soft-deleted on failure.
+ */
+async function finalizeNonGoogleUpload(opts: {
+  userId: string
+  account: { id: string; provider: string }
+  folderId: string | null
+  fileName: string
+  mimeType: string
+  sizeBytes: bigint
+  tmpPath: string
+}) {
+  const { userId, account, folderId, fileName, mimeType, sizeBytes, tmpPath } = opts
+  const providerFolderId = await resolveProviderRootOrLocation(userId, folderId, account)
+
+  if (account.provider === 's3') {
+    const config = await getS3ConfigForAccount(account.id, userId)
+    const provisionalFile = await prisma.file.create({
+      data: { userId, connectedAccountId: account.id, folderId, provider: 's3', providerFileId: 'pending', name: fileName, mimeType, sizeBytes, status: 'uploading' },
+    })
+    try {
+      const key = buildS3ObjectKey(config, userId, provisionalFile.id, fileName, folderId ? folderPrefixFor(config, providerFolderId) : undefined)
+      await uploadS3Object(config, key, createReadStream(tmpPath), mimeType)
+      return await prisma.file.update({ where: { id: provisionalFile.id }, data: { providerFileId: key, status: 'active' } })
+    } catch (error) {
+      await prisma.file.update({ where: { id: provisionalFile.id }, data: { status: 'deleted', deletedAt: new Date() } }).catch(() => undefined)
+      throw error
+    }
+  }
+
+  if (account.provider === 'telegram') {
+    const config = await getTelegramConfig(account.id, userId)
+    const provisionalFile = await prisma.file.create({
+      data: { userId, connectedAccountId: account.id, folderId, provider: 'telegram', providerFileId: 'pending', name: fileName, mimeType, sizeBytes, status: 'uploading' },
+    })
+    try {
+      const remoteId = await uploadTelegramDocument(config, { filePath: tmpPath, name: fileName, mimeType, sizeBytes: Number(sizeBytes) })
+      return await prisma.file.update({ where: { id: provisionalFile.id }, data: { providerFileId: remoteId, status: 'active' } })
+    } catch (error) {
+      await prisma.file.update({ where: { id: provisionalFile.id }, data: { status: 'deleted', deletedAt: new Date() } }).catch(() => undefined)
+      throw error
+    }
+  }
+
+  throw new Error(`finalizeNonGoogleUpload called for unsupported provider "${account.provider}"`)
+}
+
+function syncQuotaInBackground(accountId: string, sessionId: string, provider?: string) {
   logUpload('quota sync started', { accountId, sessionId })
-  syncGoogleQuota(accountId)
+  const sync = provider === 's3'
+    ? syncS3Quota(accountId)
+    : provider === 'telegram'
+      ? syncTelegramUsage(accountId)
+      : syncGoogleQuota(accountId)
+  sync
     .then(() => logUpload('quota sync completed', { accountId, sessionId }))
     .catch((error) => logUpload('quota sync failed', { accountId, sessionId, message: error instanceof Error ? error.message : 'Unknown error' }))
+}
+
+/**
+ * Non-Google (S3 / Telegram) uploads stage chunks to a temp file during the
+ * resumable flow, then commit to the provider at completion. The temp file
+ * lives under `UPLOAD_TEMP_DIR`, keyed by the upload session id.
+ */
+
+/** Path of the staged temp file for a non-Google resumable upload session. */
+function tempUploadPath(sessionId: string) {
+  return path.join(env.UPLOAD_TEMP_DIR, `${sessionId}.part`)
+}
+
+/** Bytes staged so far for a non-Google resumable upload (0 when absent). */
+async function stagedBytes(sessionId: string): Promise<bigint> {
+  try {
+    const info = await stat(tempUploadPath(sessionId))
+    return BigInt(info.size)
+  } catch {
+    return 0n
+  }
+}
+
+/** Append an incoming chunk stream to the session's staged temp file. */
+async function appendChunk(sessionId: string, stream: NodeJS.ReadableStream): Promise<void> {
+  await mkdir(env.UPLOAD_TEMP_DIR, { recursive: true })
+  const filePath = tempUploadPath(sessionId)
+  await new Promise<void>((resolve, reject) => {
+    const out = createWriteStream(filePath, { flags: 'a' })
+    stream.pipe(out)
+    out.on('finish', resolve)
+    out.on('error', reject)
+    stream.on('error', reject)
+  })
+}
+
+/** Delete a session's staged temp file (best-effort). */
+async function removeStagedFile(sessionId: string) {
+  await unlink(tempUploadPath(sessionId)).catch(() => undefined)
+}
+
+/** Write a fully-buffered multipart file to a temp path (Telegram upload source). */
+async function writeBufferToTemp(sessionId: string, buffer: Buffer): Promise<string> {
+  await mkdir(env.UPLOAD_TEMP_DIR, { recursive: true })
+  const filePath = path.join(env.UPLOAD_TEMP_DIR, `${sessionId}.multi`)
+  await new Promise<void>((resolve, reject) => {
+    const out = createWriteStream(filePath)
+    out.on('finish', resolve)
+    out.on('error', reject)
+    out.end(buffer)
+  })
+  return filePath
 }
 
 export async function handleUpload(req: AuthRequest, res: Response, next: NextFunction) {
@@ -122,64 +248,87 @@ export async function handleUpload(req: AuthRequest, res: Response, next: NextFu
         const streamedBytes = BigInt(fileBuffer.length)
 
         let providerFileId = ''
-        let s3FileId: string | null = null
+        let uploadedFileId: string | null = null
         let uploadedName = fileName
         let uploadedMimeType = meta.mimeType
-        if (account.provider === 's3') {
-          const config = await getS3ConfigForAccount(account.id, req.user!.id)
-          const provisionalFile = await prisma.file.create({
-            data: { userId: req.user!.id, connectedAccountId: account.id, folderId, provider: 's3', providerFileId: 'pending', name: fileName, mimeType: meta.mimeType, sizeBytes: meta.sizeBytes, status: 'uploading' },
-          })
-          s3FileId = provisionalFile.id
-          providerFileId = buildS3ObjectKey(config, req.user!.id, provisionalFile.id, fileName, folderId ? folderPrefixFor(config, placement.folderStorageLocation.providerFolderId) : undefined)
-          await uploadS3Object(config, providerFileId, Readable.from(fileBuffer), meta.mimeType)
-          await prisma.file.update({ where: { id: provisionalFile.id }, data: { providerFileId, status: 'active' } })
-          completed.push({ ...provisionalFile, providerFileId, status: 'active', sizeBytes: provisionalFile.sizeBytes.toString() })
-          logUpload('s3 upload completed', { sessionId: session.id, accountId: account.id, fileName })
-        } else {
-          const auth = await getAuthedGoogleClient(account)
-          const drive = google.drive({ version: 'v3', auth })
-          const targetParentId = resolveUploadParent(account, placement.folderStorageLocation)
-          const uploaded = await drive.files.create({
-            requestBody: { name: fileName, parents: [targetParentId] },
-            media: { mimeType: meta.mimeType, body: Readable.from(fileBuffer) },
-            fields: 'id,name,mimeType,size',
-          })
-          providerFileId = uploaded.data.id ?? ''
-          uploadedName = uploaded.data.name ?? fileName
-          uploadedMimeType = uploaded.data.mimeType ?? meta.mimeType
-          logUpload('google upload completed', { sessionId: session.id, accountId: account.id, fileName })
-
-          // Make the file public (anyone with link can edit/download)
-          try {
-            await drive.permissions.create({
-              fileId: providerFileId,
-              requestBody: {
-                role: 'writer',
-                type: 'anyone'
-              }
+        let tmpFilePath: string | null = null
+        try {
+          if (account.provider === 's3') {
+            const config = await getS3ConfigForAccount(account.id, req.user!.id)
+            const provisionalFile = await prisma.file.create({
+              data: { userId: req.user!.id, connectedAccountId: account.id, folderId, provider: 's3', providerFileId: 'pending', name: fileName, mimeType: meta.mimeType, sizeBytes: meta.sizeBytes, status: 'uploading' },
             })
-            logUpload('google file permissions set to public writer', { sessionId: session.id, providerFileId })
-          } catch (err: any) {
-            console.error('Failed to make Google Drive file public:', err.message || err)
+            uploadedFileId = provisionalFile.id
+            providerFileId = buildS3ObjectKey(config, req.user!.id, provisionalFile.id, fileName, folderId ? folderPrefixFor(config, placement.folderStorageLocation.providerFolderId) : undefined)
+            await uploadS3Object(config, providerFileId, Readable.from(fileBuffer), meta.mimeType)
+            await prisma.file.update({ where: { id: provisionalFile.id }, data: { providerFileId, status: 'active' } })
+            logUpload('s3 upload completed', { sessionId: session.id, accountId: account.id, fileName })
+          } else if (account.provider === 'telegram') {
+            tmpFilePath = await writeBufferToTemp(session.id, fileBuffer)
+            const uploadedFile = await finalizeNonGoogleUpload({
+              userId: req.user!.id,
+              account,
+              folderId,
+              fileName,
+              mimeType: meta.mimeType,
+              sizeBytes: meta.sizeBytes,
+              tmpPath: tmpFilePath,
+            })
+            uploadedFileId = uploadedFile.id
+            logUpload('telegram upload completed', { sessionId: session.id, accountId: account.id, fileName })
+          } else {
+            const auth = await getAuthedGoogleClient(account)
+            const drive = google.drive({ version: 'v3', auth })
+            const targetParentId = resolveUploadParent(account, placement.folderStorageLocation)
+            const uploaded = await drive.files.create({
+              requestBody: { name: fileName, parents: [targetParentId] },
+              media: { mimeType: meta.mimeType, body: Readable.from(fileBuffer) },
+              fields: 'id,name,mimeType,size',
+            })
+            providerFileId = uploaded.data.id ?? ''
+            uploadedName = uploaded.data.name ?? fileName
+            uploadedMimeType = uploaded.data.mimeType ?? meta.mimeType
+            logUpload('google upload completed', { sessionId: session.id, accountId: account.id, fileName })
+
+            // Make the file public (anyone with link can edit/download)
+            try {
+              await drive.permissions.create({
+                fileId: providerFileId,
+                requestBody: {
+                  role: 'writer',
+                  type: 'anyone'
+                }
+              })
+              logUpload('google file permissions set to public writer', { sessionId: session.id, providerFileId })
+            } catch (err: any) {
+              console.error('Failed to make Google Drive file public:', err.message || err)
+            }
           }
+        } finally {
+          if (tmpFilePath) await unlink(tmpFilePath).catch(() => undefined)
         }
 
         if (streamedBytes !== meta.sizeBytes) {
-          if (s3FileId) await prisma.file.update({ where: { id: s3FileId }, data: { status: 'deleted', deletedAt: new Date() } }).catch(() => undefined)
+          if (uploadedFileId) await prisma.file.update({ where: { id: uploadedFileId }, data: { status: 'deleted', deletedAt: new Date() } }).catch(() => undefined)
           await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'failed', errorMessage: 'Streamed byte count did not match declared size.' } })
           failed.push({ fileName, code: 'UPLOAD_SIZE_MISMATCH', message: 'Streamed byte count did not match declared size.' })
           return
         }
 
-        const file = account.provider === 's3' ? null : await prisma.file.create({ data: { userId: req.user!.id, connectedAccountId: account.id, folderId, provider: 'google_drive', providerFileId, name: uploadedName, mimeType: uploadedMimeType, sizeBytes: meta.sizeBytes } })
+        // Google creates its DB row after a successful provider upload; the S3
+        // and Telegram rows were created provisionally inside the branch above
+        // and flipped to `active` by the provider write.
+        const file = account.provider === 'google_drive'
+          ? await prisma.file.create({ data: { userId: req.user!.id, connectedAccountId: account.id, folderId, provider: 'google_drive', providerFileId, name: uploadedName, mimeType: uploadedMimeType, sizeBytes: meta.sizeBytes } })
+          : uploadedFileId
+            ? await prisma.file.findUniqueOrThrow({ where: { id: uploadedFileId } })
+            : null
         if (file) {
           logUpload('database file created', { sessionId: session.id, fileId: file.id, accountId: account.id })
           completed.push({ ...file, sizeBytes: file.sizeBytes.toString() })
         }
         await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'completed', completedAt: new Date() } })
-        if (account.provider === 's3') syncS3Quota(account.id).catch(() => undefined)
-        else syncQuotaInBackground(account.id, session.id)
+        syncQuotaInBackground(account.id, session.id, account.provider)
       } catch (error) {
         fileStream.resume()
         logUpload('file upload failed', { fileName, message: error instanceof Error ? error.message : 'Upload failed' })
@@ -372,13 +521,24 @@ uploadRouter.get('/resumable/status/:id', requireAuth, async (req: AuthRequest, 
       return res.json({ status: 'completed', offset: session.sizeBytes.toString() })
     }
 
-    if (!session.googleSessionUri || !session.targetConnectedAccountId) {
+    if (!session.targetConnectedAccountId) {
       return res.json({ status: 'uploading', offset: '0' })
     }
 
     const account = await prisma.connectedAccount.findFirstOrThrow({
       where: { id: session.targetConnectedAccountId, userId: req.user!.id }
     })
+
+    // Non-Google (S3 / Telegram): uploads stage to a temp file; the staged
+    // byte count IS the resumable offset.
+    if (account.provider !== 'google_drive') {
+      return res.json({ status: 'uploading', offset: (await stagedBytes(session.id)).toString() })
+    }
+
+    if (!session.googleSessionUri) {
+      return res.json({ status: 'uploading', offset: '0' })
+    }
+
     const auth = await getAuthedGoogleClient(account)
     const token = await auth.getAccessToken()
 
@@ -430,13 +590,71 @@ uploadRouter.put('/resumable/chunk/:id', requireAuth, async (req: AuthRequest, r
     const endByte = BigInt(match[2])
     const totalBytes = BigInt(match[3])
 
-    if (!session.googleSessionUri || !session.targetConnectedAccountId) {
-      return res.status(400).json({ code: 'UNSUPPORTED_PROVIDER', message: 'Only Google Drive resumable uploads supported.' })
+    if (!session.targetConnectedAccountId) {
+      return res.status(400).json({ code: 'UNSUPPORTED_PROVIDER', message: 'No target account for this upload session.' })
     }
 
     const account = await prisma.connectedAccount.findFirstOrThrow({
       where: { id: session.targetConnectedAccountId, userId: req.user!.id }
     })
+
+    // ── Non-Google (S3 / Telegram): stage the chunk to a temp file and commit
+    // to the provider when the final byte arrives. ───────────────────────────
+    if (account.provider !== 'google_drive') {
+      const stagedBefore = await stagedBytes(session.id)
+      if (stagedBefore > startByte) {
+        // Idempotent ack: the chunk is already staged (the client retried after
+        // a lost response). Report the offset without re-appending.
+        return res.json({ status: 'uploading', offset: stagedBefore.toString() })
+      }
+      if (stagedBefore < startByte) {
+        await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'failed', errorMessage: 'Chunk range starts past the staged offset.' } }).catch(() => undefined)
+        await removeStagedFile(session.id)
+        return res.status(409).json({ code: 'UPLOAD_OFFSET_MISMATCH', message: 'The staged file is behind the requested chunk range. Restart the upload.' })
+      }
+
+      await appendChunk(session.id, req)
+      const stagedAfter = await stagedBytes(session.id)
+      if (stagedAfter !== endByte + 1n) {
+        await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'failed', errorMessage: 'Staged byte count did not match the chunk range.' } }).catch(() => undefined)
+        await removeStagedFile(session.id)
+        return res.status(400).json({ code: 'UPLOAD_SIZE_MISMATCH', message: 'Staged byte count did not match the chunk range.' })
+      }
+
+      if (endByte + 1n < totalBytes) {
+        return res.json({ status: 'uploading', offset: (endByte + 1n).toString() })
+      }
+
+      // Final chunk — commit the staged file to the provider.
+      let uploadedFile
+      try {
+        uploadedFile = await finalizeNonGoogleUpload({
+          userId: req.user!.id,
+          account,
+          folderId: session.folderId,
+          fileName: session.fileName,
+          mimeType: session.mimeType,
+          sizeBytes: totalBytes,
+          tmpPath: tempUploadPath(session.id),
+        })
+      } catch (error: any) {
+        await removeStagedFile(session.id)
+        await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'failed', errorMessage: error?.message ?? 'Provider upload failed.' } }).catch(() => undefined)
+        logUpload('non-google resumable finalize failed', { sessionId: session.id, accountId: account.id, message: error?.message ?? 'Unknown error' })
+        return res.status(502).json({ code: 'UPLOAD_FAILED', message: error?.message ?? 'Provider upload failed.' })
+      }
+      await removeStagedFile(session.id)
+      await prisma.uploadSession.update({ where: { id: session.id }, data: { status: 'completed', completedAt: new Date() } })
+      await createAuditLog(req.user!.id, 'UPLOAD_FILE', 'file', uploadedFile.id, { name: uploadedFile.name, size: uploadedFile.sizeBytes.toString() })
+      syncQuotaInBackground(account.id, session.id, account.provider)
+      logUpload('non-google resumable upload completed', { sessionId: session.id, accountId: account.id, fileName: uploadedFile.name })
+      return res.status(201).json({ status: 'completed', file: { ...uploadedFile, sizeBytes: uploadedFile.sizeBytes.toString() } })
+    }
+
+    if (!session.googleSessionUri) {
+      return res.status(400).json({ code: 'UNSUPPORTED_PROVIDER', message: 'Only Google Drive resumable uploads are supported for this session.' })
+    }
+
     const auth = await getAuthedGoogleClient(account)
     const drive = google.drive({ version: 'v3', auth })
     const token = await auth.getAccessToken()
@@ -501,7 +719,7 @@ uploadRouter.put('/resumable/chunk/:id', requireAuth, async (req: AuthRequest, r
 
       await createAuditLog(req.user!.id, 'UPLOAD_FILE', 'file', existingFile.id, { name: existingFile.name, size: existingFile.sizeBytes.toString() })
 
-      syncQuotaInBackground(account.id, session.id)
+      syncQuotaInBackground(account.id, session.id, account.provider)
 
       return res.status(201).json({ status: 'completed', file: { ...existingFile, sizeBytes: existingFile.sizeBytes.toString() } })
     }

@@ -56,6 +56,11 @@ services:
       SMB_ENABLED: ${SMB_ENABLED:-false}
       SMB_CONFIG_PATH: ${SMB_CONFIG_PATH:-}
       SMB_ALLOWED_ROOT: ${SMB_ALLOWED_ROOT:-}
+      # Telegram Drive storage provider (MTProto)
+      TELEGRAM_MAX_FILE_BYTES: ${TELEGRAM_MAX_FILE_BYTES:-2147483648}
+      TELEGRAM_STORAGE_CHANNEL: ${TELEGRAM_STORAGE_CHANNEL:-9drive}
+      # Temp staging dir for chunked (non-Google) resumable uploads
+      UPLOAD_TEMP_DIR: /data/upload-tmp
       # Remote Import — queue + temp staging
       REDIS_URL: redis://redis:6379
       REMOTE_IMPORT_ENABLED: ${REMOTE_IMPORT_ENABLED:-true}
@@ -99,6 +104,7 @@ services:
       REMOTE_IMPORT_REQUEST_CONTEXT_COOKIE_SCOPE: ${REMOTE_IMPORT_REQUEST_CONTEXT_COOKIE_SCOPE:-source-host}
     volumes:
       - remote_import_tmp:/data/remote-import-tmp
+      - upload_tmp:/data/upload-tmp
     ports:
       - "4000:4000"
 
@@ -129,6 +135,9 @@ services:
       SMB_ENABLED: ${SMB_ENABLED:-false}
       SMB_CONFIG_PATH: ${SMB_CONFIG_PATH:-}
       SMB_ALLOWED_ROOT: ${SMB_ALLOWED_ROOT:-}
+      # Telegram Drive storage provider (MTProto) — placement runs in the worker
+      TELEGRAM_MAX_FILE_BYTES: ${TELEGRAM_MAX_FILE_BYTES:-2147483648}
+      TELEGRAM_STORAGE_CHANNEL: ${TELEGRAM_STORAGE_CHANNEL:-9drive}
       # Remote Import — same queue as the API, temp staging shared with backend
       REDIS_URL: redis://redis:6379
       REMOTE_IMPORT_ENABLED: ${REMOTE_IMPORT_ENABLED:-true}
@@ -189,3 +198,4 @@ services:
 volumes:
   mysql_data:
   remote_import_tmp:
+  upload_tmp:

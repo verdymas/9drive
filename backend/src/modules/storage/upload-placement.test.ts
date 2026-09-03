@@ -8,7 +8,7 @@ import { resolveUploadPlacement, rerouteOrFail } from './upload-placement.servic
 // materialization is mocked to return a canned location.
 const h = vi.hoisted(() => {
   const now = new Date('2026-08-07T00:00:00.000Z')
-  const account = (id: string, provider: string, availableBytes: bigint | null, autoAllocationEnabled = true, status = 'connected') => ({
+  const account = (id: string, provider: string, availableBytes: bigint | null, autoAllocationEnabled = true, status = 'connected', telegramChannelId: string | null = null) => ({
     id,
     userId: 'user-1',
     providerConfigId: null,
@@ -28,6 +28,7 @@ const h = vi.hoisted(() => {
     lastAuthErrorCode: status === 'reauth_required' ? 'GOOGLE_OAUTH_INVALID_GRANT' : null,
     createdAt: now,
     updatedAt: now,
+    telegramStorageConfig: telegramChannelId ? { connectedAccountId: id, channelId: telegramChannelId, channelTitle: `Channel ${telegramChannelId}`, createdAt: now, updatedAt: now } : null,
     storageAccount: {
       id: `sa-${id}`,
       connectedAccountId: id,
@@ -66,6 +67,12 @@ const h = vi.hoisted(() => {
     folderStorageLocation: {
       findMany: vi.fn(async ({ where }: { where: { folderId?: string } }) => {
         return locations.filter((l) => !where.folderId || l.folderId === where.folderId)
+      }),
+    },
+    telegramStorageConfig: {
+      findFirst: vi.fn(async ({ where }: { where: { connectedAccountId?: string } }) => {
+        const match = accounts.find((a) => a.id === where.connectedAccountId)
+        return match?.telegramStorageConfig ?? null
       }),
     },
   }
@@ -265,6 +272,32 @@ describe('resolveUploadPlacement — Manual (authoritative)', () => {
     expect(ensureFolderStorageLocation).not.toHaveBeenCalled()
     // Even the soft-pin fallback route must NOT select a reauth account.
     await expect(resolveUploadPlacement('user-1', 'movies', 'acc-a', 5n, undefined, 'multipart')).rejects.toMatchObject({ code: 'GOOGLE_REAUTH_REQUIRED' })
+  })
+
+  it('manual pin on a Telegram account rejects a file over the document cap with TELEGRAM_FILE_TOO_LARGE', async () => {
+    h.accounts.push(h.account('acc-tg', 'telegram', null, true, 'connected', 'chan-tg'))
+    const overCap = BigInt(3 * 1024 * 1024 * 1024) // > TELEGRAM_MAX_FILE_BYTES (2 GiB)
+    await expect(resolveUploadPlacement('user-1', 'movies', 'acc-tg', overCap, undefined, 'multipart')).rejects.toMatchObject({ code: 'TELEGRAM_FILE_TOO_LARGE' })
+    expect(ensureFolderStorageLocation).not.toHaveBeenCalled()
+  })
+
+  it('manual pin on a Telegram account without a storage channel fails fast with TELEGRAM_STORAGE_TARGET_NOT_CONFIGURED', async () => {
+    h.accounts.push(h.account('acc-tg', 'telegram', null))
+    await expect(resolveUploadPlacement('user-1', 'movies', 'acc-tg', 5n, undefined, 'multipart')).rejects.toMatchObject({ code: 'TELEGRAM_STORAGE_TARGET_NOT_CONFIGURED' })
+    expect(ensureFolderStorageLocation).not.toHaveBeenCalled()
+  })
+
+  it('manual pin on a Telegram account with a revoked session fails fast with TELEGRAM_SESSION_INVALID', async () => {
+    h.accounts.push(h.account('acc-tg', 'telegram', null, true, 'reauth_required', 'chan-tg'))
+    await expect(resolveUploadPlacement('user-1', 'movies', 'acc-tg', 5n, undefined, 'multipart')).rejects.toMatchObject({ code: 'TELEGRAM_SESSION_INVALID' })
+    expect(ensureFolderStorageLocation).not.toHaveBeenCalled()
+  })
+
+  it('manual pin on a Telegram account WITH a configured channel proceeds to materialization', async () => {
+    h.accounts.push(h.account('acc-tg', 'telegram', null, true, 'connected', 'chan-tg'))
+    const placement = await resolveUploadPlacement('user-1', 'movies', 'acc-tg', 5n, undefined, 'multipart')
+    expect(placement.connectedAccount.id).toBe('acc-tg')
+    expect(ensureFolderStorageLocation).toHaveBeenCalledWith('user-1', 'movies', 'acc-tg')
   })
 })
 

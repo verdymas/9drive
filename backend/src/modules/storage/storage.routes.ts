@@ -30,8 +30,12 @@ async function getOrCreateRoutingPolicy(userId: string) {
 
 storageRouter.get('/summary', async (req: AuthRequest, res, next) => {
   try {
-    const accounts = await prisma.connectedAccount.findMany({ where: { userId: req.user!.id, status: 'connected' }, include: { storageAccount: true } })
-    const summary = accounts.reduce((acc, account) => {
+    const accounts = await prisma.connectedAccount.findMany({ where: { userId: req.user!.id, status: 'connected' }, include: { storageAccount: true, telegramStorageConfig: { select: { channelId: true } } } })
+    // Telegram accounts without a configured storage channel are excluded from
+    // the summary: they cannot store yet, so counting them would inflate
+    // "available" space and confuse routing expectations.
+    const storables = accounts.filter((account) => account.provider !== 'telegram' || Boolean(account.telegramStorageConfig?.channelId))
+    const summary = storables.reduce((acc, account) => {
       const storage = account.storageAccount
       acc.totalBytes += storage?.totalBytes ?? 0n
       acc.usedBytes += storage?.usedBytes ?? 0n
@@ -43,7 +47,7 @@ storageRouter.get('/summary', async (req: AuthRequest, res, next) => {
       totalBytes: summary.totalBytes.toString(),
       usedBytes: summary.usedBytes.toString(),
       availableBytes: summary.availableBytes.toString(),
-      accounts: accounts.map((account) => ({
+      accounts: storables.map((account) => ({
         id: account.id,
         provider: account.provider,
         email: account.email,

@@ -1,4 +1,5 @@
 import type { ConnectedAccount } from '@prisma/client'
+import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { AppError } from '../../utils/app-error.js'
 import { selectAccount } from '../uploads/storage-routing.service.js'
@@ -67,9 +68,24 @@ export async function resolveUploadPlacement(
     // A manual pin may bypass Auto Allocation OFF but never broken
     // authentication — reauth accounts fail fast with a reconnect action.
     if (account.status === 'reauth_required') {
-      throw new AppError('GOOGLE_REAUTH_REQUIRED', 'This Google Drive account needs to be reconnected before it can be used.', 401)
+      if (account.provider === 'telegram') {
+        throw new AppError('TELEGRAM_SESSION_INVALID', 'This Telegram account needs to be reconnected before it can be used.', 401)
+      }
+      const providerName = account.provider === 's3' ? 'S3' : 'Google Drive'
+      throw new AppError('GOOGLE_REAUTH_REQUIRED', `This ${providerName} account needs to be reconnected before it can be used.`, 401)
     }
     await assertSufficientQuota(account, sizeBytes, reservedBytesByAccount)
+    if (account.provider === 'telegram' && sizeBytes > env.TELEGRAM_MAX_FILE_BYTES) {
+      throw new AppError('TELEGRAM_FILE_TOO_LARGE', `Telegram accepts documents up to ${env.TELEGRAM_MAX_FILE_BYTES} bytes.`, 400)
+    }
+    // A manual pin cannot select a Telegram account that has no storage
+    // channel yet — fail fast instead of failing mid-upload.
+    if (account.provider === 'telegram') {
+      const config = await prisma.telegramStorageConfig.findFirst({ where: { connectedAccountId: account.id }, select: { channelId: true } })
+      if (!config?.channelId) {
+        throw new AppError('TELEGRAM_STORAGE_TARGET_NOT_CONFIGURED', 'No Telegram storage channel is configured for this account. Create or select a storage channel first.', 409)
+      }
+    }
     const placement = await materializeFor(userId, virtualFolderId, account, mode, 'manual')
     return placement
   }
@@ -81,7 +97,7 @@ export async function resolveUploadPlacement(
   // full" — the latter still surfaces as AUTOMATIC_STORAGE_NO_ELIGIBLE_ACCOUNT
   // from `selectAccount` below.
   const anyAllocationEnabled = await prisma.connectedAccount.findFirst({
-    where: { userId, provider: { in: ['google_drive', 's3'] }, status: { in: ['connected', 'reauth_required'] }, autoAllocationEnabled: true },
+    where: { userId, provider: { in: ['google_drive', 's3', 'telegram'] }, status: { in: ['connected', 'reauth_required'] }, autoAllocationEnabled: true },
     select: { id: true },
   })
   if (!anyAllocationEnabled) {

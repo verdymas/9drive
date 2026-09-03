@@ -1,39 +1,43 @@
 import { useEffect, useState } from 'react'
-import { CheckCircle, Cloud, Database, Filter, Gauge, Link2, RefreshCw } from 'lucide-react'
+import { CheckCircle, Cloud, Database, Filter, Gauge, Link2, RefreshCw, Send } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/drive/PageHeader'
 import { apiFetch, formatBytes } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { isReauthRequired, REAUTH_MESSAGE } from '@/lib/connectedAccounts'
+import { isReauthRequired, isStorageReady, reauthMessage } from '@/lib/connectedAccounts'
 
 type StorageSummary = { totalBytes: string; usedBytes: string; availableBytes: string }
-type ConnectedAccount = { id: string; email: string; displayName?: string | null; provider: string; status: string; autoAllocationEnabled: boolean; storageAccount?: { totalBytes: string | null; usedBytes: string; availableBytes: string | null; lastSyncedAt: string | null } | null }
+type ConnectedAccount = { id: string; email: string; displayName?: string | null; provider: string; status: string; autoAllocationEnabled: boolean; storageAccount?: { totalBytes: string | null; usedBytes: string; availableBytes: string | null; fileCount?: number | null; lastSyncedAt: string | null } | null; telegram?: { channelId: string; channelTitle: string | null } | null }
 type RoutingMode = 'most_available' | 'round_robin' | 'priority'
 type RoutingPolicy = { mode: RoutingMode; priorityAccountIds: string[]; roundRobinCursor: number }
 
 function providerLabel(provider: string) {
   if (provider === 's3') return 'S3 Storage'
+  if (provider === 'telegram') return 'Telegram Drive'
   return 'Google Drive'
 }
 
 function ProviderIcon({ provider }: { provider: string }) {
-  const Icon = provider === 's3' ? Database : Cloud
+  const Icon = provider === 's3' ? Database : provider === 'telegram' ? Send : Cloud
   return <Icon className="h-6 w-6" />
 }
 
 function storageLimitLabel(account: ConnectedAccount) {
+  if (account.provider === 'telegram') return '—'
   if (account.provider === 's3' && account.storageAccount?.totalBytes === null) return 'Unlimited'
   return formatBytes(account.storageAccount?.totalBytes)
 }
 
 function availableLabel(account: ConnectedAccount) {
+  if (account.provider === 'telegram') return '—'
   if (account.provider === 's3' && account.storageAccount?.availableBytes === null) return 'Unlimited'
   return formatBytes(account.storageAccount?.availableBytes)
 }
 
 function pct(account: ConnectedAccount) {
+  if (account.provider === 'telegram') return null
   const total = Number(account.storageAccount?.totalBytes ?? 0)
   const used = Number(account.storageAccount?.usedBytes ?? 0)
   return total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0
@@ -63,7 +67,7 @@ export function QuotaTrackerPage() {
       apiFetch<{ policy: RoutingPolicy }>('/storage/routing-policy'),
     ])
     setSummary(summaryData)
-    setAccounts(accountData.accounts)
+    setAccounts(accountData.accounts.filter((account) => isStorageReady(account)))
     setRoutingPolicy(policyData.policy)
   }
 
@@ -236,36 +240,52 @@ export function QuotaTrackerPage() {
           </Card>
         ) : accounts.map((account) => {
           const percent = pct(account)
-          const color = statusColor(percent)
+          const color = statusColor(percent ?? 0)
           const reauth = isReauthRequired(account)
+          const isTelegram = account.provider === 'telegram'
           return (
             <Card key={account.id} className="overflow-hidden p-5">
               <div className="flex items-start justify-between gap-4">
                 <div className="flex items-center gap-3">
                   <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-600 text-white"><ProviderIcon provider={account.provider} /></div>
-                  <div><h2 className="font-extrabold">{providerLabel(account.provider)}</h2><p className="text-sm text-slate-500">{account.email}</p></div>
+                  <div><h2 className="font-extrabold">{providerLabel(account.provider)}</h2><p className="text-sm text-slate-500">{account.displayName || account.email}</p></div>
                 </div>
                 <div className="flex items-center gap-2">
-                  {reauth ? <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700" title={REAUTH_MESSAGE}>Reconnection Required</span> : null}
+                  {reauth ? <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700" title={reauthMessage(account)}>Reconnection Required</span> : null}
                   {!account.autoAllocationEnabled ? <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500" title="Excluded from Automatic storage allocation. Existing files and Sync are not affected.">Allocation Disabled</span> : null}
                   <Button variant="outline" size="icon" onClick={() => sync(account.id)} disabled={syncingAccountId === account.id}><RefreshCw className={syncingAccountId === account.id ? 'h-5 w-5 animate-spin' : 'h-5 w-5'} /></Button>
                 </div>
               </div>
               {reauth ? (
                 <div className="mt-3 rounded-xl bg-amber-50 p-3 text-xs text-amber-800">
-                  <p>{REAUTH_MESSAGE}</p>
+                  <p>{reauthMessage(account)}</p>
                   <Button size="sm" variant="soft" className="mt-2" onClick={() => reconnectDrive(account.id)} disabled={reconnectingAccountId === account.id}>
-                    <Link2 className="h-4 w-4" />{reconnectingAccountId === account.id ? 'Opening...' : 'Reconnect Google Drive'}
+                    <Link2 className="h-4 w-4" />{reconnectingAccountId === account.id ? 'Opening...' : isTelegram ? 'Reconnect Telegram' : 'Reconnect Google Drive'}
                   </Button>
                 </div>
               ) : null}
               <div className="mt-4 grid gap-3">
-                <div className="mb-1 flex items-center justify-between text-sm">
-                  <span className="flex items-center gap-2 font-semibold"><span className={cn('h-3 w-3 rounded-full', color.split(' ')[0])} />storage</span>
-                  <span className="font-bold">{percent}%</span>
-                </div>
-                <div className="h-2 rounded-full bg-slate-100"><div className={cn('h-full rounded-full', color.split(' ')[0])} style={{ width: `${percent}%` }} /></div>
-                <div className="flex items-center justify-between text-sm text-slate-500"><span>{formatBytes(account.storageAccount?.usedBytes)} / {storageLimitLabel(account)}</span><span>Available {availableLabel(account)}</span></div>
+                {isTelegram ? (
+                  <>
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="flex items-center gap-2 font-semibold">Files</span>
+                      <span className="font-bold">{account.storageAccount?.fileCount ?? '—'}</span>
+                    </div>
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="flex items-center gap-2 font-semibold">Total Stored Size</span>
+                      <span className="font-bold">{formatBytes(account.storageAccount?.usedBytes)}</span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="mb-1 flex items-center justify-between text-sm">
+                      <span className="flex items-center gap-2 font-semibold"><span className={cn('h-3 w-3 rounded-full', color.split(' ')[0])} />storage</span>
+                      <span className="font-bold">{percent}%</span>
+                    </div>
+                    <div className="h-2 rounded-full bg-slate-100"><div className={cn('h-full rounded-full', color.split(' ')[0])} style={{ width: `${percent}%` }} /></div>
+                    <div className="flex items-center justify-between text-sm text-slate-500"><span>{formatBytes(account.storageAccount?.usedBytes)} / {storageLimitLabel(account)}</span><span>Available {availableLabel(account)}</span></div>
+                  </>
+                )}
                 {reauth ? <p className="text-xs text-slate-400">Last known usage — quota unavailable until the account is reconnected.</p> : null}
                 <div className="flex items-center justify-between gap-3 border-t border-slate-100 pt-3">
                   <div className="min-w-0">

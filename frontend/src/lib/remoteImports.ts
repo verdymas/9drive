@@ -277,7 +277,7 @@ export function percentOf(current: string | null | undefined, total: string | nu
 export function accountLabel(item: RemoteImportItem): string {
   const account = item.connectedAccount
   if (!account) return 'storage'
-  return account.displayName || account.email || (account.provider === 's3' ? 'S3' : 'Google Drive')
+  return account.displayName || account.email || (account.provider === 's3' ? 'S3' : account.provider === 'telegram' ? 'Telegram' : 'Google Drive')
 }
 
 /** Human label for a status + stage pair (used in tables and badges). */

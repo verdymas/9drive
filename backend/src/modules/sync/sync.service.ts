@@ -65,8 +65,10 @@ export async function runAccountSync(userId: string, connectedAccountId: string)
   // an auth failure does not mean provider resources were deleted.
   if (account.status === 'reauth_required') {
     const run = await createSyncRun({ userId, connectedAccountId: account.id, provider: account.provider })
-    await failSyncRun(run.id, 'GOOGLE_REAUTH_REQUIRED', 'This Google Drive account needs to be reconnected before it can be used.')
-    return { accountId: account.id, provider: account.provider, status: 'failed', runId: run.id, stats: emptyStats(), errorCode: 'GOOGLE_REAUTH_REQUIRED', errorMessage: 'This Google Drive account needs to be reconnected before it can be used.' }
+    const providerName = account.provider === 's3' ? 'S3' : account.provider === 'telegram' ? 'Telegram' : 'Google Drive'
+    const message = `This ${providerName} account needs to be reconnected before it can be used.`
+    await failSyncRun(run.id, 'GOOGLE_REAUTH_REQUIRED', message)
+    return { accountId: account.id, provider: account.provider, status: 'failed', runId: run.id, stats: emptyStats(), errorCode: 'GOOGLE_REAUTH_REQUIRED', errorMessage: message }
   }
 
   const run = await createSyncRun({ userId, connectedAccountId: account.id, provider: account.provider })
@@ -79,6 +81,14 @@ export async function runAccountSync(userId: string, connectedAccountId: string)
       await runGoogleDriveScan(ctx, cancelled)
     } else if (account.provider === 's3') {
       await runS3Scan(ctx, cancelled)
+    } else if (account.provider === 'telegram') {
+      // Telegram is flat blob storage and the DB is the source of truth.
+      // Recovery/reconciliation is a separate, non-destructive index op
+      // (POST /telegram/accounts/:id/index); the missing-reconciler below must
+      // never run against the channel history (documents may exist without a
+      // DB row only because 9Drive has not indexed them).
+      await completeSyncRun(run.id, stats)
+      return { accountId: account.id, provider: account.provider, status: 'completed', runId: run.id, stats }
     } else {
       await failSyncRun(run.id, 'SYNC_PROVIDER_UNSUPPORTED', `Sync is not implemented for provider "${account.provider}".`)
       return { accountId: account.id, provider: account.provider, status: 'failed', runId: run.id, stats }

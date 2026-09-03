@@ -89,6 +89,15 @@ const envSchema = z.object({
   // Browser Capture (extension device + captured resources).
   BROWSER_CAPTURE_ENABLED: z.coerce.boolean().default(true),
   BROWSER_CAPTURE_EXTENSION_DIR: z.string().optional(),
+  // Telegram Drive storage provider.
+  // Per-file document size cap for Telegram uploads (Telegram free accounts
+  // allow documents up to ~2 GiB; premium up to 4 GiB). Enforced in placement.
+  TELEGRAM_MAX_FILE_BYTES: z.coerce.number().default(2 * 1024 * 1024 * 1024),
+  // Title of the private channel used as Telegram blob storage per account.
+  TELEGRAM_STORAGE_CHANNEL: z.string().default('9drive'),
+  // Temp dir for chunked (non-Google) resumable upload staging. Bytes are
+  // streamed here before the provider upload commits; removed after commit.
+  UPLOAD_TEMP_DIR: z.string().default('./data/upload-tmp'),
 })
 
 export const env = envSchema.parse(process.env)

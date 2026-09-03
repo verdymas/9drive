@@ -1,6 +1,8 @@
+import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { syncGoogleQuota } from '../google/google.service.js'
 import { syncS3Quota } from '../s3/s3.service.js'
+import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
 
 /**
  * Automatic storage routing shared by direct uploads (upload.routes.ts) and
@@ -26,6 +28,24 @@ type RoutingMode = 'most_available' | 'round_robin' | 'priority'
 export type PreflightFile = { fileName: string; mimeType: string; sizeBytes: bigint }
 
 export type PreflightReason = 'insufficient' | 'no_accounts' | 's3_only' | 'duplicate'
+
+/** Providers whose usage is indexed-only (no quota API) — treated as eligible. */
+const UNLIMITED_PROVIDERS = ['s3', 'telegram']
+
+/** Telegram has a per-file document cap; oversized files can never be routed to it. */
+function withinTelegramCap(provider: string, sizeBytes: bigint) {
+  return provider !== 'telegram' || sizeBytes <= BigInt(env.TELEGRAM_MAX_FILE_BYTES)
+}
+
+/**
+ * A Telegram account is only routable once a private storage channel is
+ * configured — otherwise the upload would fail mid-flight with
+ * TELEGRAM_STORAGE_TARGET_NOT_CONFIGURED. Channel-less accounts are excluded
+ * from both automatic routing and batch planning.
+ */
+function telegramChannelConfigured(account: { provider: string; telegramStorageConfig?: { channelId: string | null } | null }) {
+  return account.provider !== 'telegram' || Boolean(account.telegramStorageConfig?.channelId)
+}
 
 /**
  * Per-file plan produced by `planBatchUploads`. `accountId` is set (with
@@ -74,14 +94,15 @@ export async function selectAccount(
   // attempt naturally marks them) but are NOT eligible for selection.
   const visibleStatuses = { in: ['connected', 'reauth_required'] }
   const accounts = await prisma.connectedAccount.findMany({
-    where: { userId, provider: { in: ['google_drive', 's3'] }, status: visibleStatuses, autoAllocationEnabled: true, ...(targetAccountId ? { id: targetAccountId } : {}) },
-    include: { storageAccount: true },
+    where: { userId, provider: { in: [...UNLIMITED_PROVIDERS, 'google_drive'] }, status: visibleStatuses, autoAllocationEnabled: true, ...(targetAccountId ? { id: targetAccountId } : {}) },
+    include: { storageAccount: true, telegramStorageConfig: { select: { channelId: true } } },
   })
 
   const stale = accounts.filter((account) => !account.storageAccount?.lastSyncedAt || account.storageAccount.lastSyncedAt.getTime() < Date.now() - 5 * 60_000)
   await Promise.allSettled(stale.map(async (account) => {
     try {
       if (account.provider === 's3') await syncS3Quota(account.id)
+      else if (account.provider === 'telegram') await syncTelegramUsage(account.id)
       else await syncGoogleQuota(account.id)
     } catch (err: any) {
       console.error(`[storage-routing] failed to sync quota for account ${account.email} (${account.id}):`, err.message || err)
@@ -93,8 +114,8 @@ export async function selectAccount(
   }))
 
   const fresh = await prisma.connectedAccount.findMany({
-    where: { userId, provider: { in: ['google_drive', 's3'] }, status: visibleStatuses, autoAllocationEnabled: true },
-    include: { storageAccount: true },
+    where: { userId, provider: { in: [...UNLIMITED_PROVIDERS, 'google_drive'] }, status: visibleStatuses, autoAllocationEnabled: true },
+    include: { storageAccount: true, telegramStorageConfig: { select: { channelId: true } } },
   })
 
   const eligible = fresh
@@ -102,6 +123,7 @@ export async function selectAccount(
     // saved Auto Allocation preference, which stays intact): reauth accounts
     // are excluded even when a FolderStorageLocation exists for them.
     .filter((account) => account.status !== 'reauth_required')
+    .filter((account) => telegramChannelConfigured(account))
     .map((account) => ({
       account,
       availableBytes:
@@ -110,6 +132,7 @@ export async function selectAccount(
           : account.storageAccount.availableBytes - (reservedBytesByAccount.get(account.id) ?? 0n),
     }))
     .filter(({ availableBytes }) => availableBytes === null || availableBytes >= sizeBytes)
+    .filter(({ account }) => withinTelegramCap(account.provider, sizeBytes))
 
   if (eligible.length === 0) return null
 
@@ -150,9 +173,9 @@ export async function selectAccount(
       if (a.availableBytes !== null && b.availableBytes !== null && a.availableBytes !== b.availableBytes) {
         return Number(b.availableBytes - a.availableBytes)
       }
-      if (a.availableBytes === null && b.availableBytes !== null) return a.account.provider === 's3' ? -1 : 1
-      if (b.availableBytes === null && a.availableBytes !== null) return b.account.provider === 's3' ? 1 : -1
-      if (a.availableBytes === null && b.availableBytes === null) return a.account.provider === 's3' ? -1 : 1
+      if (a.availableBytes === null && b.availableBytes !== null) return UNLIMITED_PROVIDERS.includes(a.account.provider) ? -1 : 1
+      if (b.availableBytes === null && a.availableBytes !== null) return UNLIMITED_PROVIDERS.includes(b.account.provider) ? 1 : -1
+      if (a.availableBytes === null && b.availableBytes === null) return UNLIMITED_PROVIDERS.includes(a.account.provider) && !UNLIMITED_PROVIDERS.includes(b.account.provider) ? -1 : 1
       // 2. Tie-breaker: existing physical location for the destination folder.
       if (preferred.has(a.account.id) && !preferred.has(b.account.id)) return -1
       if (preferred.has(b.account.id) && !preferred.has(a.account.id)) return 1
@@ -164,17 +187,17 @@ export async function selectAccount(
 /**
  * Plan a multi-file upload batch BEFORE any bytes are sent, so the whole
  * batch can be checked against the combined free space of the user's
- * connected Google Drive accounts up-front. Files are assigned to accounts
+ * connected storage accounts up-front. Files are assigned to accounts
  * with a growing reservation map (the same reserve-per-file pattern as the
  * legacy multipart `handleUpload`), so two large files in one batch land on
  * different accounts instead of both being routed to the first one with
  * space and failing mid-batch when its real quota runs out.
  *
- * Only Google Drive accounts are planned: the resumable chunk path rejects
- * S3 (`UNSUPPORTED_PROVIDER`), so a plan pointing at S3 would be a dead end.
- * Files that cannot be routed get `reason` set and are excluded from
- * `totalRoutedBytes` — the caller may still upload them via the normal
- * per-file path, which re-validates space at init time.
+ * All provider types are planned (Google Drive resumable, plus S3/Telegram
+ * via the chunked non-Google finalize path in upload.routes.ts). Files that
+ * cannot be routed get `reason` set and are excluded from `totalRoutedBytes`
+ * — the caller may still upload them via the normal per-file path, which
+ * re-validates space at init time.
  *
  * Reservations are returned to the caller, not persisted: each file is
  * re-validated by init (via `selectAccount`) before uploading, so a stale
@@ -205,13 +228,13 @@ export async function planBatchUploads(
   // An explicit user-chosen pin is a SOFT preference, exactly like
   // `selectAccount`'s `allowFallback` path: the pinned account is preferred,
   // but if it cannot hold a file the planner falls back to the other connected
-  // accounts. Only when the pin is not a connected Google Drive account at all
-  // (missing, or an S3 pin — S3 is never planned) is every file unroutable.
-  // Reauth-required accounts stay in the stale-sync pass but are never planned.
+  // accounts. Only when the pin is not a connected storage account at all is
+  // every file unroutable. Reauth-required accounts stay in the stale-sync
+  // pass but are never planned.
   const visibleStatuses = { in: ['connected', 'reauth_required'] }
   const accounts = await prisma.connectedAccount.findMany({
-    where: { userId, provider: 'google_drive', status: visibleStatuses },
-    include: { storageAccount: true },
+    where: { userId, provider: { in: [...UNLIMITED_PROVIDERS, 'google_drive'] }, status: visibleStatuses },
+    include: { storageAccount: true, telegramStorageConfig: { select: { channelId: true } } },
   })
 
   if (targetAccountId && !accounts.some((account) => account.id === targetAccountId)) {
@@ -231,7 +254,9 @@ export async function planBatchUploads(
   const stale = accounts.filter((account) => !account.storageAccount?.lastSyncedAt || account.storageAccount.lastSyncedAt.getTime() < Date.now() - 5 * 60_000)
   await Promise.allSettled(stale.map(async (account) => {
     try {
-      await syncGoogleQuota(account.id)
+      if (account.provider === 's3') await syncS3Quota(account.id)
+      else if (account.provider === 'telegram') await syncTelegramUsage(account.id)
+      else await syncGoogleQuota(account.id)
     } catch (err: any) {
       console.error(`[storage-routing] failed to sync quota for account ${account.email} (${account.id}):`, err.message || err)
       await prisma.connectedAccount.update({
@@ -242,19 +267,23 @@ export async function planBatchUploads(
   }))
 
   const fresh = await prisma.connectedAccount.findMany({
-    where: { userId, provider: 'google_drive', status: visibleStatuses },
-    include: { storageAccount: true },
+    where: { userId, provider: { in: [...UNLIMITED_PROVIDERS, 'google_drive'] }, status: visibleStatuses },
+    include: { storageAccount: true, telegramStorageConfig: { select: { channelId: true } } },
   })
 
   // Auto Allocation OFF is a pre-routing exclusion: accounts opted out of
   // automatic placement are dropped from the pool before any strategy applies,
   // UNLESS the user explicitly pinned one (a manual pin stays authoritative).
   // Reauth-required accounts are excluded regardless of a pin — broken auth is
-  // never bypassable by manual selection.
+  // never bypassable by manual selection. Telegram accounts without a
+  // configured storage channel are excluded the same way (a pin cannot select
+  // an account that has nowhere to store).
   const planningPool = targetAccountId
     ? fresh.filter((account) => account.id === targetAccountId || account.autoAllocationEnabled)
     : fresh.filter((account) => account.autoAllocationEnabled)
-  const healthyPool = planningPool.filter((account) => account.status !== 'reauth_required')
+  const healthyPool = planningPool
+    .filter((account) => account.status !== 'reauth_required')
+    .filter((account) => telegramChannelConfigured(account))
 
   if (healthyPool.length === 0) {
     for (const file of files) {
@@ -325,7 +354,8 @@ export async function planBatchUploads(
   // one-per-call advance).
   let rrPointer = 0
   const fits = (entry: (typeof available)[number], sizeBytes: bigint) =>
-    entry.availableBytes === null || entry.availableBytes - (reservedBytesByAccount.get(entry.account.id) ?? 0n) >= sizeBytes
+    withinTelegramCap(entry.account.provider, sizeBytes) &&
+    (entry.availableBytes === null || entry.availableBytes - (reservedBytesByAccount.get(entry.account.id) ?? 0n) >= sizeBytes)
   const pinned = targetAccountId ? available.find((entry) => entry.account.id === targetAccountId) ?? null : null
   for (const file of routable) {
     let selected: (typeof available)[number] | null = null
@@ -338,7 +368,7 @@ export async function planBatchUploads(
         ...entry,
         adjusted: entry.availableBytes === null ? null : entry.availableBytes - (reservedBytesByAccount.get(entry.account.id) ?? 0n),
       }))
-      const eligible = withReservations.filter((entry) => entry.adjusted === null || entry.adjusted >= file.sizeBytes)
+      const eligible = withReservations.filter((entry) => fits(entry, file.sizeBytes))
       selected = eligible.length > 0
         ? eligible.reduce((best, entry) => {
             if (best.adjusted === null) return best
@@ -347,19 +377,19 @@ export async function planBatchUploads(
           })
         : null
     } else if (mode === 'round_robin') {
-      const eligibleNow = orderedAccounts.filter((entry) => entry.availableBytes === null || entry.availableBytes - (reservedBytesByAccount.get(entry.account.id) ?? 0n) >= file.sizeBytes)
+      const eligibleNow = orderedAccounts.filter((entry) => fits(entry, file.sizeBytes))
       if (eligibleNow.length > 0) {
         selected = eligibleNow[rrPointer % eligibleNow.length] ?? null
         rrPointer++
       }
     } else {
-      selected = orderedAccounts.find((entry) => entry.availableBytes === null || entry.availableBytes - (reservedBytesByAccount.get(entry.account.id) ?? 0n) >= file.sizeBytes) ?? null
+      selected = orderedAccounts.find((entry) => fits(entry, file.sizeBytes)) ?? null
     }
 
     if (selected) {
       reservedBytesByAccount.set(selected.account.id, (reservedBytesByAccount.get(selected.account.id) ?? 0n) + file.sizeBytes)
       totalRoutedBytes += file.sizeBytes
-      plans.push({ fileName: file.fileName, accountId: selected.account.id, provider: 'google_drive', reason: null })
+      plans.push({ fileName: file.fileName, accountId: selected.account.id, provider: selected.account.provider === 'google_drive' ? 'google_drive' : null, reason: null })
     } else {
       plans.push({ fileName: file.fileName, accountId: null, provider: null, reason: 'insufficient' })
     }

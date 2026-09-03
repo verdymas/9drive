@@ -10,6 +10,15 @@ export function isReauthRequired(account: { status: ConnectedAccountStatus }): b
   return account.status === 'reauth_required'
 }
 
+/**
+ * A Telegram account is only usable for storage once a private storage
+ * channel is configured. Channel-less Telegram accounts are hidden from
+ * quota/storage surfaces (Settings is where the channel gets set up).
+ */
+export function isStorageReady(account: { provider?: string; telegram?: { channelId?: string | null } | null }): boolean {
+  return account.provider !== 'telegram' || Boolean(account.telegram?.channelId)
+}
+
 export function accountStatusLabel(status: ConnectedAccountStatus): string {
   switch (status) {
     case 'connected':
@@ -24,3 +33,11 @@ export function accountStatusLabel(status: ConnectedAccountStatus): string {
 }
 
 export const REAUTH_MESSAGE = 'Google authorization is no longer valid. Reconnect this account to resume uploads and synchronization.'
+
+export const TELEGRAM_REAUTH_MESSAGE = 'The Telegram session is no longer valid. Reconnect this account to resume uploads and synchronization.'
+
+/** Reauth guidance copy per provider — Telegram sessions and Google OAuth
+ * grants expire differently and must not show each other's message. */
+export function reauthMessage(account: { provider?: string }): string {
+  return account.provider === 'telegram' ? TELEGRAM_REAUTH_MESSAGE : REAUTH_MESSAGE
+}

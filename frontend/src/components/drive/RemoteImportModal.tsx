@@ -786,7 +786,7 @@ export function RemoteImportModal({
             <option value="">Automatic (recommended)</option>
             {accounts.map((account) => (
               <option key={account.id} value={account.id}>
-                {account.email || account.displayName || account.id} ({account.provider === 's3' ? 'S3' : 'Google Drive'})
+                {account.email || account.displayName || account.id} ({account.provider === 's3' ? 'S3' : account.provider === 'telegram' ? 'Telegram' : 'Google Drive'})
               </option>
             ))}
           </select>

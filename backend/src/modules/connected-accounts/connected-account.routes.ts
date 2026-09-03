@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { google } from 'googleapis'
 import { z } from 'zod'
+import type { Prisma } from '@prisma/client'
 import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { requireAuth, type AuthRequest } from '../../middleware/auth.middleware.js'
@@ -10,6 +11,8 @@ import { hashPassword } from '../../utils/password.js'
 import { createAuditLog } from '../../utils/audit.js'
 import { createOAuthClient, replaceCredentialsAfterReconnect, syncGoogleQuota } from '../google/google.service.js'
 import { syncS3Quota, testS3Connection } from '../s3/s3.service.js'
+import { deriveTelegramChannelStatus } from '../telegram/telegram.service.js'
+import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
 
 export const connectedAccountRouter = Router()
 
@@ -26,7 +29,38 @@ const s3ConnectSchema = z.object({
 
 async function syncQuotaForAccount(account: { id: string; provider: string }) {
   if (account.provider === 's3') return syncS3Quota(account.id)
+  if (account.provider === 'telegram') return syncTelegramUsage(account.id)
   return syncGoogleQuota(account.id)
+}
+
+// Provider credentials are never exposed to the frontend. BigInts are
+// stringified; Telegram accounts additionally surface their storage channel.
+const accountInclude = {
+  storageAccount: true,
+  telegramStorageConfig: { select: { channelId: true, channelTitle: true } },
+} satisfies Prisma.ConnectedAccountInclude
+
+type AccountWithUsage = Prisma.ConnectedAccountGetPayload<{ include: typeof accountInclude }>
+
+function serializeConnectedAccount(account: AccountWithUsage) {
+  const { accessTokenEncrypted: _a, refreshTokenEncrypted: _r, storageAccount, telegramStorageConfig, ...rest } = account
+  return {
+    ...rest,
+    storageAccount: storageAccount ? {
+      ...storageAccount,
+      totalBytes: storageAccount.totalBytes?.toString() ?? null,
+      usedBytes: storageAccount.usedBytes.toString(),
+      availableBytes: storageAccount.availableBytes?.toString() ?? null,
+      trashBytes: storageAccount.trashBytes?.toString() ?? null,
+    } : null,
+    telegram: telegramStorageConfig
+      ? {
+          channelId: telegramStorageConfig.channelId,
+          channelTitle: telegramStorageConfig.channelTitle,
+          status: deriveTelegramChannelStatus(rest.status, telegramStorageConfig.channelId),
+        }
+      : null,
+  }
 }
 
 connectedAccountRouter.get('/', requireAuth, async (req: AuthRequest, res, next) => {
@@ -36,7 +70,7 @@ connectedAccountRouter.get('/', requireAuth, async (req: AuthRequest, res, next)
     const connectedStatuses = { in: ['connected', 'reauth_required'] }
     const accounts = await prisma.connectedAccount.findMany({
       where: { userId: req.user!.id, status: connectedStatuses },
-      include: { storageAccount: true },
+      include: accountInclude,
       orderBy: { createdAt: 'desc' },
     })
     const missingQuota = accounts.filter((account) => !account.storageAccount?.lastSyncedAt)
@@ -45,23 +79,12 @@ connectedAccountRouter.get('/', requireAuth, async (req: AuthRequest, res, next)
     const syncedAccounts = missingQuota.length > 0
       ? await prisma.connectedAccount.findMany({
         where: { userId: req.user!.id, status: connectedStatuses },
-        include: { storageAccount: true },
+        include: accountInclude,
         orderBy: { createdAt: 'desc' },
       })
       : accounts
 
-    return res.json({
-      accounts: syncedAccounts.map(({ accessTokenEncrypted: _a, refreshTokenEncrypted: _r, storageAccount, ...account }) => ({
-        ...account,
-        storageAccount: storageAccount ? {
-          ...storageAccount,
-          totalBytes: storageAccount.totalBytes?.toString() ?? null,
-          usedBytes: storageAccount.usedBytes.toString(),
-          availableBytes: storageAccount.availableBytes?.toString() ?? null,
-          trashBytes: storageAccount.trashBytes?.toString() ?? null,
-        } : null,
-      })),
-    })
+    return res.json({ accounts: syncedAccounts.map(serializeConnectedAccount) })
   } catch (error) {
     return next(error)
   }
@@ -417,7 +440,7 @@ connectedAccountRouter.patch('/:id', requireAuth, async (req: AuthRequest, res, 
     const updated = await prisma.connectedAccount.update({
       where: { id: accountId },
       data: { autoAllocationEnabled: body.autoAllocationEnabled },
-      include: { storageAccount: true },
+      include: accountInclude,
     })
     await createAuditLog(req.user!.id, body.autoAllocationEnabled ? 'storage.auto_allocation.enabled' : 'storage.auto_allocation.disabled', 'connected_account', accountId, {
       connectedAccountId: accountId,
@@ -426,19 +449,7 @@ connectedAccountRouter.patch('/:id', requireAuth, async (req: AuthRequest, res, 
       newValue: body.autoAllocationEnabled,
     })
 
-    const { accessTokenEncrypted: _a, refreshTokenEncrypted: _r, storageAccount, ...account } = updated
-    return res.json({
-      account: {
-        ...account,
-        storageAccount: storageAccount ? {
-          ...storageAccount,
-          totalBytes: storageAccount.totalBytes?.toString() ?? null,
-          usedBytes: storageAccount.usedBytes.toString(),
-          availableBytes: storageAccount.availableBytes?.toString() ?? null,
-          trashBytes: storageAccount.trashBytes?.toString() ?? null,
-        } : null,
-      },
-    })
+    return res.json({ account: serializeConnectedAccount(updated) })
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ code: 'INVALID_REQUEST', message: error.issues[0]?.message ?? 'Invalid request.' })
     if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })

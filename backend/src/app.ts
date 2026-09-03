@@ -5,6 +5,7 @@ import { errorMiddleware } from './middleware/error.middleware.js'
 import { authRouter } from './modules/auth/auth.routes.js'
 import { providerConfigRouter } from './modules/provider-configs/provider-config.routes.js'
 import { connectedAccountRouter } from './modules/connected-accounts/connected-account.routes.js'
+import { telegramRouter } from './modules/telegram/telegram.routes.js'
 import { storageRouter } from './modules/storage/storage.routes.js'
 import { uploadRouter } from './modules/uploads/upload.routes.js'
 import { fileRouter } from './modules/files/file.routes.js'
@@ -54,6 +55,7 @@ app.use('/public', publicRouter)
 app.use('/auth', authRouter)
 app.use('/api-keys', apiKeyRouter)
 app.use('/provider-configs', providerConfigRouter)
+app.use('/telegram', telegramRouter)
 app.use('/connected-accounts', connectedAccountRouter)
 app.use('/storage', storageRouter)
 app.use('/uploads', uploadRouter)

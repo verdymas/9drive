@@ -3,6 +3,7 @@ import type { ConnectedAccount, FolderStorageLocation } from '@prisma/client'
 import { AppError } from '../../utils/app-error.js'
 import { getAuthedGoogleClient, ensureGoogleAppFolder } from '../google/google.service.js'
 import { getS3ConfigForAccount } from '../s3/s3.service.js'
+import { getTelegramConfig } from '../telegram/telegram.service.js'
 
 /**
  * Provider-agnostic physical folder operations, dispatched by `account.provider`.
@@ -17,6 +18,10 @@ import { getS3ConfigForAccount } from '../s3/s3.service.js'
  * - S3: folders are object-key prefixes. `providerFolderId` stores the prefix
  *   for the virtual folder path (e.g. `9drive/Movies/Action`) and is derived
  *   from the virtual path; no real object is ever created for a "folder".
+ * - Telegram: the channel is physically flat blob storage (the DB stays the
+ *   source of truth for the tree). Folder operations are virtual no-ops; the
+ *   `providerFolderId` of a location is the `telegram://channel` root plus the
+ *   sanitized virtual path, kept only so location rows stay stable and unique.
  *
  * Never call the Google Drive API directly from routes for folder operations —
  * go through this module so S3 and future providers stay uniform.
@@ -28,11 +33,16 @@ const googleDriveFolderMimeType = 'application/vnd.google-apps.folder'
  * Resolve the account's 9Drive root location:
  * - Google: the `9drive` folder under Drive root (find-or-create).
  * - S3: the configured object-key prefix (e.g. `9drive`).
+ * - Telegram: the private storage channel id (virtual root).
  */
 export async function ensureProviderRoot(account: ConnectedAccount): Promise<string> {
   if (account.provider === 's3') {
     const config = await getS3ConfigForAccount(account.id)
     return config.prefix.replace(/^\/+|\/+$/g, '')
+  }
+  if (account.provider === 'telegram') {
+    const config = await getTelegramConfig(account.id)
+    return config.channelId ?? 'telegram'
   }
   return ensureGoogleAppFolder(account)
 }
@@ -44,9 +54,10 @@ export async function ensureProviderRoot(account: ConnectedAccount): Promise<str
  * Google: find-by-name-in-parent first (reconciliation — two concurrent
  * materializations must not create duplicate sibling folders), then create.
  * S3: the "folder" is just the joined prefix; nothing is created remotely.
+ * Telegram: channel is flat — the "folder" is a stable virtual path suffix.
  */
 export async function createProviderFolder(account: ConnectedAccount, name: string, parentProviderId: string): Promise<string> {
-  if (account.provider === 's3') {
+  if (account.provider === 's3' || account.provider === 'telegram') {
     return `${parentProviderId.replace(/\/+$/g, '')}/${name.replace(/[/\\]/g, '-')}`
   }
 
@@ -72,10 +83,10 @@ export async function createProviderFolder(account: ConnectedAccount, name: stri
 
 /**
  * Check whether a physical folder still exists on the provider.
- * S3: prefixes are virtual — always true.
+ * S3/Telegram: prefixes are virtual — always true.
  */
 export async function providerFolderExists(account: ConnectedAccount, providerFolderId: string): Promise<boolean> {
-  if (account.provider === 's3') return true
+  if (account.provider === 's3' || account.provider === 'telegram') return true
   try {
     const auth = await getAuthedGoogleClient(account)
     await google.drive({ version: 'v3', auth }).files.get({ fileId: providerFolderId, fields: 'id' })
@@ -86,11 +97,11 @@ export async function providerFolderExists(account: ConnectedAccount, providerFo
 }
 
 /**
- * Rename a physical folder. S3 folder prefixes are derived from the virtual
- * path, never from a stored name — renaming is a no-op there.
+ * Rename a physical folder. S3/Telegram folder prefixes are derived from the
+ * virtual path, never from a stored name — renaming is a no-op there.
  */
 export async function renameProviderFolder(account: ConnectedAccount, providerFolderId: string, newName: string): Promise<void> {
-  if (account.provider === 's3') return
+  if (account.provider === 's3' || account.provider === 'telegram') return
   try {
     const auth = await getAuthedGoogleClient(account)
     await google.drive({ version: 'v3', auth }).files.update({ fileId: providerFolderId, requestBody: { name: newName } })
@@ -100,11 +111,11 @@ export async function renameProviderFolder(account: ConnectedAccount, providerFo
 }
 
 /**
- * Move a physical folder under `newParentProviderId`. S3: no-op (prefixes are
- * derived from the virtual tree on next materialization).
+ * Move a physical folder under `newParentProviderId`. S3/Telegram: no-op
+ * (prefixes are derived from the virtual tree on next materialization).
  */
 export async function moveProviderFolder(account: ConnectedAccount, providerFolderId: string, newParentProviderId: string): Promise<void> {
-  if (account.provider === 's3') return
+  if (account.provider === 's3' || account.provider === 'telegram') return
   try {
     const auth = await getAuthedGoogleClient(account)
     const drive = google.drive({ version: 'v3', auth })
@@ -122,11 +133,11 @@ export async function moveProviderFolder(account: ConnectedAccount, providerFold
 }
 
 /**
- * Delete a physical folder. S3: no-op — folder prefixes have no real object;
- * the objects under the prefix are removed by per-file deletion.
+ * Delete a physical folder. S3/Telegram: no-op — folder prefixes have no real
+ * object; the objects under the prefix are removed by per-file deletion.
  */
 export async function deleteProviderFolder(account: ConnectedAccount, providerFolderId: string): Promise<void> {
-  if (account.provider === 's3') return
+  if (account.provider === 's3' || account.provider === 'telegram') return
   try {
     const auth = await getAuthedGoogleClient(account)
     await google.drive({ version: 'v3', auth }).files.delete({ fileId: providerFolderId })

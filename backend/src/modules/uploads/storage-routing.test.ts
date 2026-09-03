@@ -6,7 +6,7 @@ import { planBatchUploads, selectAccount } from './storage-routing.service.js'
 // close over must come from vi.hoisted (see remote-import.service.test.ts).
 const h = vi.hoisted(() => {
   const now = new Date('2026-08-07T00:00:00.000Z')
-  const account = (id: string, provider: string, availableBytes: bigint | null, stale = false, autoAllocationEnabled = true, status = 'connected') => ({
+  const account = (id: string, provider: string, availableBytes: bigint | null, stale = false, autoAllocationEnabled = true, status = 'connected', telegramChannelId: string | null = null) => ({
     id,
     userId: 'user-1',
     providerConfigId: null,
@@ -26,6 +26,7 @@ const h = vi.hoisted(() => {
     lastAuthErrorCode: status === 'reauth_required' ? 'GOOGLE_OAUTH_INVALID_GRANT' : null,
     createdAt: now,
     updatedAt: now,
+    telegramStorageConfig: telegramChannelId ? { connectedAccountId: id, channelId: telegramChannelId, channelTitle: `Channel ${telegramChannelId}`, createdAt: now, updatedAt: now } : null,
     storageAccount: {
       id: `sa-${id}`,
       connectedAccountId: id,
@@ -90,6 +91,12 @@ vi.mock('../google/google.service.js', () => ({
   syncGoogleQuota: vi.fn(async () => {
     throw new Error('syncGoogleQuota should not be called in these tests')
   }),
+}))
+
+// Telegram quota sync is best-effort in the stale pass; mock it so routing
+// tests never touch prisma.file.
+vi.mock('../telegram/telegram-usage.service.js', () => ({
+  syncTelegramUsage: vi.fn(async () => undefined),
 }))
 
 // Import AFTER the mocks are registered (vi.mock is hoisted; imports re-order).
@@ -233,15 +240,25 @@ describe('planBatchUploads', () => {
     expect(result.plans[0].accountId).toBe('acc-a')
   })
 
-  it('never plans S3 accounts', async () => {
+  it('plans S3 accounts (provider: null) alongside Google', async () => {
     setupAccounts([h.account('acc-a', 'google_drive', 100n), h.account('acc-s3', 's3', 10_000n)])
+    // S3 has no quota (availableBytes is a soft floor); most_available sorts by
+    // available bytes, so acc-s3 wins for a 50n file.
     const result = await planBatchUploads('user-1', [{ fileName: 'a.bin', mimeType: 'application/octet-stream', sizeBytes: 50n }])
-    expect(result.plans).toEqual([{ fileName: 'a.bin', accountId: 'acc-a', provider: 'google_drive', reason: null }])
+    expect(result.plans).toEqual([{ fileName: 'a.bin', accountId: 'acc-s3', provider: null, reason: null }])
   })
 
-  it('marks all files no_accounts when a non-google pin is given', async () => {
+  it('never routes a file over the Telegram document cap to a telegram account', async () => {
+    const overCap = BigInt(3 * 1024 * 1024 * 1024) // > TELEGRAM_MAX_FILE_BYTES (2 GiB)
+    setupAccounts([h.account('acc-a', 'google_drive', 100n), h.account('acc-tg', 'telegram', null, false, true, 'connected', 'chan-tg')])
+    const result = await planBatchUploads('user-1', [{ fileName: 'big.bin', mimeType: 'application/octet-stream', sizeBytes: overCap }])
+    // Telegram is ineligible for the oversized file; acc-a lacks quota → unroutable.
+    expect(result.plans[0]).toMatchObject({ accountId: null, reason: 'insufficient' })
+  })
+
+  it('marks all files no_accounts when the pinned account is not connected', async () => {
     setupAccounts([h.account('acc-a', 'google_drive', 100n), h.account('acc-s3', 's3', 10_000n)])
-    const result = await planBatchUploads('user-1', [{ fileName: 'a.bin', mimeType: 'application/octet-stream', sizeBytes: 50n }], 'acc-s3')
+    const result = await planBatchUploads('user-1', [{ fileName: 'a.bin', mimeType: 'application/octet-stream', sizeBytes: 50n }], 'acc-missing')
     expect(result.plans).toEqual([{ fileName: 'a.bin', accountId: null, provider: null, reason: 'no_accounts' }])
     expect(result.totalRoutedBytes).toBe(0n)
     expect(result.unroutedBytes).toBe(50n)
@@ -402,5 +419,38 @@ describe('routing eligibility — REAUTH_REQUIRED', () => {
     setupAccounts([h.account('acc-s3', 's3', 500n, false, true)])
     const selected = await selectAccount('user-1', 10n)
     expect(selected?.id).toBe('acc-s3')
+  })
+})
+
+describe('routing eligibility — Telegram storage channel', () => {
+  it('planBatchUploads excludes a Telegram account without a configured channel', async () => {
+    setupAccounts([h.account('acc-tg', 'telegram', null)])
+    const result = await planBatchUploads('user-1', [{ fileName: 'a.bin', mimeType: 'application/octet-stream', sizeBytes: 10n }])
+    expect(result.plans[0]).toEqual({ fileName: 'a.bin', accountId: null, provider: null, reason: 'no_accounts' })
+  })
+
+  it('planBatchUploads routes to a Telegram account once a channel is configured', async () => {
+    setupAccounts([h.account('acc-tg', 'telegram', null, false, true, 'connected', 'chan-tg')])
+    const result = await planBatchUploads('user-1', [{ fileName: 'a.bin', mimeType: 'application/octet-stream', sizeBytes: 10n }])
+    // Indexed-only providers (Telegram/S3) plan with provider null.
+    expect(result.plans[0]).toMatchObject({ accountId: 'acc-tg', provider: null, reason: null })
+  })
+
+  it('a manual pin on a channel-less Telegram account never wins (hard exclusion)', async () => {
+    setupAccounts([h.account('acc-tg', 'telegram', null), h.account('acc-a', 'google_drive', 100n)])
+    const result = await planBatchUploads('user-1', [{ fileName: 'a.bin', mimeType: 'application/octet-stream', sizeBytes: 10n }], 'acc-tg')
+    expect(result.plans[0].accountId).toBe('acc-a')
+  })
+
+  it('selectAccount skips channel-less Telegram accounts entirely', async () => {
+    setupAccounts([h.account('acc-tg', 'telegram', null), h.account('acc-a', 'google_drive', 100n)])
+    const selected = await selectAccount('user-1', 10n)
+    expect(selected?.id).toBe('acc-a')
+  })
+
+  it('selectAccount picks a channel-configured Telegram account when it has the most space', async () => {
+    setupAccounts([h.account('acc-tg', 'telegram', null, false, true, 'connected', 'chan-tg'), h.account('acc-a', 'google_drive', 50n)])
+    const selected = await selectAccount('user-1', 10n)
+    expect(selected?.id).toBe('acc-tg')
   })
 })

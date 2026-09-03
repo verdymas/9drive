@@ -8,6 +8,8 @@ import { hashToken, randomToken } from '../../utils/crypto.js'
 import { getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
 import { runSyncAll, runAccountSync } from '../sync/sync.service.js'
 import { deleteS3Object, syncS3Quota, createS3Client, getS3ConfigForAccount } from '../s3/s3.service.js'
+import { deleteTelegramDocuments, getTelegramConfig, openTelegramDocument } from '../telegram/telegram.service.js'
+import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
 import { ensureFolderStorageLocation } from '../storage/folder-materialization.service.js'
 import { streamProviderFile } from './stream-file.js'
 import { googleDownloadExportMimeTypes, normalizeHeaders, withExtension } from './stream-google-file.js'
@@ -222,7 +224,11 @@ fileRouter.delete('/batch/permanent', async (req: AuthRequest, res, next) => {
 
     for (const file of files) {
       try {
-        if (file.provider === 's3') {
+        if (file.provider === 'telegram') {
+          const config = await getTelegramConfig(file.connectedAccountId, req.user!.id)
+          const errors = await deleteTelegramDocuments(config, [file.providerFileId])
+          if (errors.length > 0) throw new Error(errors[0])
+        } else if (file.provider === 's3') {
           await deleteS3Object(file)
         } else {
           const auth = await getAuthedGoogleClient(file.connectedAccount)
@@ -247,6 +253,8 @@ fileRouter.delete('/batch/permanent', async (req: AuthRequest, res, next) => {
       const account = files.find((file) => file.connectedAccountId === accountId)?.connectedAccount
       if (account?.provider === 's3') {
         await syncS3Quota(accountId).catch(() => undefined)
+      } else if (account?.provider === 'telegram') {
+        await syncTelegramUsage(accountId).catch(() => undefined)
       } else {
         await syncGoogleQuota(accountId).catch(() => undefined)
       }
@@ -320,7 +328,8 @@ fileRouter.patch('/:id', async (req: AuthRequest, res, next) => {
     const body = z.object({ name: z.string().min(1).max(255).optional(), folderId: z.string().nullable().optional() }).parse(req.body)
     const fileId = String(req.params.id)
     const file = await prisma.file.findFirstOrThrow({ where: { id: fileId, userId: req.user!.id }, include: { connectedAccount: true } })
-    const drive = file.provider === 's3' ? null : google.drive({ version: 'v3', auth: await getAuthedGoogleClient(file.connectedAccount) })
+    // Telegram is physically flat: renames/moves are DB-only, exactly like S3.
+    const drive = file.provider === 's3' || file.provider === 'telegram' ? null : google.drive({ version: 'v3', auth: await getAuthedGoogleClient(file.connectedAccount) })
     if (body.folderId) await prisma.folder.findFirstOrThrow({ where: { id: body.folderId, userId: req.user!.id, deletedAt: null } })
     if (body.name && drive) await drive.files.update({ fileId: file.providerFileId, requestBody: { name: body.name } })
 
@@ -502,6 +511,13 @@ fileRouter.post('/batch-download', async (req: AuthRequest, res, next) => {
           const client = createS3Client(config)
           const response = await client.send(new GetObjectCommand({ Bucket: config.bucket, Key: file.providerFileId }))
           stream = response.Body as Readable
+        } else if (file.provider === 'telegram') {
+          const config = await getTelegramConfig(file.connectedAccountId, req.user!.id)
+          const download = await openTelegramDocument(config, file.providerFileId)
+          stream = Readable.from(download.stream)
+          const close = () => void download.close()
+          stream.once('end', close)
+          stream.once('error', close)
         } else {
           const auth = await getAuthedGoogleClient(file.connectedAccount)
           const headers = normalizeHeaders(await auth.getRequestHeaders())

@@ -190,11 +190,20 @@ Google connected accounts:
 - `GET /connected-accounts/google/callback`
 - `GET /connected-accounts`
 - `POST /connected-accounts/:id/sync-quota`
-- `PATCH /connected-accounts/:id` — update account settings. Body: `{ autoAllocationEnabled: boolean }`. When `false`, the account is excluded from Automatic storage placement only (normal upload routing, batch preflight, Remote Import, HLS import). Manual storage selection ignores the flag (still quota-checked strictly); Sync, quota refresh, existing reads and existing physical folder mappings are unaffected. Returns the updated account (tokens stripped, bigints stringified).
+- `PATCH /connected-accounts/:id` — update account settings. Body: `{ autoAllocationEnabled: boolean }`. When `false`, the account is excluded from Automatic storage placement only (normal upload routing, batch preflight, Remote Import, HLS import). Manual storage selection ignores the flag (still quota-checked strictly); Sync, quota refresh, existing reads and existing physical folder mappings are unaffected. Returns the updated account (tokens stripped, bigints stringified; Telegram accounts include `telegram: { channelId, channelTitle, status }`).
 - `DELETE /connected-accounts/:id`
 
+Telegram Drive:
+- `POST /telegram/auth/start` — `{ accountId? | phone, apiId?, apiHash? }`.
+- `POST /telegram/auth/verify` — `{ authId, code? }` or `{ authId, password? }`.
+- `GET /telegram/accounts/:accountId/channels` — broadcast private-channel candidates (never Saved Messages/groups).
+- `POST /telegram/accounts/:accountId/channel` — `{ action: 'create', title? }` or `{ action: 'select', channelId }`; capability-probed before persist; doubles as Change Channel.
+- `POST /telegram/accounts/:accountId/test` — connection + channel read/write/delete check.
+- `POST /telegram/accounts/:accountId/index` — non-destructive recovery index.
+- A Telegram account is not routable until a storage channel is configured: automatic routing/batch planning exclude it and manual pins fail with `TELEGRAM_STORAGE_TARGET_NOT_CONFIGURED`. Channel-less accounts are also excluded from `/storage/summary` totals.
+
 Storage:
-- `GET /storage/summary`
+- `GET /storage/summary` — connected accounts minus channel-less Telegram accounts; totals exclude them too.
 - `GET /storage/breakdown`
 
 Folders:

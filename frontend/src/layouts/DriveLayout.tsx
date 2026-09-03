@@ -33,6 +33,7 @@ import { Button } from '@/components/ui/button'
 import { BrandLogo } from '@/components/drive/BrandLogo'
 import { Input } from '@/components/ui/input'
 import { apiFetch, formatBytes } from '@/lib/api'
+import { isStorageReady } from '@/lib/connectedAccounts'
 import { useUpload } from '@/context/UploadContext'
 import { clearAuthSession, getStoredUser, updateStoredUser, type AuthUser } from '@/lib/auth'
 import { getGravatarUrl } from '@/lib/gravatar'
@@ -70,7 +71,14 @@ type StorageBreakdown = {
 }
 
 function SystemInfoDropdown({ storage }: { storage: any }) {
-  const activeGoogle = storage?.accounts?.filter((a: any) => a.provider === 'google_drive' && a.status === 'connected') ?? []
+  const accounts = storage?.accounts ?? []
+  const connected = accounts.filter((a: any) => a.status === 'connected')
+  const groups: Array<{ provider: string; label: string; accounts: any[] }> = []
+  const labels: Record<string, string> = { google_drive: 'Google Drive', s3: 'S3 Storage', telegram: 'Telegram Drive' }
+  for (const provider of ['google_drive', 's3', 'telegram']) {
+    const list = connected.filter((a: any) => a.provider === provider)
+    if (list.length > 0) groups.push({ provider, label: labels[provider] ?? provider, accounts: list })
+  }
 
   return (
     <div className="absolute right-0 top-12 z-50 w-[min(calc(100vw-2rem),22rem)] overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl shadow-slate-950/15">
@@ -83,14 +91,23 @@ function SystemInfoDropdown({ storage }: { storage: any }) {
         <div>
           <h4 className="text-[11px] font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5"><ShieldCheck className="h-3.5 w-3.5 text-emerald-500" /> Connection Status</h4>
           <div className="mt-2 space-y-2">
-            <div className="flex items-center justify-between text-xs rounded-xl bg-slate-50 p-2.5 border border-slate-100">
-              <span className="font-semibold text-slate-700">Google Drive accounts</span>
-              <span className={activeGoogle.length > 0 ? "text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full font-bold border border-emerald-100" : "text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full font-bold border border-amber-100"}>
-                {activeGoogle.length} Connected
-              </span>
-            </div>
-            {activeGoogle.map((acc: any) => (
-              <p key={acc.id} className="text-[11px] text-slate-500 truncate px-2.5">— {acc.email}</p>
+            {groups.length === 0 ? (
+              <div className="flex items-center justify-between text-xs rounded-xl bg-slate-50 p-2.5 border border-slate-100">
+                <span className="font-semibold text-slate-700">Storage accounts</span>
+                <span className="text-amber-600 bg-amber-50 px-2 py-0.5 rounded-full font-bold border border-amber-100">0 Connected</span>
+              </div>
+            ) : groups.map((group) => (
+              <div key={group.provider} className="rounded-xl bg-slate-50 p-2.5 border border-slate-100">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold text-slate-700">{group.label} accounts</span>
+                  <span className="text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full font-bold border border-emerald-100">
+                    {group.accounts.length} Connected
+                  </span>
+                </div>
+                {group.accounts.map((acc: any) => (
+                  <p key={acc.id} className="text-[11px] text-slate-500 truncate px-2.5 mt-1">— {acc.email}</p>
+                ))}
+              </div>
             ))}
           </div>
         </div>
@@ -296,7 +313,7 @@ export function DriveLayout() {
   async function loadConnectedAccounts() {
     try {
       const data = await apiFetch<{ accounts: ConnectedAccount[] }>('/connected-accounts')
-      setAccounts(data.accounts)
+      setAccounts(data.accounts.filter((account) => isStorageReady(account)))
     } catch (e) {
       console.error('Failed to load accounts for filter dropdown', e)
     }
@@ -481,7 +498,7 @@ export function DriveLayout() {
                       <select value={filterAccountId} onChange={(e) => setFilterAccountId(e.target.value)} className="mt-1 block w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-blue-500 focus:bg-white focus:outline-none">
                         <option value="">All Accounts</option>
                         {accounts.map((acc) => (
-                          <option key={acc.id} value={acc.id}>{acc.email} ({acc.provider})</option>
+                          <option key={acc.id} value={acc.id}>{acc.email} ({acc.provider === 's3' ? 'S3' : acc.provider === 'telegram' ? 'Telegram' : 'Google Drive'})</option>
                         ))}
                       </select>
                     </div>

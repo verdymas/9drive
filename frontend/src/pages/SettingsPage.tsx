@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef, type FormEvent } from 'react'
-import { Bell, Cloud, Database, Globe, HardDrive, Link2, RefreshCw, Trash2 } from 'lucide-react'
+import { Bell, Cloud, Database, Globe, HardDrive, Link2, RefreshCw, Send, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { DummyModal } from '@/components/drive/DummyModal'
@@ -8,22 +8,25 @@ import { BrowserCaptureCard } from '@/components/settings/BrowserCaptureCard'
 import { apiFetch, formatBytes, API_URL } from '@/lib/api'
 import { getGravatarUrl } from '@/lib/gravatar'
 import { getStoredUser, getAccessToken, clearAuthSession } from '@/lib/auth'
-import { isReauthRequired, accountStatusLabel, REAUTH_MESSAGE } from '@/lib/connectedAccounts'
+import { isReauthRequired, accountStatusLabel, reauthMessage } from '@/lib/connectedAccounts'
+import { TelegramChannelModal } from '@/components/drive/TelegramChannelModal'
+import { telegramChannelStatusLabel, testTelegramConnection, type TelegramChannelInfo } from '@/lib/telegram'
 
-type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string; autoAllocationEnabled: boolean; storageAccount?: { totalBytes: string | null; usedBytes: string; availableBytes: string | null; lastSyncedAt: string | null } | null }
+type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string; autoAllocationEnabled: boolean; storageAccount?: { totalBytes: string | null; usedBytes: string; availableBytes: string | null; fileCount?: number | null; lastSyncedAt: string | null } | null; telegram?: TelegramChannelInfo | null }
 
 function providerLabel(provider: string) {
   if (provider === 's3') return 'S3 Storage'
+  if (provider === 'telegram') return 'Telegram Drive'
   return 'Google Drive'
 }
 
 function storageLimitLabel(account: ConnectedAccount) {
-  if (account.provider === 's3' && account.storageAccount?.totalBytes === null) return 'Unlimited'
+  if ((account.provider === 's3' || account.provider === 'telegram') && account.storageAccount?.totalBytes === null) return 'Unlimited'
   return formatBytes(account.storageAccount?.totalBytes)
 }
 
 function availableLabel(account: ConnectedAccount) {
-  if (account.provider === 's3' && account.storageAccount?.availableBytes === null) return 'Unlimited'
+  if ((account.provider === 's3' || account.provider === 'telegram') && account.storageAccount?.availableBytes === null) return '—'
   return formatBytes(account.storageAccount?.availableBytes)
 }
 
@@ -35,6 +38,15 @@ export function SettingsPage() {
   const [s3Open, setS3Open] = useState(false)
   const [connectingS3, setConnectingS3] = useState(false)
   const [s3Form, setS3Form] = useState({ name: '', bucket: '', region: 'us-east-1', endpoint: '', accessKeyId: '', secretAccessKey: '', forcePathStyle: false, quotaBytes: '' })
+  const [telegramOpen, setTelegramOpen] = useState(false)
+  const [telegramStep, setTelegramStep] = useState<'credentials' | 'code' | 'password'>('credentials')
+  const [telegramAuthId, setTelegramAuthId] = useState('')
+  const [telegramAccountId, setTelegramAccountId] = useState<string | null>(null)
+  const [telegramForm, setTelegramForm] = useState({ phone: '', apiId: '', apiHash: '', code: '', password: '' })
+  const [connectingTelegram, setConnectingTelegram] = useState(false)
+  const [channelAccount, setChannelAccount] = useState<ConnectedAccount | null>(null)
+  const [testingTelegramId, setTestingTelegramId] = useState<string | null>(null)
+  const [testResult, setTestResult] = useState<string>('')
   const [syncingAccountId, setSyncingAccountId] = useState<string | null>(null)
   const [disconnectingAccountId, setDisconnectingAccountId] = useState<string | null>(null)
   const [accountToDisconnect, setAccountToDisconnect] = useState<ConnectedAccount | null>(null)
@@ -375,6 +387,101 @@ export function SettingsPage() {
     }
   }
 
+  function openTelegramConnect(accountId?: string) {
+    setTelegramAccountId(accountId ?? null)
+    setTelegramStep('credentials')
+    setTelegramAuthId('')
+    setTelegramForm({ phone: '', apiId: '', apiHash: '', code: '', password: '' })
+    setMessage('')
+    setTelegramOpen(true)
+  }
+
+  async function startTelegramAuth(event: FormEvent) {
+    event.preventDefault()
+    setConnectingTelegram(true)
+    setMessage('')
+    try {
+      const data = await apiFetch<{ authId: string; nextStep: 'code' }>('/telegram/auth/start', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...(telegramAccountId ? { accountId: telegramAccountId } : {}),
+          phone: telegramForm.phone,
+          apiId: telegramAccountId ? undefined : telegramForm.apiId,
+          apiHash: telegramAccountId ? undefined : telegramForm.apiHash,
+        }),
+      })
+      setTelegramAuthId(data.authId)
+      setTelegramStep('code')
+      setTelegramForm((form) => ({ ...form, code: '', password: '' }))
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Failed to request Telegram login code')
+    } finally {
+      setConnectingTelegram(false)
+    }
+  }
+
+  async function submitTelegramCode(event: FormEvent) {
+    event.preventDefault()
+    setConnectingTelegram(true)
+    setMessage('')
+    try {
+      const data = await apiFetch<{ nextStep: 'password' | 'done'; account?: ConnectedAccount }>('/telegram/auth/verify', {
+        method: 'POST',
+        body: JSON.stringify({ authId: telegramAuthId, code: telegramForm.code }),
+      })
+      if (data.nextStep === 'password') {
+        setTelegramStep('password')
+      } else {
+        setTelegramOpen(false)
+        setMessage('Telegram Drive connected.')
+        await load()
+        window.dispatchEvent(new Event('9drive:storage-changed'))
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Failed to verify Telegram code')
+    } finally {
+      setConnectingTelegram(false)
+    }
+  }
+
+  async function submitTelegramPassword(event: FormEvent) {
+    event.preventDefault()
+    setConnectingTelegram(true)
+    setMessage('')
+    try {
+      const data = await apiFetch<{ nextStep: 'password' | 'done'; account?: ConnectedAccount }>('/telegram/auth/verify', {
+        method: 'POST',
+        body: JSON.stringify({ authId: telegramAuthId, password: telegramForm.password }),
+      })
+      if (data.nextStep === 'password') {
+        setMessage('Two-step verification password was not accepted.')
+      } else {
+        setTelegramOpen(false)
+        setMessage('Telegram Drive connected.')
+        await load()
+        window.dispatchEvent(new Event('9drive:storage-changed'))
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Failed to verify Telegram password')
+    } finally {
+      setConnectingTelegram(false)
+    }
+  }
+
+  async function runTelegramTest(account: ConnectedAccount) {
+    setTestingTelegramId(account.id)
+    setTestResult('')
+    try {
+      const result = await testTelegramConnection(account.id)
+      setTestResult(result.ok ? 'Telegram connection OK.' : (result.details || 'Telegram connection failed.'))
+      await load()
+    } catch (error) {
+      setTestResult(error instanceof Error ? error.message : 'Telegram connection test failed.')
+    } finally {
+      setTestingTelegramId(null)
+    }
+  }
+
   return (
     <>
       <PageHeader title="Setting" description="Manage account and connected storage." actions={<><Button variant="outline" size="sm" onClick={() => setS3Open(true)}><Database className="h-4 w-4" />Connect S3</Button><Button size="sm" onClick={connectDrive} disabled={connecting}><Link2 className="h-4 w-4" />{connecting ? 'Connecting...' : 'Connect Drive'}</Button></>} />
@@ -419,6 +526,16 @@ export function SettingsPage() {
             </div>
           </Card>
 
+          <Card className="overflow-hidden p-3.5">
+            <div className="flex flex-col gap-3.5 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <div className="flex items-center gap-2.5"><Send className="h-5 w-5 text-blue-600" /><h2 className="text-[16px] font-bold">Telegram Drive</h2></div>
+                <p className="mt-1 text-[13px] text-slate-500">Use a Telegram account as private storage. Files are stored as documents in your own channel.</p>
+              </div>
+              <Button className="w-full sm:w-32" size="sm" variant="outline" onClick={() => openTelegramConnect()}><Send className="h-4 w-4" />Connect</Button>
+            </div>
+          </Card>
+
           <BrowserCaptureCard />
 
           <Card className="p-4">
@@ -430,17 +547,35 @@ export function SettingsPage() {
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <div className="min-w-0"><p className="break-all font-semibold text-sm">{selectedAccount.displayName || selectedAccount.email}</p><p className="text-xs text-slate-500 mt-0.5">{providerLabel(selectedAccount.provider)} · {accountStatusLabel(selectedAccount.status)}</p></div>
                     <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                      {isReauthRequired(selectedAccount) ? <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700" title={REAUTH_MESSAGE}>Reconnection Required</span> : null}
+                      {isReauthRequired(selectedAccount) ? <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700" title={reauthMessage(selectedAccount)}>Reconnection Required</span> : null}
                       {!selectedAccount.autoAllocationEnabled ? <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500" title="Excluded from Automatic storage allocation. Existing files and Sync are not affected.">Allocation Disabled</span> : null}
                       <div className="grid grid-cols-2 gap-2 sm:flex">
-                        {isReauthRequired(selectedAccount) ? <Button className="w-full" size="sm" onClick={() => reconnectDrive(selectedAccount.id)} disabled={connecting}><Link2 className="h-4 w-4" />{connecting ? 'Opening...' : 'Reconnect Google Drive'}</Button> : null}
-                        <Button className="w-full" size="sm" variant="outline" onClick={() => sync(selectedAccount.id)} disabled={syncingAccountId === selectedAccount.id}><RefreshCw className={syncingAccountId === selectedAccount.id ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{syncingAccountId === selectedAccount.id ? 'Syncing...' : 'Sync'}</Button><Button className="w-full" size="sm" variant="danger" onClick={() => setAccountToDisconnect(selectedAccount)}><Trash2 className="h-4 w-4" />Disconnect</Button></div>
+                        {isReauthRequired(selectedAccount) ? <Button className="w-full" size="sm" onClick={() => selectedAccount.provider === 'telegram' ? openTelegramConnect(selectedAccount.id) : reconnectDrive(selectedAccount.id)} disabled={connecting}><Link2 className="h-4 w-4" />{connecting ? 'Opening...' : selectedAccount.provider === 'telegram' ? 'Reconnect Telegram' : 'Reconnect Google Drive'}</Button> : null}
+                        <Button className="w-full" size="sm" variant="outline" onClick={() => sync(selectedAccount.id)} disabled={syncingAccountId === selectedAccount.id}><RefreshCw className={syncingAccountId === selectedAccount.id ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{syncingAccountId === selectedAccount.id ? 'Syncing...' : 'Sync'}</Button>
+                        {selectedAccount.provider === 'telegram' ? <Button className="w-full" size="sm" variant="outline" onClick={() => setChannelAccount(selectedAccount)}><Send className="h-4 w-4" />{selectedAccount.telegram?.channelId ? 'Change Channel' : 'Set Up Channel'}</Button> : null}
+                        {selectedAccount.provider === 'telegram' ? <Button className="w-full" size="sm" variant="outline" onClick={() => runTelegramTest(selectedAccount)} disabled={testingTelegramId === selectedAccount.id}><RefreshCw className={testingTelegramId === selectedAccount.id ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{testingTelegramId === selectedAccount.id ? 'Testing...' : 'Test Connection'}</Button> : null}
+                        <Button className="w-full" size="sm" variant="danger" onClick={() => setAccountToDisconnect(selectedAccount)}><Trash2 className="h-4 w-4" />Disconnect</Button></div>
                     </div>
                   </div>
-                  {isReauthRequired(selectedAccount) ? <p className="mt-2 rounded-xl bg-amber-50 p-2.5 text-xs text-amber-800">{REAUTH_MESSAGE}</p> : null}
+                  {selectedAccount.provider === 'telegram' ? (
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                      {selectedAccount.telegram?.channelId ? (
+                        <span className="rounded-full bg-emerald-100 px-2 py-0.5 font-semibold text-emerald-700" title={`Channel: ${selectedAccount.telegram.channelTitle ?? selectedAccount.telegram.channelId}`}>Channel: {selectedAccount.telegram.channelTitle ?? selectedAccount.telegram.channelId}</span>
+                      ) : (
+                        <span className="rounded-full bg-amber-100 px-2 py-0.5 font-semibold text-amber-700">Storage Channel Required — set one up to enable uploads.</span>
+                      )}
+                      <span className={selectedAccount.telegram?.status === 'connected' || selectedAccount.telegram?.status === 'ready' ? 'rounded-full bg-emerald-100 px-2 py-0.5 font-semibold text-emerald-700' : 'rounded-full bg-slate-100 px-2 py-0.5 font-semibold text-slate-500'}>{selectedAccount.telegram ? telegramChannelStatusLabel(selectedAccount.telegram.status) : '—'}</span>
+                    </div>
+                  ) : null}
+                  {testResult ? <p className="mt-2 rounded-xl bg-blue-50 p-2.5 text-xs text-blue-700">{testResult}</p> : null}
+                  {isReauthRequired(selectedAccount) ? <p className="mt-2 rounded-xl bg-amber-50 p-2.5 text-xs text-amber-800">{reauthMessage(selectedAccount)}</p> : null}
                   <div className="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
                     <div className="rounded-xl bg-white dark:bg-slate-950 p-2 border border-slate-100 dark:border-slate-800"><p className="font-extrabold text-slate-950">{formatBytes(selectedAccount.storageAccount?.usedBytes)}</p><p className="mt-0.5 text-[10px] text-slate-500">Used</p></div>
-                    <div className="rounded-xl bg-white dark:bg-slate-950 p-2 border border-slate-100 dark:border-slate-800"><p className="font-extrabold text-slate-950">{storageLimitLabel(selectedAccount)}</p><p className="mt-0.5 text-[10px] text-slate-500">Total</p></div>
+                    {selectedAccount.provider === 'telegram' ? (
+                      <div className="rounded-xl bg-white dark:bg-slate-950 p-2 border border-slate-100 dark:border-slate-800"><p className="font-extrabold text-slate-950">{selectedAccount.storageAccount?.fileCount ?? '—'}</p><p className="mt-0.5 text-[10px] text-slate-500">Files</p></div>
+                    ) : (
+                      <div className="rounded-xl bg-white dark:bg-slate-950 p-2 border border-slate-100 dark:border-slate-800"><p className="font-extrabold text-slate-950">{storageLimitLabel(selectedAccount)}</p><p className="mt-0.5 text-[10px] text-slate-500">Total</p></div>
+                    )}
                     <div className="rounded-xl bg-white dark:bg-slate-950 p-2 border border-slate-100 dark:border-slate-800"><p className="font-extrabold text-slate-950">{availableLabel(selectedAccount)}</p><p className="mt-0.5 text-[10px] text-slate-500">Free</p></div>
                   </div>
                 </div> : null}
@@ -655,6 +790,29 @@ export function SettingsPage() {
           <div className="grid gap-3 sm:flex sm:justify-end"><Button variant="outline" type="button" onClick={() => setS3Open(false)} disabled={connectingS3}>Cancel</Button><Button type="submit" disabled={connectingS3}>{connectingS3 ? 'Connecting...' : 'Connect S3'}</Button></div>
         </form>
       </DummyModal>
+      <DummyModal open={telegramOpen} title={telegramAccountId ? 'Reconnect Telegram Drive' : 'Connect Telegram Drive'} description={telegramStep === 'credentials' ? 'Enter your Telegram API credentials and phone number. 9Drive never stores your OTP or password.' : telegramStep === 'code' ? 'Enter the login code Telegram sent to your phone.' : 'This account has two-step verification enabled. Enter your Telegram password.'} onClose={() => { if (!connectingTelegram) setTelegramOpen(false) }}>
+        {telegramStep === 'credentials' ? (
+          <form className="grid gap-4" onSubmit={startTelegramAuth}>
+            <input className="h-11 rounded-xl border border-slate-200 px-3 text-sm" placeholder="Phone number (+1234567890)" value={telegramForm.phone} onChange={(event) => setTelegramForm({ ...telegramForm, phone: event.target.value })} required />
+            {!telegramAccountId ? <>
+              <input className="h-11 rounded-xl border border-slate-200 px-3 text-sm" placeholder="API ID" inputMode="numeric" value={telegramForm.apiId} onChange={(event) => setTelegramForm({ ...telegramForm, apiId: event.target.value })} required />
+              <input className="h-11 rounded-xl border border-slate-200 px-3 text-sm" placeholder="API Hash" type="password" value={telegramForm.apiHash} onChange={(event) => setTelegramForm({ ...telegramForm, apiHash: event.target.value })} required />
+            </> : null}
+            <p className="text-[12px] leading-relaxed text-slate-500">Get your API ID and API Hash from <a className="text-blue-600 hover:underline" href="https://my.telegram.org" target="_blank" rel="noopener noreferrer">my.telegram.org</a>. After connecting, you will pick or create the private channel used for storage.</p>
+            <div className="grid gap-3 sm:flex sm:justify-end"><Button variant="outline" type="button" onClick={() => setTelegramOpen(false)} disabled={connectingTelegram}>Cancel</Button><Button type="submit" disabled={connectingTelegram}>{connectingTelegram ? 'Requesting code...' : 'Send Code'}</Button></div>
+          </form>
+        ) : telegramStep === 'code' ? (
+          <form className="grid gap-4" onSubmit={submitTelegramCode}>
+            <input className="h-11 rounded-xl border border-slate-200 px-3 text-sm" placeholder="Login code" inputMode="numeric" autoFocus value={telegramForm.code} onChange={(event) => setTelegramForm({ ...telegramForm, code: event.target.value })} required />
+            <div className="grid gap-3 sm:flex sm:justify-end"><Button variant="outline" type="button" onClick={() => setTelegramOpen(false)} disabled={connectingTelegram}>Cancel</Button><Button type="submit" disabled={connectingTelegram}>{connectingTelegram ? 'Verifying...' : 'Verify Code'}</Button></div>
+          </form>
+        ) : (
+          <form className="grid gap-4" onSubmit={submitTelegramPassword}>
+            <input className="h-11 rounded-xl border border-slate-200 px-3 text-sm" placeholder="Two-step verification password" type="password" autoFocus value={telegramForm.password} onChange={(event) => setTelegramForm({ ...telegramForm, password: event.target.value })} required />
+            <div className="grid gap-3 sm:flex sm:justify-end"><Button variant="outline" type="button" onClick={() => setTelegramOpen(false)} disabled={connectingTelegram}>Cancel</Button><Button type="submit" disabled={connectingTelegram}>{connectingTelegram ? 'Verifying...' : 'Sign In'}</Button></div>
+          </form>
+        )}
+      </DummyModal>
       <DummyModal open={Boolean(accountToDisconnect)} title="Disconnect storage?" description="This will remove this storage account from 9Drive. Existing file records for this account may no longer be usable." onClose={() => setAccountToDisconnect(null)}>
         <div className="grid gap-4">
           <div className="rounded-xl bg-slate-50 p-4 text-sm text-slate-600">
@@ -667,6 +825,16 @@ export function SettingsPage() {
           </div>
         </div>
       </DummyModal>
+
+      <TelegramChannelModal
+        account={channelAccount}
+        onClose={() => setChannelAccount(null)}
+        onSaved={() => {
+          setChannelAccount(null)
+          setMessage('Telegram storage channel saved.')
+          load().then(() => window.dispatchEvent(new Event('9drive:storage-changed'))).catch(() => undefined)
+        }}
+      />
 
       <DummyModal
         open={updateModalOpen}
