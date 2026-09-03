@@ -56,6 +56,18 @@ async function streamFile(ctx: v2.HTTPRequestContext, fs: VirtualFileSystem): Pr
   const rangeHeader = ctx.headers.find('Range')
   const range = parseRange(rangeHeader ?? '', size)
 
+  // RFC 9110 §14.1.2: a single satisfiable-range request that starts at or
+  // past the resource size is `416 Range Not Satisfiable`. Previously this
+  // controller silently fell back to a 200 with the full body, which is wrong
+  // now that the Telegram branch can serve partial bytes from a tmp file and
+  // `fs.createReadStream` would throw `ERR_OUT_OF_RANGE` on `start >= size`.
+  if (rangeHeader && !range && size > 0 && /^bytes=/i.test(rangeHeader)) {
+    ctx.setCode(v2.HTTPCodes.RequestedRangeNotSatisfiable)
+    ctx.response.setHeader('Content-Range', `bytes */${size}`)
+    ctx.exit()
+    return
+  }
+
   ctx.response.setHeader('Content-Type', file.mimeType ?? 'application/octet-stream')
   ctx.response.setHeader('Accept-Ranges', 'bytes')
   if (size > 0) ctx.response.setHeader('Content-Length', String(size))

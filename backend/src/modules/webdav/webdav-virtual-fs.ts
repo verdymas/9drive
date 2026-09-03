@@ -1,11 +1,18 @@
 import { GetObjectCommand } from '@aws-sdk/client-s3'
 import type { ConnectedAccount, File, Folder } from '@prisma/client'
+import { randomUUID } from 'node:crypto'
+import { createReadStream, createWriteStream } from 'node:fs'
+import { unlink } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { pipeline } from 'node:stream/promises'
 import { Readable, type Writable } from 'node:stream'
 import { v2 } from 'webdav-server'
 import { prisma } from '../../config/prisma.js'
 import { googleDownloadExportMimeTypes, normalizeHeaders } from '../files/stream-google-file.js'
 import { getAuthedGoogleClient } from '../google/google.service.js'
 import { createS3Client, getS3ConfigForAccount } from '../s3/s3.service.js'
+import { getTelegramConfig, openTelegramDocument } from '../telegram/telegram.service.js'
 
 const { FileSystem, LocalLockManager, LocalPropertyManager, ResourceType } = v2
 
@@ -413,6 +420,10 @@ export async function streamProviderFileToReadable(file: FileWithAccount, range?
     return body
   }
 
+  if (file.provider === 'telegram') {
+    return streamTelegramFileToReadable(file, range)
+  }
+
   // Google Drive
   const auth = await getAuthedGoogleClient(file.connectedAccount)
   const headers = normalizeHeaders(await auth.getRequestHeaders())
@@ -432,4 +443,78 @@ export async function streamProviderFileToReadable(file: FileWithAccount, range?
   }
   if (!response.body) return Readable.from([])
   return Readable.fromWeb(response.body as any)
+}
+
+/**
+ * Telegram does not support server-side Range — `iterDownload` is a forward-only
+ * chunked MTProto stream. To honor HTTP Range for Jellyfin playback/seeking, we
+ * download the file once to a unique temp file under `os.tmpdir()` and then
+ * serve byte ranges with `fs.createReadStream({ start, end })`. The temp file is
+ * deleted automatically when the returned stream ends, is closed by the
+ * consumer, or errors out.
+ *
+ * If the file's size is unknown, we cannot satisfy ranges; the controller will
+ * already have requested the full body, so we stream the Telegram iterable
+ * directly without a temp file.
+ */
+async function streamTelegramFileToReadable(file: FileWithAccount, range?: string): Promise<Readable> {
+  const config = await getTelegramConfig(file.connectedAccountId)
+  const download = await openTelegramDocument(config, file.providerFileId)
+
+  const size = Number(file.sizeBytes ?? 0n)
+  const { start, end } = parseRangeHeader(range, size)
+
+  // No range and no known size: stream the Telegram iterable directly so we
+  // don't create a zero-byte temp file.
+  if (!range && size <= 0) {
+    const iter = Readable.from(download.stream as AsyncIterable<Buffer>)
+    iter.on('end', () => { void download.close() })
+    iter.on('close', () => { void download.close() })
+    iter.on('error', () => { void download.close() })
+    return iter
+  }
+
+  const tmpPath = join(tmpdir(), `9drive-webdav-${file.id}-${process.pid}-${randomUUID()}.bin`)
+
+  // Materialize the Telegram download to disk, then slice. `pipeline` propagates
+  // Telegram errors so the surrounding `stream.on('error', …)` in the route
+  // surfaces a 500.
+  await pipeline(Readable.from(download.stream as AsyncIterable<Buffer>), createWriteStream(tmpPath))
+  // close() is idempotent and only runs after the pipeline finishes; errors
+  // during pipeline are rethrown by `pipeline` itself, which already cleaned up.
+  void download.close()
+
+  const slice = end !== undefined ? { start, end } : { start }
+  const out = createReadStream(tmpPath, slice)
+
+  const cleanup = () => {
+    unlink(tmpPath).catch(() => undefined)
+  }
+  out.on('end', cleanup)
+  out.on('close', cleanup)
+  out.on('error', cleanup)
+
+  return out
+}
+
+/**
+ * Parse an HTTP `Range: bytes=START-END` header into `{ start, end }` for use
+ * with `fs.createReadStream({ start, end })`. `end` is inclusive in HTTP but
+ * `createReadStream` treats it as exclusive, so we add 1.
+ *
+ * - Returns `{ start: 0, end: undefined }` when no range is requested.
+ * - Returns `{ start, end: size - 1 }` when the suffix range is open-ended.
+ * - Returns `{ start: size }` (i.e. start === end+1) for unsatisfiable ranges;
+ *   the route layer should never invoke this branch with a known-unsatisfiable
+ *   range because it will set 416 first.
+ */
+function parseRangeHeader(range: string | undefined, size: number): { start: number; end: number | undefined } {
+  if (!range || size <= 0) return { start: 0, end: undefined }
+  const match = /^bytes=([0-9]+)-([0-9]*)$/.exec(range.trim())
+  if (!match) return { start: 0, end: undefined }
+  const start = parseInt(match[1], 10)
+  if (start >= size) return { start: size, end: size - 1 } // caller should have returned 416
+  const endRaw = match[2]
+  const end = endRaw === '' ? size - 1 : Math.min(parseInt(endRaw, 10), size - 1)
+  return { start, end }
 }
