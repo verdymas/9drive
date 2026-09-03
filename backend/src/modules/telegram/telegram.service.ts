@@ -249,6 +249,31 @@ export async function serializeTelegramAccount(userId: string, accountId: string
     include: { storageAccount: true, telegramStorageConfig: { select: { channelId: true, channelTitle: true } } },
   })
   const { accessTokenEncrypted: _a, refreshTokenEncrypted: _r, telegramStorageConfig, storageAccount, ...rest } = account
+
+  // Pull the latest synchronization state + open-issue count so the UI
+  // can render the "Last sync / Status / Issues" card without an extra
+  // round-trip to /telegram/accounts/:id/status. Single-flight safe:
+  // never throws — sync failures must not break account listing.
+  let syncStatus: string = 'never_synced'
+  let lastSyncAt: Date | null = null
+  let openIssuesCount = 0
+  try {
+    const state = await prisma.telegramSyncState.findUnique({
+      where: { connectedAccountId: accountId },
+      select: { status: true, lastScanAt: true },
+    })
+    if (state) {
+      syncStatus = state.status
+      lastSyncAt = state.lastScanAt
+    }
+    openIssuesCount = await prisma.telegramSyncIssue.count({
+      where: { userId, connectedAccountId: accountId, resolvedAt: null },
+    })
+  } catch {
+    // Sync tables may not exist yet on a fresh install — fall through
+    // with the default "never_synced" status.
+  }
+
   return {
     ...rest,
     provider: 'telegram',
@@ -264,6 +289,9 @@ export async function serializeTelegramAccount(userId: string, accountId: string
       channelId: telegramStorageConfig.channelId,
       channelTitle: telegramStorageConfig.channelTitle,
       status: deriveTelegramChannelStatus(account.status, telegramStorageConfig.channelId),
+      syncStatus,
+      lastSyncAt: lastSyncAt?.toISOString() ?? null,
+      openIssuesCount,
     } : null,
   }
 }

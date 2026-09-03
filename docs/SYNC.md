@@ -4,6 +4,14 @@ The sync engine turns physical files and folders living on connected storage
 accounts (Google Drive `9drive` folder, S3 prefixes) into ONE virtual
 filesystem per user.
 
+Telegram storage has its own dedicated sync engine — see
+`docs/implementation/telegram-drive.md` (`Telegram Synchronization`
+section). The Provider → Virtual engine intentionally treats Telegram
+as a no-op because Telegram is flat blob storage with no physical
+folder hierarchy to mirror; the dedicated engine handles Telegram's
+caption-driven identity, logical-path reconciliation, and
+orphan/missing-remote issue tracking.
+
 ## Model
 
 - **Virtual `Folder`** — the single user-facing node (`userId`, `parentId`,

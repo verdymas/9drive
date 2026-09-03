@@ -180,6 +180,9 @@ model ConnectedAccount {
   telegramStorageConfig TelegramStorageConfig?
   remoteImports         RemoteImport[]
   syncRuns              SyncRun[]
+  telegramSyncStates    TelegramSyncState[]
+  telegramSyncRuns      TelegramSyncRun[]
+  telegramSyncIssues    TelegramSyncIssue[]
 
   @@unique([userId, provider, providerAccountId])
   @@index([userId])
@@ -521,6 +524,14 @@ model SyncRun {
   filesMissing       Int              @default(0) @map("files_missing")
   mappingsMissing    Int              @default(0) @map("mappings_missing")
   collisionsDetected Int              @default(0) @map("collisions_detected")
+  // ── Telegram reconciliation stats (additive; non-breaking for legacy rows) ─
+  scannedCount       Int              @default(0) @map("scanned_count")
+  matchedCount       Int              @default(0) @map("matched_count")
+  importedCount      Int              @default(0) @map("imported_count")
+  missingCount       Int              @default(0) @map("missing_count")
+  orphanCount        Int              @default(0) @map("orphan_count")
+  conflictCount      Int              @default(0) @map("conflict_count")
+  errorCount         Int              @default(0) @map("error_count")
   createdAt          DateTime         @default(now()) @map("created_at")
   updatedAt          DateTime         @updatedAt @map("updated_at")
   user               User             @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -715,4 +726,108 @@ model RemoteFetchWorker {
   @@index([status])
   @@index([deletedAt])
   @@map("remote_fetch_workers")
+}
+
+// ── Telegram Synchronization ─────────────────────────────────────────────
+// Reconciliation ledger for Telegram ↔ 9Drive. The DB (9Drive) is the
+// authoritative logical filesystem; the channel is a mirror. The sync
+// service never deletes data — issues are flagged here and reviewed
+// via the HTTP surface.
+//
+// `TelegramSyncState` is one row per ConnectedAccount. It carries the
+// pagination cursor (`lastMessageId`) and the derived status vocabulary
+// (`never_synced | syncing | up_to_date | changes_detected |
+// needs_attention | sync_failed`). The `status = 'syncing'` value is
+// also the single-flight guard (atomic UPDATE refuses to overwrite).
+//
+// `TelegramSyncRun` is one row per sync invocation. Stats are scalar
+// columns so the UI can merge runs without JSON parsing.
+//
+// `TelegramSyncIssue` is the non-destructive reconciliation log:
+//   - `ORPHAN_REMOTE_FILE` — Telegram message has no DB row
+//   - `REMOTE_FILE_MISSING` — DB row has no Telegram message
+//   - `TELEGRAM_METADATA_MISMATCH` — DB row's logical metadata
+//     (filename/folder/size/mime) differs from the channel
+//
+// All three tables are append-only by convention — issues are
+// resolved by setting `resolvedAt`, never by DELETE. The sync NEVER
+// re-uploads a missing file automatically; manual reconciliation
+// only (spec §13).
+model TelegramSyncState {
+  id                 String           @id @default(uuid()) @db.Char(36)
+  userId             String           @map("user_id") @db.Char(36)
+  connectedAccountId String           @unique(map: "telegram_sync_state_account_id_key") @map("connected_account_id") @db.Char(36)
+  // Pagination cursor: highest message id seen in the last successful
+  // scan. Incremental sync resumes at `min_id = lastMessageId`.
+  lastMessageId      BigInt?          @map("last_message_id")
+  lastScanAt         DateTime?        @map("last_scan_at")
+  // never_synced | syncing | up_to_date | changes_detected |
+  // needs_attention | sync_failed
+  status             String           @default("never_synced") @map("status") @db.VarChar(32)
+  // Last-error code/message from a failed run (NEVER a session
+  // string, API hash, OTP, password, or authorization secret).
+  errorCode          String?          @map("error_code") @db.VarChar(64)
+  errorMessage       String?          @map("error_message") @db.Text
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime         @updatedAt @map("updated_at")
+  connectedAccount   ConnectedAccount @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
+
+  @@index([userId], name: "telegram_sync_state_user_idx")
+  @@map("telegram_sync_state")
+}
+
+model TelegramSyncRun {
+  id                 String           @id @default(uuid()) @db.Char(36)
+  userId             String           @map("user_id") @db.Char(36)
+  connectedAccountId String           @map("connected_account_id") @db.Char(36)
+  // running | completed | failed | cancelled
+  status             String           @default("running") @map("status") @db.VarChar(16)
+  startedAt          DateTime         @default(now()) @map("started_at")
+  finishedAt         DateTime?        @map("finished_at")
+  // Reconciliation stats (spec §16). All default 0 — non-breaking for
+  // legacy rows.
+  scannedCount       Int              @default(0) @map("scanned_count")
+  matchedCount       Int              @default(0) @map("matched_count")
+  importedCount      Int              @default(0) @map("imported_count")
+  missingCount       Int              @default(0) @map("missing_count")
+  orphanCount        Int              @default(0) @map("orphan_count")
+  conflictCount      Int              @default(0) @map("conflict_count")
+  errorCount         Int              @default(0) @map("error_count")
+  errorCode          String?          @map("error_code") @db.VarChar(64)
+  errorMessage       String?          @map("error_message") @db.Text
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime         @updatedAt @map("updated_at")
+  connectedAccount   ConnectedAccount @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt], name: "telegram_sync_runs_user_created_idx")
+  @@index([connectedAccountId, createdAt], name: "telegram_sync_runs_acct_created_idx")
+  @@map("telegram_sync_runs")
+}
+
+model TelegramSyncIssue {
+  id                 String           @id @default(uuid()) @db.Char(36)
+  userId             String           @map("user_id") @db.Char(36)
+  runId              String?          @map("run_id") @db.Char(36)
+  connectedAccountId String           @map("connected_account_id") @db.Char(36)
+  // ORPHAN_REMOTE_FILE | REMOTE_FILE_MISSING | TELEGRAM_METADATA_MISMATCH
+  kind               String           @map("kind") @db.VarChar(32)
+  // Telegram-side physical reference (`telegram://channel/messageId`)
+  // when the issue is about a Telegram document. Nullable for issues
+  // that resolve purely on the 9Drive side.
+  telegramFileId     String?          @map("telegram_file_id") @db.VarChar(191)
+  // 9Drive-side file id when the issue resolves to a known row.
+  fileId             String?          @map("file_id") @db.Char(36)
+  detectedAt         DateTime         @default(now()) @map("detected_at")
+  resolvedAt         DateTime?        @map("resolved_at")
+  // Arbitrary JSON metadata: original DB row fields, Telegram fields,
+  // or whatever the resolver needs to make a decision. Never stores
+  // secrets.
+  metadata           Json?
+  connectedAccount   ConnectedAccount @relation(fields: [connectedAccountId], references: [id], onDelete: Cascade)
+
+  @@index([userId, connectedAccountId, resolvedAt], name: "telegram_sync_issues_user_acct_resolved_idx")
+  @@index([runId], name: "telegram_sync_issues_run_idx")
+  @@index([telegramFileId], name: "telegram_sync_issues_tg_file_idx")
+  @@index([fileId], name: "telegram_sync_issues_file_idx")
+  @@map("telegram_sync_issues")
 }

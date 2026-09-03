@@ -402,6 +402,220 @@ excludes them from its totals too.
   document limits but must be tuned (`TELEGRAM_MAX_FILE_BYTES`) for premium
   accounts or provider changes.
 
+## Telegram Synchronization
+
+Synchronization reconciles the configured Telegram storage channel
+against the 9Drive database. The DB is authoritative for the logical
+filesystem — the channel is a mirror — so the sync NEVER deletes data.
+The reconciliation ledger is a separate, append-only set of tables
+(`telegram_sync_state`, `telegram_sync_runs`, `telegram_sync_issues`).
+
+### Architecture
+
+```
+POST /telegram/sync                         ─ AutoSyncService (setInterval)
+                │                                   │
+                ▼                                   ▼
+         enqueueTelegramSync ─── BullMQ queue ─── runTelegramSync
+                │           (telegram-sync)        │
+                ▼                                   ▼
+                                       scanChannel ── reconcile ── issues
+                                       (per-account lock, single-flight)
+```
+
+The orchestrator lives in `backend/src/modules/telegram/telegram-sync.service.ts`.
+The worker lives in `telegram-sync.worker.ts` and is registered in the
+API process on boot. The queue + dedup are in `telegram-sync.queue.ts`.
+The periodic sweeper is in `telegram-sync.scheduler.ts`.
+
+### Source of truth
+
+9Drive is the source of truth for logical paths, folders, filenames,
+ownership, and metadata. Telegram is the source of truth for message
+existence, message ids, file identity, file size, and message metadata.
+The sync reconciles the two by **stable id** first, then by
+**physical identity** (`providerFileId`), then by **filename + size**
+heuristic — never assuming two files are identical based on filename
+alone (spec §7).
+
+### Initial sync
+
+When a Telegram Drive account connects for the first time, the
+`TelegramSyncState` row is absent. The first `runTelegramSync` call
+sees `last_message_id = null` and scans the entire channel
+(`min_id = 0`). Subsequent runs advance the cursor to the highest
+seen message id. Orphan Telegram documents (no matching DB row) are
+imported into the existing "Recovered from Telegram" inbox folder;
+documents with `9drive:id` metadata update by logical identity (see
+the previous 9Drive metadata section).
+
+### Incremental sync
+
+`TelegramSyncState.last_message_id` is the pagination cursor. Every
+run reads it and resumes at `min_id = last_message_id`. The cursor
+advances to `max(page.maxId)` after every page. The next run sees
+only the documents added since the previous run completed.
+
+### Full resync
+
+`POST /telegram/sync` accepts `{ full: true }` to ignore the cursor
+and rescan the entire channel. The Telegram side never returns
+deleted messages, so a full resync is also the safest way to confirm
+that the cursor hasn't drifted (e.g. a manual cleanup of the
+channel).
+
+### Orphan handling
+
+A Telegram document with no matching `File` row in the DB is an
+**orphan**. The sync imports it into the "Recovered from Telegram"
+inbox folder and surfaces it as a count in the run's
+`importedCount` / `orphanCount` stats. The user reviews the run via
+`GET /telegram/sync/runs`.
+
+### Missing remote handling
+
+A `File` row whose Telegram message no longer exists (the message was
+manually deleted in Telegram, or the channel was re-created) is
+flagged as a `REMOTE_FILE_MISSING` issue. The 9Drive row is NEVER
+deleted by the sync — the user can resolve the discrepancy via the
+existing 9Drive-side permanent-delete flow
+(`DELETE /files/batch/permanent`), which removes both the 9Drive
+row and the Telegram message. **No automatic re-upload** happens on
+missing-remote (spec §13).
+
+### Conflict handling
+
+A DB row whose Telegram metadata (size / mimeType) disagrees with the
+current channel state is flagged as a `TELEGRAM_METADATA_MISMATCH`
+issue. The user reviews via
+`GET /telegram/accounts/:accountId/sync-issues?kind=TELEGRAM_METADATA_MISMATCH`
+and resolves via `POST /telegram/sync-issues/:id/resolve`. Sync
+NEVER auto-resolves a conflict.
+
+### Reconciliation rules (spec §26)
+
+| DB row                     | Telegram message                  | Outcome                |
+| -------------------------- | --------------------------------- | ---------------------- |
+| exists, matches            | exists, matches metadata          | `matched`              |
+| exists, | no Telegram message              | `REMOTE_FILE_MISSING` |
+| no DB row                  | exists                            | `imported` (inbox)     |
+| exists, mismatched metadata| exists                            | `TELEGRAM_METADATA_MISMATCH` |
+
+### Retry behavior
+
+- `client.iterMessages` errors are classified by
+  `classifyTelegramError`. FloodWait waits the requested seconds and
+  retries up to `TELEGRAM_SYNC_FLOOD_WAIT_RETRIES` times per page.
+- Transient errors (TELEGRAM_NETWORK, FLOOD_WAIT) abort the run with
+  status `sync_failed` and surface the last error. NO files are
+  marked missing on transient errors (spec §25).
+- A failed run releases the single-flight guard so the next manual
+  or automatic sync can retry.
+
+### Automatic sync
+
+A `setInterval`-based sweeper runs every
+`TELEGRAM_SYNC_INTERVAL_MINUTES` minutes (default 30, range 15–720).
+It enqueues a sync for each connected Telegram account whose state
+row's `last_scan_at` is older than the interval, OR has status
+`never_synced`. Disabled by setting
+`TELEGRAM_SYNC_AUTO_ENABLED=false`. The sweeper is `unref()`'d so it
+never holds the process open, and is gated by an `inFlight` flag so
+overlapping ticks never enqueue duplicate jobs.
+
+### Manual sync
+
+`POST /telegram/sync` enqueues a BullMQ job. The response carries the
+job id and the queue status (`queued` or `already_queued` when a job
+for the same `(accountId, trigger)` is in flight). The UI polls
+`GET /telegram/sync/runs?accountId=...` and
+`GET /telegram/accounts/:accountId/status` to render the spinner,
+final state, and the "3 synchronization issues" link to the review
+view.
+
+### Usage calculation
+
+Telegram sync uses the same indexed-only model as uploads:
+`usedBytes` and `fileCount` are derived from active `File` rows.
+No quota (`totalBytes` / `availableBytes`) is ever shown — sync
+never invents a quota (spec §23). The connected-account serializer
+extends the `telegram:` block with sync-only fields:
+
+```ts
+telegram: {
+  channelId, channelTitle, status,
+  syncStatus,          // never_synced | syncing | up_to_date | changes_detected | needs_attention | sync_failed
+  lastSyncAt,          // ISO string of last_scan_at
+  openIssuesCount,     // unresolved issues for the "Review" badge
+}
+```
+
+### HTTP surface
+
+- `POST /telegram/sync` — body `{ accountId, full? }`; returns
+  `{ status, jobId, queued }`.
+- `GET /telegram/sync/runs?accountId=&limit=` — recent runs for the UI
+  history list.
+- `GET /telegram/accounts/:accountId/status` — single status card:
+  `{ status, lastMessageId, lastScanAt, errorCode, errorMessage,
+  lastRun, openIssuesCount, liveJobId, knownStatuses }`.
+- `GET /telegram/accounts/:accountId/sync-issues?kind=&limit=` —
+  unresolved issues for the "Review" panel.
+- `POST /telegram/sync-issues/:id/resolve` — mark an issue
+  `resolvedAt = now()`.
+- `POST /telegram/sync-issues/bulk-resolve` — body `{ accountId,
+  kind? }`; resolves every matching unresolved issue in one call.
+
+### Sync status vocabulary
+
+|Status            | Meaning                                                       |
+|------------------|---------------------------------------------------------------|
+|`never_synced`    | No sync attempt yet.                                          |
+|`syncing`         | A run is in flight (also the lock value).                      |
+|`up_to_date`      | LastRun found no changes (all matched).                       |
+|`changes_detected`| LastRun found >0 imported orphans (no missing/conflicts).     |
+|`needs_attention` | LastRun produced missing or conflict issues.                  |
+|`sync_failed`      | LastRun errored (transient or permanent).                      |
+
+### Concurrency protection
+
+The single-flight guard is the atomic
+`UPDATE telegram_sync_state SET status = 'syncing' WHERE id = ? AND
+status != 'syncing'` transition. If the row already has `status =
+'syncing'`, zero rows are affected and the service throws
+`SYNC_ALREADY_RUNNING` (409). The same guard is applied in the
+BullMQ producer via deterministic job ids
+(`${accountId}~manual` / `${accountId}~auto`) — BullMQ dedups on
+jobId, so two concurrent enqueues result in one queued job
+(`{ status: 'already_queued' }`).
+
+### Rate limiting
+
+- `client.iterMessages(channel, { min_id, limit: 100 })` — Telegram
+  caps responses at ~100/page; the env-controlled
+  `TELEGRAM_SYNC_PAGE_SIZE` is the upper bound.
+- `TELEGRAM_SYNC_CONCURRENCY` (default 2) is reserved for future
+  parallel-page support; the current implementation processes one
+  page at a time (pages are sequential to keep the cursor monotonic).
+- FloodWait is respected per page; the retry budget is
+  `TELEGRAM_SYNC_FLOOD_WAIT_RETRIES` (default 3).
+
+### Tests performed
+
+- `telegram-sync.service.test.ts` — initial sync (10 orphans → 10
+  inbox imports), incremental sync (only documents after cursor),
+  orphan detection, missing-remote detection (with soft-delete
+  exclusion), metadata-mismatch detection, single-flight guard
+  (`SYNC_ALREADY_RUNNING`), transient API failure (no files marked
+  missing), `GOOGLE_REAUTH_REQUIRED` for reauth-required accounts,
+  pagination safety (multi-page, short-page termination).
+- `telegram-sync.queue.test.ts` — deterministic job ids, dedup on
+  `jobId`, single-flight per `(accountId, trigger)`, graceful close.
+- `telegram-sync.scheduler.test.ts` — sweep enqueues only eligible
+  accounts, respects the syncing guard, respects the interval,
+  idempotent `start` / `stop`.
+- All pre-existing tests remain green (67 files, 899 tests).
+
 ## Future improvements
 
 - Durable retry/queue for Telegram uploads (currently the current retries).

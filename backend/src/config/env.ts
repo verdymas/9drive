@@ -95,6 +95,21 @@ const envSchema = z.object({
   TELEGRAM_MAX_FILE_BYTES: z.coerce.number().default(2 * 1024 * 1024 * 1024),
   // Title of the private channel used as Telegram blob storage per account.
   TELEGRAM_STORAGE_CHANNEL: z.string().default('9drive'),
+  // ── Telegram Synchronization (channel ↔ 9Drive reconciliation) ─────────
+  // Master switch for the periodic sweep. Manual `POST /telegram/sync` is
+  // always allowed; this only gates the setInterval-driven auto sync.
+  TELEGRAM_SYNC_AUTO_ENABLED: z.coerce.boolean().default(true),
+  // Sweep cadence (minutes). Spec recommends 15–30; default 30 keeps load
+  // bounded while still catching newly-deleted / uploaded files quickly.
+  TELEGRAM_SYNC_INTERVAL_MINUTES: z.coerce.number().int().min(15).max(720).default(30),
+  // Page size for `client.iterMessages`. Telegram returns ≤100/page; we keep
+  // this configurable for tests / smaller channels.
+  TELEGRAM_SYNC_PAGE_SIZE: z.coerce.number().int().min(10).max(200).default(100),
+  // Maximum pages processed in parallel. Spec §21 — bounded concurrency.
+  TELEGRAM_SYNC_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(2),
+  // Maximum retries per page on FloodWait. FloodWait itself waits the
+  // requested seconds; this caps how many times we re-enter on a row.
+  TELEGRAM_SYNC_FLOOD_WAIT_RETRIES: z.coerce.number().int().min(0).max(5).default(3),
   // Temp dir for chunked (non-Google) resumable upload staging. Bytes are
   // streamed here before the provider upload commits; removed after commit.
   UPLOAD_TEMP_DIR: z.string().default('./data/upload-tmp'),
