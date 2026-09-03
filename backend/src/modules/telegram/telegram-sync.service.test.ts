@@ -79,6 +79,20 @@ function fakeClient(opts: { documents: Array<{ messageId: number; name: string; 
   } as unknown as TelegramClient
 }
 
+/** Like fakeClient but also returns captions on getMessages. */
+function fakeClientWithCaptions(opts: {
+  documents: Array<{ messageId: number; name: string; size: number; mimeType: string | null }>
+  captions: Map<number, string>
+}): TelegramClient {
+  const base = fakeClient({ documents: opts.documents })
+  return {
+    ...base,
+    async getMessages(_channel: unknown, params: { ids: number[] }) {
+      return params.ids.map((id) => ({ id, message: opts.captions.get(id) ?? '' }))
+    },
+  } as unknown as TelegramClient
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   // Re-establish the default prisma mock implementations after
@@ -281,5 +295,71 @@ describe('runTelegramSync — pagination / large channel', () => {
     // `lastMessageId <= minId` stops the loop at page 3).
     expect(result.scannedCount).toBeGreaterThanOrEqual(200)
     expect(result.importedCount).toBeGreaterThanOrEqual(200)
+  })
+})
+
+describe('runTelegramSync — caption-driven resolution for orphans', () => {
+  it('fetches captions for orphan docs and reports per-strategy stats + structured log', async () => {
+    const docs = [
+      { messageId: 1, name: 'ep1.mkv', size: 1024, mimeType: 'video/x-matroska' },
+      { messageId: 2, name: 'ep2.mkv', size: 1024, mimeType: 'video/x-matroska' },
+      { messageId: 3, name: 'orphan.mkv', size: 1024, mimeType: 'video/x-matroska' },
+    ]
+    const captions = new Map<number, string>([
+      [1, '9drive:id=stable-1\n9drive:path=Movies/Anime/One Piece/ep1.mkv'],
+      [2, '9drive:path=Movies/Anime/One Piece/ep2.mkv'],
+      [3, ''],
+    ])
+    h.withTelegramClientMock.mockImplementation(
+      async (_cfg: unknown, fn: (client: TelegramClient) => Promise<unknown>) =>
+        fn(fakeClientWithCaptions({ documents: docs, captions })),
+    )
+
+    // The orchestrator-level stub of ingestTelegramDocument is a black box
+    // for stats purposes — we only assert on the counts and structured log
+    // emitted by the sync path itself, which now consumes captions.
+    const logSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+
+    const result = await runTelegramSync('user-1', 'acc-1')
+
+    // All three docs are orphans (no existing rows in h.state.fileRows),
+    // so they all flow through the caption-driven ingest path.
+    expect(result.scannedCount).toBe(3)
+    expect(result.importedCount).toBe(3)
+    // Per-strategy breakdown is exposed on the run summary.
+    expect(result.matchedByIdCount + result.matchedByPathCount + result.recoveredCount).toBe(3)
+
+    // The structured per-document log fired once per orphan document.
+    const documentLogs = logSpy.mock.calls
+      .map((c) => { try { return JSON.parse(c[1] as string) } catch { return null } })
+      .filter((j) => j && j.event === 'telegram.sync.document')
+    expect(documentLogs).toHaveLength(3)
+    const strategies = documentLogs.map((j) => j.matchStrategy).sort()
+    // Doc 1 → 9drive_id, doc 2 → 9drive_path, doc 3 → none (empty caption).
+    // The orchestrator-level stub returns 'created' for every ingest, so
+    // the per-strategy breakdown maps each caption to its parsed value.
+    expect(strategies).toEqual(['9drive_id', '9drive_path', 'none'])
+
+    logSpy.mockRestore()
+  })
+
+  it('keeps working when caption fetch fails (falls back to recovery inbox)', async () => {
+    const docs = [{ messageId: 1, name: 'a.mkv', size: 1, mimeType: 'video/x-matroska' }]
+    h.withTelegramClientMock.mockImplementation(async (_cfg: unknown, fn: (client: TelegramClient) => Promise<unknown>) => {
+      // Client whose getMessages throws (e.g. transient network error).
+      const base = fakeClient({ documents: docs })
+      return fn({
+        ...base,
+        async getMessages() { throw new Error('TELEGRAM_NETWORK') },
+      } as unknown as TelegramClient)
+    })
+
+    const result = await runTelegramSync('user-1', 'acc-1')
+
+    // The orphan still routes through ingest; classifyOne catches the
+    // caption failure and falls through to the no-caption path.
+    expect(result.scannedCount).toBe(1)
+    expect(result.importedCount).toBe(1)
+    expect(result.recoveredCount).toBe(1)
   })
 })

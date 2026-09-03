@@ -16,6 +16,7 @@ import {
   withTelegramClient,
 } from './telegram.service.js'
 import { ingestTelegramDocument } from './telegram-ingest.service.js'
+import { parseCaption } from './telegram-metadata.js'
 
 /**
  * Telegram Synchronization / Reconciliation.
@@ -73,6 +74,13 @@ export type TelegramSyncRunStats = {
   orphanCount: number
   conflictCount: number
   errorCount: number
+  // Per-strategy breakdown for orphan Telegram documents that the
+  // caption-driven ingest resolved. `recoveredCount` counts the
+  // documents that landed in the "Recovered from Telegram" inbox
+  // because the caption was missing or malformed.
+  matchedByIdCount: number
+  matchedByPathCount: number
+  recoveredCount: number
 }
 
 export type TelegramSyncRunSummary = TelegramSyncRunStats & {
@@ -93,6 +101,9 @@ const emptyStats = (): TelegramSyncRunStats => ({
   orphanCount: 0,
   conflictCount: 0,
   errorCount: 0,
+  matchedByIdCount: 0,
+  matchedByPathCount: 0,
+  recoveredCount: 0,
 })
 
 export type TelegramSyncOptions = {
@@ -107,10 +118,24 @@ export type TelegramSyncOptions = {
 /**
  * Per-document classification. The orchestrator emits one of these
  * for every Telegram document seen during a scan.
+ *
+ * `imported` carries the resolution strategy + virtual path so the
+ * structured log + stats can attribute the match correctly. The
+ * `fileId` field is filled in when the ingest created or matched a
+ * row; `parentFolderId` is the folder the file was placed in (or
+ * `null` at the user root).
  */
 type DocumentOutcome =
   | { kind: 'matched' }
-  | { kind: 'imported'; telegramFileId: string }
+  | {
+      kind: 'imported'
+      telegramFileId: string
+      strategy: '9drive_id' | '9drive_path' | 'physical' | 'recovered' | 'none'
+      virtualPath: string | null
+      fileId: string | null
+      parentFolderId: string | null
+      action: 'created' | 'updated' | 'matched' | 'inboxed' | 'skipped'
+    }
   | { kind: 'missing'; telegramFileId: string; file: { id: string; name: string } }
   | { kind: 'conflict'; telegramFileId: string; reason: string; file: { id: string; name: string } }
   | { kind: 'error'; telegramFileId: string; errorCode: string; errorMessage: string }
@@ -399,9 +424,11 @@ async function scanChannel(input: {
             accountId,
             document,
             fileByProviderFileId,
+            getCaption: (remoteId) => fetchCaptionForRemoteId(client, channel, remoteId),
           })
           applyOutcomeStats(stats, outcome)
           await recordOutcome({ outcome, runId: input.runId, userId, accountId, document })
+          logSyncDocument({ runId: input.runId, accountId, outcome })
           if (rawDocument.messageId > (maxSeen ? Number(maxSeen) : 0)) {
             maxSeen = BigInt(rawDocument.messageId)
           }
@@ -464,8 +491,10 @@ async function classifyOne(input: {
   accountId: string
   document: TelegramDocument
   fileByProviderFileId: Map<string, { id: string; name: string; mimeType: string; sizeBytes: bigint; folderId: string | null; telegramStableId: string | null; status: string }>
+  /** Fetches the caption for a remote id; `null` when the fetch fails. */
+  getCaption: (remoteId: string) => Promise<string | null>
 }): Promise<DocumentOutcome> {
-  const { document, fileByProviderFileId } = input
+  const { document, fileByProviderFileId, getCaption } = input
 
   // Physical identity match by `providerFileId`.
   const existing = fileByProviderFileId.get(document.remoteId)
@@ -487,18 +516,63 @@ async function classifyOne(input: {
     }
   }
 
-  // Orphan: Telegram-only document. Delegate to the existing
-  // ingest path so the orphan is placed in the inbox folder and
-  // (when caption metadata is present) routed by stable id.
+  // Orphan: Telegram-only document. Fetch the caption and delegate to
+  // the ingest path so a valid 9drive:id / 9drive:path caption routes
+  // the file to its logical location instead of the recovery inbox.
+  // The fetch is best-effort — a transient caption read failure falls
+  // back to the legacy "no caption" behaviour (which still lands the
+  // file in the recovery folder rather than dropping it).
+  let caption: string | null = null
+  try {
+    caption = await getCaption(document.remoteId)
+  } catch {
+    caption = null
+  }
+  const parsed = parseCaption(caption)
+  // The strategy is decided by what the caption carries. The ingest
+  // service itself picks the resolution branch in the same order
+  // (9drive:id → 9drive:path → physical remote → recovery).
+  const strategy: '9drive_id' | '9drive_path' | 'physical' | 'recovered' | 'none' = parsed.stableId
+    ? '9drive_id'
+    : parsed.logicalPath
+      ? '9drive_path'
+      : 'none'
+
   try {
     const outcome = await ingestTelegramDocument(input.userId, input.accountId, {
       remoteId: document.remoteId,
       name: document.name,
       size: document.size,
       mimeType: document.mimeType,
-    }, null)
+    }, caption)
+
+    // After the ingest, resolve the file + parent folder for the
+    // structured log. The ingest path is idempotent; this lookup is
+    // bounded by the (userId, providerFileId) index.
+    const placed = await prisma.file.findFirst({
+      where: { userId: input.userId, provider: 'telegram', providerFileId: document.remoteId },
+      select: { id: true, folderId: true },
+    })
+
+    // Inbox routing is always a "recovered" outcome, regardless of
+    // whether the caption had partial metadata (e.g. a `9drive:id` that
+    // didn't match any row, or a `9drive:path` that was rejected as
+    // unsafe). An `inboxed` result means the ingest path chose the
+    // recovery folder as a last resort.
+    const finalStrategy: '9drive_id' | '9drive_path' | 'physical' | 'recovered' | 'none' = outcome === 'inboxed'
+      ? 'recovered'
+      : strategy
+
     if (outcome === 'created' || outcome === 'inboxed') {
-      return { kind: 'imported', telegramFileId: document.remoteId }
+      return {
+        kind: 'imported',
+        telegramFileId: document.remoteId,
+        strategy: finalStrategy,
+        virtualPath: parsed.logicalPath,
+        fileId: placed?.id ?? null,
+        parentFolderId: placed?.folderId ?? null,
+        action: outcome,
+      }
     }
     return { kind: 'matched' }
   } catch (error) {
@@ -511,6 +585,26 @@ async function classifyOne(input: {
   }
 }
 
+/**
+ * Best-effort caption fetch for a single remote id. Returns `null` on
+ * any failure (the ingest path then falls back to the recovery inbox
+ * rather than dropping the document).
+ */
+async function fetchCaptionForRemoteId(
+  client: TelegramClient,
+  channel: unknown,
+  remoteId: string,
+): Promise<string | null> {
+  try {
+    const { messageId } = parseTelegramRemoteId(remoteId)
+    const messages = await client.getMessages(channel as never, { ids: [messageId] })
+    const message = messages[0] as { message?: string } | undefined
+    return message?.message ?? null
+  } catch {
+    return null
+  }
+}
+
 function applyOutcomeStats(stats: TelegramSyncRunStats, outcome: DocumentOutcome) {
   stats.scannedCount += 1
   switch (outcome.kind) {
@@ -520,6 +614,9 @@ function applyOutcomeStats(stats: TelegramSyncRunStats, outcome: DocumentOutcome
     case 'imported':
       stats.importedCount += 1
       stats.orphanCount += 1
+      if (outcome.strategy === '9drive_id') stats.matchedByIdCount += 1
+      else if (outcome.strategy === '9drive_path') stats.matchedByPathCount += 1
+      else if (outcome.strategy === 'recovered' || outcome.strategy === 'none') stats.recoveredCount += 1
       break
     case 'missing':
       stats.missingCount += 1
@@ -531,6 +628,39 @@ function applyOutcomeStats(stats: TelegramSyncRunStats, outcome: DocumentOutcome
       stats.errorCount += 1
       break
   }
+}
+
+/**
+ * Emit one structured log line per document. Format mirrors the spec
+ * (§23) so an operator can see at a glance how each Telegram document
+ * was resolved (by id, by path, or by recovery fallback). Never logs
+ * session strings, API hashes, OTPs, or other authentication secrets.
+ */
+function logSyncDocument(input: { runId: string; accountId: string; outcome: DocumentOutcome }): void {
+  const { runId, accountId, outcome } = input
+  if (outcome.kind === 'imported') {
+    const pathResolution = outcome.virtualPath ? 'success' : 'failed'
+    const reason = outcome.strategy === 'recovered'
+      ? (outcome.virtualPath ? 'unresolvable_path' : 'missing_metadata')
+      : outcome.strategy === 'none'
+        ? 'missing_metadata'
+        : undefined
+    console.info('[telegram-sync]', JSON.stringify({
+      event: 'telegram.sync.document',
+      runId,
+      accountId,
+      remoteId: outcome.telegramFileId,
+      matchStrategy: outcome.strategy,
+      virtualPath: outcome.virtualPath,
+      pathResolution,
+      parentFolderId: outcome.parentFolderId,
+      fileId: outcome.fileId,
+      action: outcome.action,
+      ...(reason ? { reason } : {}),
+    }))
+  }
+  // matched/conflict/missing/error are already logged elsewhere or are
+  // not user-actionable per document; omit to keep the log volume sane.
 }
 
 async function recordOutcome(input: {

@@ -438,10 +438,77 @@ The periodic sweeper is in `telegram-sync.scheduler.ts`.
 9Drive is the source of truth for logical paths, folders, filenames,
 ownership, and metadata. Telegram is the source of truth for message
 existence, message ids, file identity, file size, and message metadata.
-The sync reconciles the two by **stable id** first, then by
-**physical identity** (`providerFileId`), then by **filename + size**
-heuristic — never assuming two files are identical based on filename
+The sync reconciles the two in this order (spec §11):
+
+1. **Physical identity** — match by `providerFileId`
+   (`telegram://<channelId>/<messageId>`). High confidence; the
+   channel + message id is globally unique and immutable.
+2. **`9drive:id` caption** — the strongest logical identity. A row
+   keyed on `(userId, telegramStableId)` is matched, then the
+   `9drive:path` caption is used to **verify / correct** the
+   destination folder. Existing files in the recovery folder are
+   moved to the correct location; never duplicated.
+3. **`9drive:path` caption only** — match by `providerFileId`,
+   then use the path to position the row. Missing folders in the
+   chain are auto-created.
+4. **Recovery folder** — genuine last resort. Used when no
+   `9drive:id` / `9drive:path` is present, when the path is
+   malformed, or when traversal is detected. Never used merely
+   because a folder does not exist or the file is currently in
+   another folder.
+
+The sync never assumes two files are identical based on filename
 alone (spec §7).
+
+### Caption reading on full sync
+
+The full-sync path (`runTelegramSync` → `scanChannel` → `classifyOne`)
+fetches the caption for **every orphan** document (a Telegram doc with
+no matching `providerFileId`) and passes it to the caption-driven
+ingest service. This mirrors the recovery `POST /telegram/accounts/:id/import`
+endpoint. A transient caption fetch failure (network, FloodWait) is
+swallowed and falls back to the no-caption behaviour (recovery inbox).
+
+### Per-document structured log
+
+For every orphan the sync emits one `[telegram-sync]` info log line
+with the shape:
+
+```json
+{
+  "event": "telegram.sync.document",
+  "runId": "...",
+  "accountId": "...",
+  "remoteId": "telegram://<channel>/<message>",
+  "matchStrategy": "9drive_id" | "9drive_path" | "recovered" | "none",
+  "virtualPath": "Movies/Anime/file.mkv" | null,
+  "pathResolution": "success" | "failed",
+  "parentFolderId": "..." | null,
+  "fileId": "..." | null,
+  "action": "created" | "updated" | "matched" | "inboxed",
+  "reason": "missing_metadata" | "unresolvable_path"   // only on recovery
+}
+```
+
+The log never includes session strings, API hashes, OTPs, or other
+authentication secrets. Operators can grep `[telegram-sync]` to follow
+exactly how each Telegram document was resolved.
+
+### Per-strategy statistics
+
+The `TelegramSyncRunSummary` and `telegram.sync` audit log payload
+include three additional counters that break down how orphan documents
+were resolved:
+
+- `matchedByIdCount` — caption had a `9drive:id` that matched an
+  existing row.
+- `matchedByPathCount` — caption had only a `9drive:path` (no id) that
+  the ingest service used to position the row.
+- `recoveredCount` — landed in the "Recovered from Telegram" inbox
+  (no metadata, malformed path, or path traversal).
+
+The existing per-run counters (`scannedCount`, `matchedCount`,
+`importedCount`, etc.) are unchanged.
 
 ### Initial sync
 
@@ -450,9 +517,11 @@ When a Telegram Drive account connects for the first time, the
 sees `last_message_id = null` and scans the entire channel
 (`min_id = 0`). Subsequent runs advance the cursor to the highest
 seen message id. Orphan Telegram documents (no matching DB row) are
-imported into the existing "Recovered from Telegram" inbox folder;
-documents with `9drive:id` metadata update by logical identity (see
-the previous 9Drive metadata section).
+routed through the caption-driven ingest service: documents with
+`9drive:id` update by logical identity, documents with
+`9drive:path` are positioned by the path (creating missing folders),
+and documents with no usable caption are placed in the "Recovered
+from Telegram" inbox folder.
 
 ### Incremental sync
 
@@ -472,9 +541,19 @@ channel).
 ### Orphan handling
 
 A Telegram document with no matching `File` row in the DB is an
-**orphan**. The sync imports it into the "Recovered from Telegram"
-inbox folder and surfaces it as a count in the run's
-`importedCount` / `orphanCount` stats. The user reviews the run via
+**orphan**. The sync reads the orphan's caption and routes it through
+the caption-driven ingest service:
+
+- `9drive:id` matches an existing row → update by logical identity
+  (recompute folder chain from `9drive:path`).
+- `9drive:path` only → match by `providerFileId`, then position the
+  row by the path. Missing folders in the chain are auto-created.
+- No usable caption → import into the "Recovered from Telegram" inbox
+  folder.
+
+The run summary surfaces orphans as `importedCount` / `orphanCount`
+plus the per-strategy breakdown (`matchedByIdCount`,
+`matchedByPathCount`, `recoveredCount`). The user reviews the run via
 `GET /telegram/sync/runs`.
 
 ### Missing remote handling
