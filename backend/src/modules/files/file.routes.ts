@@ -17,31 +17,7 @@ import { GetObjectCommand } from '@aws-sdk/client-s3'
 import { Readable } from 'node:stream'
 import { ZipArchive } from 'archiver'
 import { createAuditLog } from '../../utils/audit.js'
-import { logicalPathForFileId } from './file-logical-path.js'
-
-/**
- * Best-effort Telegram caption refresh. Invoked after rename/move on a
- * Telegram-backed file. Resolves the current logical path from the DB,
- * loads the storage config, and asks the caption service to re-encode
- * + `editMessage`. Errors are caught by the caller (never block the
-  // route response) and the next ingest reconciles any drift.
- */
-async function refreshTelegramCaption(userId: string, fileId: string): Promise<void> {
-  const file = await prisma.file.findFirst({
-    where: { id: fileId, userId, provider: 'telegram' },
-    select: { id: true, name: true, connectedAccountId: true, telegramStableId: true },
-  })
-  if (!file || !file.telegramStableId) return
-  const [logicalPath, config] = await Promise.all([
-    logicalPathForFileId(userId, fileId),
-    getTelegramConfig(file.connectedAccountId, userId).catch(() => null),
-  ])
-  if (!config) return
-  const { updateTelegramDocumentCaption } = await import('../telegram/telegram-caption.service.js')
-  await updateTelegramDocumentCaption(userId, { id: file.id, name: file.name, telegramStableId: file.telegramStableId }, config, logicalPath)
-}
-
-
+import { refreshTelegramCaption } from '../telegram/telegram-caption-refresh.js'
 
 export const fileRouter = Router()
 

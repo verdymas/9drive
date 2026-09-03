@@ -11,6 +11,8 @@ import { ensureGoogleAppFolder, getAuthedGoogleClient, syncGoogleQuota } from '.
 import { buildS3ObjectKey, getS3ConfigForAccount, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
 import { getTelegramConfig, markTelegramReauthRequired, uploadTelegramDocument } from '../telegram/telegram.service.js'
 import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
+import { buildInitialCaption } from '../telegram/telegram-caption.service.js'
+import { logicalPathForFileId } from '../files/file-logical-path.js'
 import { resolveUploadPlacement } from '../storage/upload-placement.service.js'
 import type { RemoteImportJobData } from './queue.js'
 import { followRemoteUrl } from './url-downloader.js'
@@ -282,19 +284,58 @@ async function uploadTempFile(
   if (account.provider === 'telegram') {
     const config = await getTelegramConfig(account.id, userId)
     const uploadProgress = throttledProgressUpdater(importId, STAGES.UPLOADING)
-    const providerFileId = await uploadTelegramDocument(config, {
-      filePath: tempPartPath,
-      name: fileName,
-      mimeType,
-      sizeBytes: Number(uploadTotalBytes),
-      onProgress: (pct) => {
-        void uploadProgress({ uploadedBytes: BigInt(Math.round((pct / 100) * Number(uploadTotalBytes))).toString() })
+
+    // Pre-create the File row so we can mint `telegramStableId = file.id`
+    // and compute the full logical path BEFORE the upload — the caption
+    // must be encoded with the final destination path, not just the
+    // filename. Mirrors the normal /uploads flow.
+    const provisionalFile = await prisma.file.create({
+      data: {
+        userId,
+        connectedAccountId: account.id,
+        folderId,
+        provider: 'telegram',
+        providerFileId: 'pending',
+        name: fileName,
+        mimeType,
+        sizeBytes: uploadTotalBytes,
+        status: 'uploading',
       },
     })
-    // Force the final write so the bar reaches 100% the moment the upload
-    // completes (mirrors the S3 branch).
-    await prisma.remoteImport.update({ where: { id: importId }, data: { uploadedBytes: uploadTotalBytes } }).catch(() => undefined)
-    return { providerFileId, fileId: null }
+
+    try {
+      const stableId = provisionalFile.id
+      await prisma.file.update({
+        where: { id: provisionalFile.id },
+        data: { telegramStableId: stableId },
+      })
+
+      const logicalPath = await logicalPathForFileId(userId, provisionalFile.id)
+      const caption = buildInitialCaption(stableId, logicalPath)
+
+      const providerFileId = await uploadTelegramDocument(config, {
+        filePath: tempPartPath,
+        name: fileName,
+        mimeType,
+        sizeBytes: Number(uploadTotalBytes),
+        caption: caption ?? undefined,
+        onProgress: (pct) => {
+          void uploadProgress({ uploadedBytes: BigInt(Math.round((pct / 100) * Number(uploadTotalBytes))).toString() })
+        },
+      })
+      // Force the final write so the bar reaches 100% the moment the upload
+      // completes (mirrors the S3 branch).
+      await prisma.remoteImport.update({ where: { id: importId }, data: { uploadedBytes: uploadTotalBytes } }).catch(() => undefined)
+      return { providerFileId, fileId: provisionalFile.id }
+    } catch (error) {
+      // Soft-delete the provisional row so the import looks like a no-op
+      // (mirrors the S3 branch's failure handling).
+      await prisma.file.update({
+        where: { id: provisionalFile.id },
+        data: { status: 'deleted', deletedAt: new Date() },
+      }).catch(() => undefined)
+      throw error
+    }
   }
 
   // Google Drive — resumable upload streams the temp file directly, records
@@ -309,8 +350,21 @@ async function uploadTempFile(
 /**
  * Register the imported file in the virtual filesystem (idempotent by
  * providerFileId when the row already points at one).
+ *
+ * `options.existingFileId` lets the caller reuse a provisional row that
+ * `uploadTempFile` already created (e.g. for Telegram, where the stable
+ * id and caption must be stamped BEFORE the upload so the first
+ * Telegram message carries the right metadata). When provided, the
+ * provisional row is flipped to `active` and the final `sizeBytes` /
+ * `providerFileId` are stamped instead of creating a second row.
  */
-async function registerFile(importId: string, remoteImport: { userId: string; folderId: string | null; connectedAccountId: string | null; fileName: string; mimeType: string | null; tempPath?: string | null }, providerFileId: string, sizeBytes: bigint) {
+async function registerFile(
+  importId: string,
+  remoteImport: { userId: string; folderId: string | null; connectedAccountId: string | null; fileName: string; mimeType: string | null; tempPath?: string | null },
+  providerFileId: string,
+  sizeBytes: bigint,
+  options: { existingFileId?: string } = {},
+) {
   await updateStage(importId, STAGES.REGISTERING)
   const accountId = remoteImport.connectedAccountId
   if (!accountId) throw new Error('Missing connected account for file registration.')
@@ -320,6 +374,15 @@ async function registerFile(importId: string, remoteImport: { userId: string; fo
     where: { userId: remoteImport.userId, provider, providerFileId },
   })
   if (existing) return existing
+
+  if (options.existingFileId) {
+    const updated = await prisma.file.update({
+      where: { id: options.existingFileId, userId: remoteImport.userId },
+      data: { providerFileId, sizeBytes, status: 'active' },
+    })
+    await createAuditLog(remoteImport.userId, 'IMPORT_FILE', 'file', updated.id, { name: updated.name, size: updated.sizeBytes.toString() })
+    return updated
+  }
 
   const created = await prisma.file.create({
     data: {
@@ -628,7 +691,7 @@ async function processHlsImport(
     const sizeBytes = BigInt((await fsp.stat(outputPath!)).size)
 
     // ── Register + link. ────────────────────────────────────────────────────
-    const file = await registerFile(importId, { ...record, connectedAccountId: account.id, fileName: record.fileName, mimeType }, uploaded.providerFileId, sizeBytes)
+    const file = await registerFile(importId, { ...record, connectedAccountId: account.id, fileName: record.fileName, mimeType }, uploaded.providerFileId, sizeBytes, { existingFileId: uploaded.fileId ?? undefined })
 
     await prisma.remoteImport.update({
       where: { id: importId },
@@ -904,7 +967,7 @@ async function continueFromPart(
 
   // Register file + link the import row.
   const sizeBytes = contentLength ?? (await fsp.stat(tempPartPath)).size
-  const file = await registerFile(importId, { ...input.record, connectedAccountId: account.id, fileName, mimeType }, uploaded.providerFileId, BigInt(sizeBytes))
+  const file = await registerFile(importId, { ...input.record, connectedAccountId: account.id, fileName, mimeType }, uploaded.providerFileId, BigInt(sizeBytes), { existingFileId: uploaded.fileId ?? undefined })
 
   const totalSize = BigInt(sizeBytes)
   await prisma.remoteImport.update({

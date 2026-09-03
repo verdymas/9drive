@@ -171,6 +171,7 @@ const h = vi.hoisted(() => {
         const rows = files.filter((f) => {
           if (where?.userId && f.userId !== where.userId) return false
           if (where?.status && f.status !== where.status) return false
+          if (where?.provider && f.provider !== where.provider) return false
           if (where?.folderId?.in && !where.folderId.in.includes(f.folderId)) return false
           return true
         })
@@ -206,6 +207,7 @@ const h = vi.hoisted(() => {
     })),
     deleteDriveFile: vi.fn(async () => ({})),
     deleteS3File: vi.fn(async () => undefined),
+    refreshTelegramCaption: vi.fn(async () => undefined),
   }
 })
 
@@ -229,6 +231,10 @@ vi.mock('../storage/provider-folder.service.js', () => ({
 
 vi.mock('../storage/folder-materialization.service.js', () => ({
   ensureFolderStorageLocation: (...args: unknown[]) => h.materialize(...args),
+}))
+
+vi.mock('../telegram/telegram-caption-refresh.js', () => ({
+  refreshTelegramCaption: (...args: unknown[]) => h.refreshTelegramCaption(...args),
 }))
 
 // The delete route calls google.drive() directly for google files — mock the
@@ -280,6 +286,7 @@ function reset() {
   h.root.mockImplementation(async () => 'ROOT')
   h.deleteDriveFile.mockImplementation(async () => ({}))
   h.deleteS3File.mockImplementation(async () => undefined)
+  h.refreshTelegramCaption.mockImplementation(async () => undefined)
   h.materialize.mockImplementation(async (_userId: string, parentId: string, connectedAccountId: string) => ({
     location: { id: `loc-${parentId}-${connectedAccountId}`, folderId: parentId, connectedAccountId, provider: 'google_drive', providerFolderId: `parent-${parentId}-${connectedAccountId}` },
     createdCount: 1,
@@ -418,5 +425,50 @@ describe('DELETE /folders/:id', () => {
     // Files + folders soft-deleted.
     expect(h.files.every((f) => f.status === 'deleted')).toBe(true)
     expect(h.folders.every((f) => f.deletedAt !== null)).toBe(true)
+  })
+})
+
+describe('PATCH /folders/:id — Telegram caption fan-out', () => {
+  beforeEach(reset)
+
+  it('renames the virtual folder and refreshes the Telegram caption on every active Telegram descendant file', async () => {
+    h.folder('movies', 'Movies')
+    h.file('tg-file-1', 'movies', 'acc-a', 'telegram', 'telegram://channel-1/1', 'movie1.mkv')
+    h.file('tg-file-2', 'movies', 'acc-a', 'telegram', 'telegram://channel-1/2', 'movie2.mkv')
+    h.file('gdrive-file', 'movies', 'acc-a', 'google_drive', 'drive-file-1', 'movie3.mkv')
+
+    const { status } = await api('PATCH', '/movies', { name: 'Films' })
+
+    expect(status).toBe(200)
+    // Fan-out ran for both Telegram descendants; non-Telegram files are
+    // ignored even though they share the same folder.
+    expect(h.refreshTelegramCaption).toHaveBeenCalledTimes(2)
+    const refreshed = (h.refreshTelegramCaption as ReturnType<typeof vi.fn>).mock.calls
+    const ids = refreshed.map((c) => c[1]).sort()
+    expect(ids).toEqual(['tg-file-1', 'tg-file-2'])
+    for (const call of refreshed) expect(call[0]).toBe('user-1')
+  })
+
+  it('moves the virtual folder and refreshes Telegram captions on descendants', async () => {
+    h.folder('movies', 'Movies')
+    h.folder('series', 'Series')
+    h.file('tg-file-1', 'movies', 'acc-a', 'telegram', 'telegram://channel-1/1', 'ep.mkv')
+
+    const { status } = await api('PATCH', '/movies', { parentId: 'series' })
+
+    expect(status).toBe(200)
+    expect(h.refreshTelegramCaption).toHaveBeenCalledTimes(1)
+    expect(h.refreshTelegramCaption).toHaveBeenCalledWith('user-1', 'tg-file-1')
+  })
+
+  it('does not refresh captions when no body change is requested', async () => {
+    h.folder('movies', 'Movies')
+    h.file('tg-file-1', 'movies', 'acc-a', 'telegram', 'telegram://channel-1/1', 'ep.mkv')
+
+    // PATCH with empty body — server ignores it.
+    const { status } = await api('PATCH', '/movies', { color: '#000000' })
+
+    expect(status).toBe(200)
+    expect(h.refreshTelegramCaption).not.toHaveBeenCalled()
   })
 })

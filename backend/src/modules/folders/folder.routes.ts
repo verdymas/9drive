@@ -11,6 +11,7 @@ import { createAuditLog } from '../../utils/audit.js'
 import { deleteProviderFolder, ensureProviderRoot, moveProviderFolder, renameProviderFolder } from '../storage/provider-folder.service.js'
 import { ensureFolderStorageLocation } from '../storage/folder-materialization.service.js'
 import { normalizeFolderName } from '../sync/normalize-folder-name.js'
+import { refreshTelegramCaption } from '../telegram/telegram-caption-refresh.js'
 
 export const folderRouter = Router()
 folderRouter.use(requireAuth)
@@ -19,6 +20,23 @@ const defaultFolderColor = '#3b82f6'
 const defaultFolderIconUrl = 'https://api.iconify.design/lucide:folder.svg'
 const iconUrlSchema = z.string().url().startsWith('https://api.iconify.design/lucide:').max(2048)
 const colorSchema = z.string().regex(/^(#[0-9a-fA-F]{6}|text-[a-z]+-[0-9]+)$/).max(64)
+
+/** All folder ids in a user's active tree that are the root or descendants of it. */
+async function collectDescendantFolderIds(userId: string, rootId: string): Promise<Set<string>> {
+  const folders = await prisma.folder.findMany({ where: { userId, deletedAt: null }, select: { id: true, parentId: true } })
+  const ids = new Set<string>([rootId])
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const folder of folders) {
+      if (folder.parentId && ids.has(folder.parentId) && !ids.has(folder.id)) {
+        ids.add(folder.id)
+        changed = true
+      }
+    }
+  }
+  return ids
+}
 
 const createSchema = z.object({
   name: z.string().min(1).max(255),
@@ -174,18 +192,7 @@ folderRouter.patch('/:id', async (req: AuthRequest, res, next) => {
 
     if (body.parentId) {
       await prisma.folder.findFirstOrThrow({ where: { id: body.parentId, userId: req.user!.id, deletedAt: null } })
-      const folders = await prisma.folder.findMany({ where: { userId: req.user!.id, deletedAt: null }, select: { id: true, parentId: true } })
-      const descendantIds = new Set<string>([folderId])
-      let changed = true
-      while (changed) {
-        changed = false
-        for (const folder of folders) {
-          if (folder.parentId && descendantIds.has(folder.parentId) && !descendantIds.has(folder.id)) {
-            descendantIds.add(folder.id)
-            changed = true
-          }
-        }
-      }
+      const descendantIds = await collectDescendantFolderIds(req.user!.id, folderId)
       if (descendantIds.has(body.parentId)) return res.status(400).json({ code: 'FOLDER_INVALID_PARENT', message: 'Folder cannot be moved into itself or a child folder.' })
     }
 
@@ -247,6 +254,22 @@ folderRouter.patch('/:id', async (req: AuthRequest, res, next) => {
       }
     }
 
+    // Telegram caption refresh for every active Telegram-backed file in
+    // the descendant set (best-effort, never blocks the response; the DB
+    // is the source of truth and the next ingest reconciles any drift).
+    if (body.name || body.parentId !== undefined) {
+      const descendantIds = await collectDescendantFolderIds(req.user!.id, folderId)
+      const telegramFiles = await prisma.file.findMany({
+        where: { userId: req.user!.id, status: 'active', provider: 'telegram', folderId: { in: [...descendantIds] } },
+        select: { id: true },
+      })
+      for (const file of telegramFiles) {
+        void refreshTelegramCaption(req.user!.id, file.id).catch((error) => {
+          console.error('[telegram-caption] failed to refresh caption after PATCH /folders/:id', error?.message || error)
+        })
+      }
+    }
+
     const updated = await prisma.folder.findFirstOrThrow({
       where: { id: folderId, userId: req.user!.id },
       select: { id: true, name: true, color: true, iconUrl: true, parentId: true, providerFolderId: true, createdAt: true, updatedAt: true },
@@ -262,18 +285,7 @@ folderRouter.delete('/:id', async (req: AuthRequest, res, next) => {
   try {
     const rootId = String(req.params.id)
     const root = await prisma.folder.findFirstOrThrow({ where: { id: rootId, userId: req.user!.id, deletedAt: null } })
-    const folders = await prisma.folder.findMany({ where: { userId: req.user!.id, deletedAt: null }, select: { id: true, parentId: true } })
-    const folderIds = new Set<string>([root.id])
-    let changed = true
-    while (changed) {
-      changed = false
-      for (const folder of folders) {
-        if (folder.parentId && folderIds.has(folder.parentId) && !folderIds.has(folder.id)) {
-          folderIds.add(folder.id)
-          changed = true
-        }
-      }
-    }
+    const folderIds = await collectDescendantFolderIds(req.user!.id, root.id)
     const folderIdArray = [...folderIds]
 
     const files = await prisma.file.findMany({ where: { userId: req.user!.id, status: 'active', folderId: { in: folderIdArray } }, include: { connectedAccount: true } })
