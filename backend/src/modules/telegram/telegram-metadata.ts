@@ -37,6 +37,17 @@ const SEGMENT_FORBIDDEN_RE = /[\u0000\u000A\u000D/:?*]/
 /** Telegram caption limit for documents. */
 export const TELEGRAM_CAPTION_MAX = 1024
 
+/**
+ * A path segment is unsafe when it is `.` or `..`: it can never be a real
+ * file/folder name in 9Drive, and accepting it would let a malicious caption
+ * claim a path outside the user's root (spec §8, §21). The path builders
+ * reject any path containing such a segment by returning `null`, so the
+ * caller falls back to the inbox instead of creating a `.`/`..` folder.
+ */
+export function isUnsafeSegment(segment: string): boolean {
+  return segment === '.' || segment === '..'
+}
+
 export type ParsedMetadata = {
   /** Stable file id from `9drive:id=`, or `null` when not present / invalid. */
   stableId: string | null
@@ -109,6 +120,7 @@ function encodePath(path: string): string | null {
     if (segment === '') return null
     if (segment.length > 255) return null
     if (SEGMENT_FORBIDDEN_RE.test(segment)) return null
+    if (isUnsafeSegment(segment)) return null
   }
   const line = `${NINE_DRIVE_PATH_KEY}=${segments.join('/')}`
   if (line.length > TELEGRAM_CAPTION_MAX) return null
@@ -231,6 +243,7 @@ export function normalizeLogicalPath(rawPath: string | null | undefined): string
     if (segment === '') return null
     if (segment.length > 255) return null
     if (SEGMENT_FORBIDDEN_RE.test(segment)) return null
+    if (isUnsafeSegment(segment)) return null
     cleaned.push(segment)
   }
   return cleaned.join('/')
@@ -255,6 +268,7 @@ export function buildLogicalPath(segments: string[]): string | null {
     if (normalized === '') return null
     if (normalized.length > 255) return null
     if (SEGMENT_FORBIDDEN_RE.test(normalized)) return null
+    if (isUnsafeSegment(normalized)) return null
     cleaned.push(normalized)
   }
   return cleaned.join('/')

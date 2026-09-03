@@ -164,6 +164,14 @@ describe('ensureFolderPathBySegments', () => {
     const result = await ensureFolderPathBySegments('user-1', ['OK', 'x'.repeat(256)])
     expect(result).toBe('p1')
   })
+
+  it('never creates `.`/`..` folders — treats traversal as unresolvable', async () => {
+    h.prismaMock.folder.findFirst.mockResolvedValueOnce({ id: 'p1', name: 'OK', parentId: null, normalizedName: 'ok', deletedAt: null })
+    const result = await ensureFolderPathBySegments('user-1', ['OK', '..', '..', 'outside'])
+    expect(result).toBe('p1')
+    // No `..` folder was ever looked up or created after the parent.
+    expect(h.prismaMock.folder.create).not.toHaveBeenCalled()
+  })
 })
 
 describe('joinLogicalPath', () => {

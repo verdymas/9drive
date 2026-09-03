@@ -104,7 +104,11 @@ channel). Legacy rows stay null; the first ingest that meets a
   `[A-Za-z0-9._-]{1,36}` (UUIDs fit).
 - Second line, when location is known: `9drive:path=<logicalPath>`.
   The path is NFC-normalized, slash-joined, no leading/trailing slash,
-  no backslashes, no control characters.
+  no backslashes, no control characters. `.`/`..` segments are rejected
+  (a path such as `../../outside/file.mkv` is treated as malformed and
+  routed to the inbox — it can never escape the user's 9Drive root,
+  spec §8/§21). The encoder likewise omits the path line when it
+  contains a `.`/`..` segment.
 - Extra lines (user-written notes, descriptions) are preserved verbatim
   in the caption; the parser keeps them in `extraLines`.
 - Duplicate `9drive:id=` fields in one caption: first wins; later ones
@@ -369,13 +373,14 @@ excludes them from its totals too.
 - `telegram-usage.service.test.ts` — indexed-only usage, zero-usage case.
 - `telegram-metadata.test.ts` — encoder/parser round-trip, deep paths, Unicode,
   CRLF handling, duplicate-key diagnostics, malformed inputs, oversized
-  captions (25 tests).
+  captions, path-traversal rejection (`.`, `..`) in the parser, normalizer,
+  encoder, and `buildLogicalPath` (28 tests).
 - `telegram-caption.service.test.ts` — caption refresh no-op when matching,
   legacy-row no-op, missing-telegram-doc no-op, classified TELEGRAM_NETWORK
   on edit failure (7 tests).
 - `telegram-ingest.service.test.ts` — by stable id, by providerFileId, no
-  metadata → inbox, folder chain (`ensureFolderPathBySegments`), `joinLogicalPath`
-  (10 tests).
+  metadata → inbox, folder chain (`ensureFolderPathBySegments`), traversal guard
+  (never creates `.`/`..` folders), `joinLogicalPath` (11 tests).
 - `file-logical-path.test.ts` — pure ancestry walker + DB-backed
   `logicalPathForFileId` (4 tests).
 - `storage-routing.test.ts` — Telegram never receives a file over the document

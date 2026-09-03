@@ -11,6 +11,7 @@ import {
 } from './telegram.service.js'
 import {
   buildLogicalPath,
+  isUnsafeSegment,
   normalizeLogicalPath,
   parseCaption,
   splitLogicalPath,
@@ -305,6 +306,9 @@ export async function ensureFolderPathBySegments(
     const segment = raw.normalize('NFC').trim()
     if (!segment) return parentId
     if (segment.length > 255) return parentId
+    // Defense-in-depth: never create a `.`/`..` folder even if a caller
+    // bypasses the metadata normalizer (spec §8). Treat as unresolvable.
+    if (isUnsafeSegment(segment)) return parentId
     const normalized = segment.toLowerCase()
     const existing: { id: string } | null = await prisma.folder.findFirst({
       where: { userId, parentId, normalizedName: normalized, deletedAt: null },

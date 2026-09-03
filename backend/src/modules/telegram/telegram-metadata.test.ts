@@ -82,6 +82,16 @@ describe('telegram-metadata — parser', () => {
     }
   })
 
+  it('rejects path-traversal captions and flags them malformed', () => {
+    const caption = `${NINE_DRIVE_PATH_KEY}=../../outside/file.mkv`
+    const parsed = parseCaption(caption)
+    expect(parsed.logicalPath).toBeNull()
+    expect(parsed.diagnostics.pathSeen).toBe(1)
+    expect(parsed.diagnostics.pathReason).toBe('malformed')
+    // Same for a mid-path `..` — never invent a resolved path.
+    expect(parseCaption(`${NINE_DRIVE_PATH_KEY}=A/../B.md`).logicalPath).toBeNull()
+  })
+
   it('parses the path up to the first newline and treats the rest as extras', () => {
     // The encoder never produces a caption with an embedded newline in a
     // segment; the parser splits on LF first, so a forged caption with
@@ -129,6 +139,14 @@ describe('telegram-metadata — encoder', () => {
     const parsed = parseCaption(caption!)
     expect(parsed.stableId).toBe('abc')
     expect(parsed.logicalPath).toBeNull()
+  })
+
+  it('omits the path line for path-traversal inputs, keeping only the id', () => {
+    const caption = encodeCaption({ stableId: 'abc', logicalPath: '../B.md' })
+    expect(caption).not.toBeNull()
+    // The valid 9drive:id survives; the unsafe path is not encoded.
+    expect(caption!.startsWith('9drive:id=abc')).toBe(true)
+    expect(caption!.includes('9drive:path=')).toBe(false)
   })
 
   it('returns null when the stable id is malformed', () => {
@@ -186,6 +204,14 @@ describe('telegram-metadata — normalizeLogicalPath', () => {
     expect(normalizeLogicalPath('A//B')).toBeNull()
   })
 
+  it('rejects path traversal and dot segments', () => {
+    expect(normalizeLogicalPath('../../outside/file.mkv')).toBeNull()
+    expect(normalizeLogicalPath('A/../B.md')).toBeNull()
+    expect(normalizeLogicalPath('A/./B.md')).toBeNull()
+    expect(normalizeLogicalPath('../file.mkv')).toBeNull()
+    expect(normalizeLogicalPath('A/.')).toBeNull()
+  })
+
   it('NFC-normalizes segments', () => {
     expect(normalizeLogicalPath('café/file.md')).toBe('café/file.md')
   })
@@ -196,6 +222,8 @@ describe('telegram-metadata — buildLogicalPath / splitLogicalPath', () => {
     expect(buildLogicalPath(['Projects', 'APP-V', 'docs', 'architecture.md'])).toBe('Projects/APP-V/docs/architecture.md')
     expect(buildLogicalPath([])).toBeNull()
     expect(buildLogicalPath(['A', 'B:C'])).toBeNull()
+    expect(buildLogicalPath(['A', '..', 'B.md'])).toBeNull()
+    expect(buildLogicalPath(['A', '.', 'B.md'])).toBeNull()
   })
 
   it('splitLogicalPath is the inverse of buildLogicalPath for valid inputs', () => {
