@@ -1,5 +1,6 @@
 import type { ConnectedAccount, File, TelegramStorageConfig } from '@prisma/client'
 import type { Response } from 'express'
+import { Readable } from 'node:stream'
 import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { AppError } from '../../utils/app-error.js'
@@ -560,11 +561,19 @@ export async function deleteTelegramDocuments(config: CredentialsSource, remoteI
 }
 
 /**
- * Open a Telegram document for byte streaming (batch download / zip export).
+ * Open a Telegram document for byte streaming (batch download / zip export /
+ * WebDAV range reads).
+ *
+ * `range` (optional, backward compatible): download only the given byte span.
+ * teleproto's `iterDownload` sends `upload.getFile({ offset, precise: true })`,
+ * so `offset` is honored exactly (no chunk-alignment math needed). `limit` is
+ * approximate — the stream overshoots by up to one `requestSize` chunk — so
+ * callers that need exact byte counts must trim (see `telegramDownloadToReadable`).
+ *
  * Returns the async iterable plus a `close()` that MUST be awaited when the
  * consumer is done (it disconnects the short-lived client).
  */
-export async function openTelegramDocument(config: CredentialsSource, remoteId: string) {
+export async function openTelegramDocument(config: CredentialsSource, remoteId: string, range?: { offset: number; limit: number }) {
   const client = await createTelegramClient(config)
   await client.connect()
   try {
@@ -577,13 +586,64 @@ export async function openTelegramDocument(config: CredentialsSource, remoteId: 
     }
     return {
       remoteId,
-      stream: client.iterDownload(message.media as never, { requestSize: 512 * 1024 }) as AsyncIterable<Buffer>,
+      stream: client.iterDownload(message.media as never, {
+        requestSize: 512 * 1024,
+        ...(range ? { offset: range.offset, limit: range.limit } : {}),
+      }) as AsyncIterable<Buffer>,
       close: () => client.disconnect().catch(() => undefined),
     }
   } catch (error) {
     await client.disconnect().catch(() => undefined)
     throw error
   }
+}
+
+/**
+ * Yield only the first `limit` bytes of a stream. `iterDownload`'s `limit` is
+ * rounded up to whole `requestSize` chunks, so the final chunk must be trimmed
+ * to the exact byte count — otherwise a piped HTTP response overshoots its
+ * `Content-Length` and Node destroys the connection
+ * (`ERR_HTTP_CONTENT_LENGTH_MISMATCH`).
+ */
+async function* trimToLimit(stream: AsyncIterable<Buffer>, limit: number): AsyncGenerator<Buffer> {
+  let emitted = 0
+  for await (const chunk of stream) {
+    const remaining = limit - emitted
+    if (remaining <= 0) return
+    if (chunk.length <= remaining) {
+      emitted += chunk.length
+      yield chunk
+    } else {
+      yield chunk.subarray(0, remaining)
+      return
+    }
+  }
+}
+
+/**
+ * Wrap an `openTelegramDocument` result as a Node `Readable`. Trims to an exact
+ * byte `limit` when given (HTTP `Content-Length` must match the body exactly).
+ * Disconnects the short-lived client exactly once when the readable ends,
+ * errors, or is destroyed — `Readable.from` calls the source iterator's
+ * `return()`, which propagates through `trimToLimit` into teleproto's
+ * `iterDownload` and stops the Telegram download, so a client abort does not
+ * keep pulling the rest of a large file.
+ */
+export function telegramDownloadToReadable(
+  download: { stream: AsyncIterable<Buffer>; close: () => Promise<void> },
+  limit?: number,
+): Readable {
+  const readable = Readable.from(limit !== undefined ? trimToLimit(download.stream, limit) : download.stream)
+  let closed = false
+  const disconnect = () => {
+    if (closed) return
+    closed = true
+    void download.close()
+  }
+  readable.once('end', disconnect)
+  readable.once('error', disconnect)
+  readable.once('close', disconnect)
+  return readable
 }
 
 /** Stream a Telegram document to `res` as a full `200` response (no Range). */

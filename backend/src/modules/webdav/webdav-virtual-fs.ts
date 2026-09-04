@@ -6,6 +6,7 @@ import { prisma } from '../../config/prisma.js'
 import { googleDownloadExportMimeTypes, normalizeHeaders } from '../files/stream-google-file.js'
 import { getAuthedGoogleClient } from '../google/google.service.js'
 import { createS3Client, getS3ConfigForAccount } from '../s3/s3.service.js'
+import { getTelegramConfig, openTelegramDocument, telegramDownloadToReadable } from '../telegram/telegram.service.js'
 
 const { FileSystem, LocalLockManager, LocalPropertyManager, ResourceType } = v2
 
@@ -402,15 +403,31 @@ export class VirtualFileSystem extends FileSystem {
   }
 }
 
-/** Stream a provider file's bytes as a Node Readable. Range is applied by the routes layer. */
-export async function streamProviderFileToReadable(file: FileWithAccount, range?: string): Promise<Readable> {
+/**
+ * Stream a provider file's bytes as a Node Readable.
+ *
+ * `range` (inclusive `{ start, end }` bounds, parsed by the WebDAV routes
+ * layer) is applied by the provider: S3 and Google Drive forward a native
+ * `Range` header, Telegram downloads directly at the requested offset via
+ * `iterDownload`. Without a range the whole file streams from byte 0.
+ */
+export async function streamProviderFileToReadable(file: FileWithAccount, range?: { start: number; end: number }): Promise<Readable> {
   if (file.provider === 's3') {
     const config = await getS3ConfigForAccount(file.connectedAccountId)
     const client = createS3Client(config)
-    const response = await client.send(new GetObjectCommand({ Bucket: config.bucket, Key: file.providerFileId, Range: range }))
+    const response = await client.send(
+      new GetObjectCommand({ Bucket: config.bucket, Key: file.providerFileId, Range: range ? `bytes=${range.start}-${range.end}` : undefined }),
+    )
     const body = response.Body as Readable | undefined
     if (!body) return Readable.from([])
     return body
+  }
+
+  if (file.provider === 'telegram') {
+    const config = await getTelegramConfig(file.connectedAccountId)
+    const bounds = range ? { offset: range.start, limit: range.end - range.start + 1 } : undefined
+    const download = await openTelegramDocument(config, file.providerFileId, bounds)
+    return telegramDownloadToReadable(download, bounds?.limit)
   }
 
   // Google Drive
@@ -423,7 +440,7 @@ export async function streamProviderFileToReadable(file: FileWithAccount, range?
   const response = await fetch(url, {
     headers: {
       ...headers,
-      ...(range && !exportTarget ? { Range: range } : {}),
+      ...(range && !exportTarget ? { Range: `bytes=${range.start}-${range.end}` } : {}),
     },
   })
   if (!response.ok) {

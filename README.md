@@ -816,6 +816,15 @@ rclone ls 9drive:/
 3. Enter `http://<host>:4000/webdav` as the folder URL, with any username and the shared WebDAV password.
 4. Scan and browse the virtual folder/file tree.
 
+### Streaming
+
+Files backed by any supported provider (Google Drive, S3, Telegram) can be
+streamed and seeked through WebDAV: `HEAD` returns size/MIME metadata from the
+9Drive database, and `Range` requests are honored with `206 Partial Content`
+and correct `Content-Range`/`Content-Length`. Telegram-backed files are
+downloaded directly at the requested byte offset — no full-file download for a
+seek. See `docs/audits/telegram-webdav-range-streaming-audit.md` for details.
+
 ### Security notes
 
 - The WebDAV interface is **read-only**: write methods (PUT, MKCOL, DELETE, MOVE, COPY, PROPPATCH) are rejected.
