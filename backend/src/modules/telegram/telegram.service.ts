@@ -304,7 +304,15 @@ export async function createTelegramClient(config: CredentialsSource) {
     const apiId = Number(decryptText(config.apiIdEncrypted))
     const apiHash = decryptText(config.apiHashEncrypted)
     const session = decryptText(config.sessionEncrypted)
-    return new telegram.TelegramClient(new telegram.sessions.StringSession(session), apiId, apiHash, {}) as TelegramClient
+    // Silent logger: the default logs INFO per connect ("Running teleproto
+    // version ...", "Using LAYER ..."), which spams the backend logs since a
+    // fresh client is created per operation. Errors are wrapped as AppErrors
+    // by classifyTelegramError regardless of this logger.
+    const silentLogger = new telegram.Logger()
+    silentLogger.log = () => undefined
+    return new telegram.TelegramClient(new telegram.sessions.StringSession(session), apiId, apiHash, {
+      baseLogger: silentLogger,
+    }) as TelegramClient
   } catch (error) {
     throw classifyTelegramError(error)
   }
