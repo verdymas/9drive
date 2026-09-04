@@ -4,6 +4,7 @@ import {
   encodeCaption,
   looksLikeNineDriveCaption,
   NINE_DRIVE_ID_KEY,
+  NINE_DRIVE_META_KEY,
   NINE_DRIVE_PATH_KEY,
   normalizeLogicalPath,
   parseCaption,
@@ -121,6 +122,48 @@ describe('telegram-metadata — parser', () => {
     expect(parsed.hasAny).toBe(false)
     expect(parsed.diagnostics.idKept).toBe(false)
     expect(parsed.diagnostics.pathKept).toBe(false)
+    expect(parsed.diagnostics.metaKept).toBe(false)
+  })
+
+  it('parses an encrypted 9drive:meta line alongside the stable id', () => {
+    const caption = `${NINE_DRIVE_ID_KEY}=abc-123\n${NINE_DRIVE_META_KEY}=v1:aaa:bbb:ccc`
+    const parsed = parseCaption(caption)
+    expect(parsed.stableId).toBe('abc-123')
+    expect(parsed.encryptedMeta).toBe('v1:aaa:bbb:ccc')
+    expect(parsed.logicalPath).toBeNull()
+    expect(parsed.hasAny).toBe(true)
+    expect(parsed.diagnostics.metaKept).toBe(true)
+    expect(parsed.diagnostics.metaReason).toBeUndefined()
+    expect(parsed.extraLines).toEqual([])
+  })
+
+  it('keeps 9drive:meta out of extraLines and drops empty meta values', () => {
+    const parsed = parseCaption(`${NINE_DRIVE_META_KEY}=v1:xyz\nnote`)
+    expect(parsed.encryptedMeta).toBe('v1:xyz')
+    expect(parsed.extraLines).toEqual(['note'])
+    const empty = parseCaption(`${NINE_DRIVE_META_KEY}=`)
+    expect(empty.encryptedMeta).toBeNull()
+    expect(empty.diagnostics.metaSeen).toBe(1)
+    expect(empty.diagnostics.metaReason).toBe('malformed')
+  })
+
+  it('first meta wins, later duplicates are flagged', () => {
+    const parsed = parseCaption(`${NINE_DRIVE_META_KEY}=v1:first\n${NINE_DRIVE_META_KEY}=v1:second`)
+    expect(parsed.encryptedMeta).toBe('v1:first')
+    expect(parsed.diagnostics.metaSeen).toBe(2)
+    expect(parsed.diagnostics.metaKept).toBe(true)
+    expect(parsed.diagnostics.metaReason).toBe('duplicate')
+  })
+
+  it('combines encrypted meta with a legacy plaintext path (transitional captions)', () => {
+    const parsed = parseCaption(`${NINE_DRIVE_ID_KEY}=abc\n${NINE_DRIVE_META_KEY}=v1:payload\n${NINE_DRIVE_PATH_KEY}=Movies/a.mkv`)
+    expect(parsed.stableId).toBe('abc')
+    expect(parsed.encryptedMeta).toBe('v1:payload')
+    expect(parsed.logicalPath).toBe('Movies/a.mkv')
+  })
+
+  it('treats 9drive:meta captions as 9Drive captions', () => {
+    expect(looksLikeNineDriveCaption(`${NINE_DRIVE_META_KEY}=v1:x`)).toBe(true)
   })
 })
 
@@ -182,6 +225,47 @@ describe('telegram-metadata — encoder', () => {
     const parsed = parseCaption(caption!)
     expect(parsed.diagnostics.pathSeen).toBe(1)
     expect(parsed.diagnostics.pathReason).toBeUndefined()
+  })
+
+  it('emits an encrypted meta line that the parser reads back', () => {
+    const caption = encodeCaption({ stableId: 'abc', encryptedMeta: 'v1:aaa:bbb:ccc' })
+    expect(caption).not.toBeNull()
+    const parsed = parseCaption(caption!)
+    expect(parsed.stableId).toBe('abc')
+    expect(parsed.encryptedMeta).toBe('v1:aaa:bbb:ccc')
+    expect(parsed.logicalPath).toBeNull()
+  })
+
+  it('emits id + meta + legacy path together (transitional captions)', () => {
+    const caption = encodeCaption({ stableId: 'abc', encryptedMeta: 'v1:xyz', logicalPath: 'A/B.md' })
+    expect(caption).not.toBeNull()
+    const parsed = parseCaption(caption!)
+    expect(parsed.stableId).toBe('abc')
+    expect(parsed.encryptedMeta).toBe('v1:xyz')
+    expect(parsed.logicalPath).toBe('A/B.md')
+  })
+
+  it('drops an empty / oversized meta value while keeping the id', () => {
+    const empty = encodeCaption({ stableId: 'abc', encryptedMeta: '' })
+    expect(empty).not.toBeNull()
+    expect(empty!.startsWith('9drive:id=abc')).toBe(true)
+    expect(empty!.includes(`${NINE_DRIVE_META_KEY}=`)).toBe(false)
+
+    const filler = 'x'.repeat(TELEGRAM_CAPTION_MAX)
+    const oversized = encodeCaption({ stableId: 'abc', encryptedMeta: `v1:${filler}` })
+    expect(oversized).not.toBeNull()
+    expect(oversized!.startsWith('9drive:id=abc')).toBe(true)
+    expect(oversized!.includes(`${NINE_DRIVE_META_KEY}=`)).toBe(false)
+  })
+
+  it('drops 9drive:meta slipped in via extras (parser would treat as duplicate)', () => {
+    const caption = encodeCaption({ stableId: 'abc', extras: [`${NINE_DRIVE_META_KEY}=v1:oops`] })
+    expect(caption).not.toBeNull()
+    // The duplicate-key extra is dropped by isNineDriveLine, so the encoded
+    // caption carries no meta line at all — the parser sees zero.
+    const parsed = parseCaption(caption!)
+    expect(parsed.diagnostics.metaSeen).toBe(0)
+    expect(parsed.encryptedMeta).toBeNull()
   })
 })
 

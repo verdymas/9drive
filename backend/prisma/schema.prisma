@@ -292,7 +292,17 @@ model File {
   // first caption it sees. The DB is the source of truth for the logical
   // filesystem; this column is the stable key that 9Drive metadata uses.
   telegramStableId  String?            @map("telegram_stable_id") @db.VarChar(36)
-  createdAt          DateTime           @default(now()) @map("created_at")
+  // Telegram metadata-protection cache (encrypted recovery metadata). Canonical
+  // logical state stays in name/folderId/mimeType/sizeBytes; these columns hold
+  // the cached recovery representation + opaque physical filename so normal
+  // reads never decrypt and sync can compare ciphertext without decrypting.
+  // Null for legacy Telegram rows and for non-Telegram providers (Google/S3
+  // rows are completely unaffected).
+  physicalFilename    String?          @map("physical_filename") @db.VarChar(191)
+  encryptedMetadata   String?          @map("encrypted_metadata") @db.Text
+  metadataFingerprint String?          @map("metadata_fingerprint") @db.VarChar(64)
+  cryptoVersion       String?          @map("crypto_version") @db.VarChar(16)
+  createdAt           DateTime         @default(now()) @map("created_at")
   updatedAt          DateTime           @updatedAt @map("updated_at")
   deletedAt          DateTime?          @map("deleted_at")
   user               User               @relation(fields: [userId], references: [id], onDelete: Cascade)

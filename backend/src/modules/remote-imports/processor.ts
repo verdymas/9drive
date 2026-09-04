@@ -11,7 +11,8 @@ import { ensureGoogleAppFolder, getAuthedGoogleClient, syncGoogleQuota } from '.
 import { buildS3ObjectKey, getS3ConfigForAccount, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
 import { getTelegramConfig, markTelegramReauthRequired, uploadTelegramDocument } from '../telegram/telegram.service.js'
 import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
-import { buildInitialCaption } from '../telegram/telegram-caption.service.js'
+import { uploadTelegramDocumentWithCrypto } from '../telegram/telegram-caption.service.js'
+import { buildTelegramMetadataCache } from '../telegram/telegram-metadata-cache.js'
 import { logicalPathForFileId } from '../files/file-logical-path.js'
 import { resolveUploadPlacement } from '../storage/upload-placement.service.js'
 import type { RemoteImportJobData } from './queue.js'
@@ -311,16 +312,26 @@ async function uploadTempFile(
       })
 
       const logicalPath = await logicalPathForFileId(userId, provisionalFile.id)
-      const caption = buildInitialCaption(stableId, logicalPath)
-
-      const providerFileId = await uploadTelegramDocument(config, {
+      const uploaded = await uploadTelegramDocumentWithCrypto({
+        config,
         filePath: tempPartPath,
-        name: fileName,
+        fileName,
         mimeType,
         sizeBytes: Number(uploadTotalBytes),
-        caption: caption ?? undefined,
+        userId,
+        fileId: stableId,
+        logicalPath,
         onProgress: (pct) => {
           void uploadProgress({ uploadedBytes: BigInt(Math.round((pct / 100) * Number(uploadTotalBytes))).toString() })
+        },
+      })
+      const providerFileId = uploaded.remoteId
+      // Persist the protected-metadata cache (encrypted payload + opaque
+      // physical name) on the active row — normal reads never decrypt.
+      await prisma.file.update({
+        where: { id: provisionalFile.id },
+        data: {
+          ...buildTelegramMetadataCache({ fileId: stableId, name: fileName, path: logicalPath, mimeType, size: uploadTotalBytes }),
         },
       })
       // Force the final write so the bar reaches 100% the moment the upload

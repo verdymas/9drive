@@ -184,6 +184,10 @@ async function finalizeTelegramAuth(
   state: Pick<TelegramAuthState, 'id' | 'connectedAccountId'>,
   credentials: ApiCredentials,
   session: string,
+  // ponytail: no getMe() identity check on Telegram reconnect — deliberate, it is
+  // what lets an abandoned channel be recovered with a different login. Add one
+  // (like GOOGLE_RECONNECT_ACCOUNT_MISMATCH) only alongside a stored Telegram
+  // user id AND an explicit "recover with different account" opt-in.
   _client: TelegramClient,
 ) {
   let account: ConnectedAccount | null = null

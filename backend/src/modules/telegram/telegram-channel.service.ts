@@ -129,8 +129,8 @@ function assertProbeOk(probe: { read: boolean; write: boolean; delete: boolean }
 }
 
 /**
- * Persist the chosen channel on the account: update the storage config, point
- * the connected-account identity at the channel, and refresh indexed usage.
+ * Persist the chosen channel on the account: point the connected-account
+ * identity at the channel, then update the storage config, then refresh usage.
  * A channel already bound to another of the user's accounts fails loudly.
  */
 async function persistChannelConfig(
@@ -139,10 +139,11 @@ async function persistChannelConfig(
   channel: { channelId: string; channelTitle: string },
 ) {
   const accountId = config.connectedAccount.id
-  await prisma.telegramStorageConfig.update({
-    where: { connectedAccountId: accountId },
-    data: { channelId: channel.channelId, channelTitle: channel.channelTitle },
-  })
+  // Identity FIRST: this is the write that can trip the
+  // (userId, provider, providerAccountId) unique constraint. Writing the
+  // storage config first left a rejected selection with a config pointing at a
+  // channel the account was never granted — and uploads read the config, not
+  // the identity, so that account would silently keep writing into it.
   try {
     await prisma.connectedAccount.update({
       where: { id: accountId },
@@ -157,10 +158,31 @@ async function persistChannelConfig(
     })
   } catch (error) {
     if ((error as { code?: string }).code === 'P2002') {
-      throw new AppError('TELEGRAM_CHANNEL_IN_USE', 'This storage channel is already used by another 9Drive account.', 409)
+      throw await channelInUseError(userId, channel.channelId)
     }
     throw error
   }
+  await prisma.telegramStorageConfig.update({
+    where: { connectedAccountId: accountId },
+    data: { channelId: channel.channelId, channelTitle: channel.channelTitle },
+  })
   await syncTelegramUsage(accountId).catch(() => undefined)
   return serializeTelegramAccount(userId, accountId)
+}
+
+/**
+ * Name what holds the channel so a 409 is actionable. Disconnecting an account
+ * is a soft status change — it keeps its claim on the channel (and its files),
+ * so the fix is to reconnect that account rather than connect a new one.
+ */
+async function channelInUseError(userId: string, channelId: string): Promise<AppError> {
+  const holder = await prisma.connectedAccount.findFirst({
+    where: { userId, provider: 'telegram', providerAccountId: channelId },
+    select: { status: true },
+  })
+  const hint =
+    holder?.status === 'disconnected'
+      ? ' A disconnected 9Drive account still holds it — reconnect that account instead of connecting a new one; its channel and files are preserved.'
+      : ''
+  return new AppError('TELEGRAM_CHANNEL_IN_USE', `This storage channel is already used by another 9Drive account.${hint}`, 409)
 }

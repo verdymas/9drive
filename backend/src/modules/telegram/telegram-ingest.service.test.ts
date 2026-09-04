@@ -109,7 +109,7 @@ describe('ingestTelegramDocument — by 9drive:id', () => {
 })
 
 describe('ingestTelegramDocument — by providerFileId only', () => {
-  it('creates a row when only the path is supplied', async () => {
+  it('creates a row at its logical path with a minted stable id', async () => {
     // No stable id match (case 1 → not found), then no providerFileId match
     // (case 2 → not found) → case 2 creates a row.
     h.prismaMock.file.findFirst.mockResolvedValue(null)
@@ -121,8 +121,13 @@ describe('ingestTelegramDocument — by providerFileId only', () => {
       '9drive:path=Projects/APP-V/docs/architecture.md',
     )
 
-    expect(result).toBe('inboxed') // no stable id, so it routes as inbox
+    // The path resolved, so this is a create — NOT an inbox fallback.
+    expect(result).toBe('created')
     expect(h.prismaMock.file.create).toHaveBeenCalledTimes(1)
+    const data = h.prismaMock.file.create.mock.calls[0]?.[0].data
+    expect(data.folderId).toBe('root/Projects/APP-V/docs')
+    expect(data.telegramStableId).toBe(data.id)
+    expect(data.id).toMatch(/^[0-9a-f-]{36}$/)
   })
 })
 
@@ -131,6 +136,15 @@ describe('ingestTelegramDocument — no metadata', () => {
     const result = await ingestTelegramDocument('user-1', 'acc-1', document, 'human caption, no metadata')
     expect(result).toBe('inboxed')
     expect(h.prismaMock.file.create).toHaveBeenCalledTimes(1)
+  })
+
+  it('stamps a stable id on a recovered row so a later rename can rewrite the caption', async () => {
+    // Without a stable id, `updateTelegramDocumentCaption` no-ops forever and
+    // the file can never be renamed on Telegram — the point of recovering it.
+    await ingestTelegramDocument('user-1', 'acc-1', document, null)
+    const data = h.prismaMock.file.create.mock.calls[0]?.[0].data
+    expect(data.telegramStableId).toBe(data.id)
+    expect(data.id).toMatch(/^[0-9a-f-]{36}$/)
   })
 
   it('returns "matched" when a physical-only row already exists', async () => {

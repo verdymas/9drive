@@ -700,8 +700,30 @@ jobId, so two concurrent enqueues result in one queued job
   idempotent `start` / `stop`.
 - All pre-existing tests remain green (67 files, 899 tests).
 
+## Metadata protection (encrypted captions + opaque filenames)
+
+Optional, off by default. When enabled, the Telegram document filename becomes
+`tg_<hex>.bin` (HMAC-SHA256 of the immutable file id) and the caption carries an
+AES-256-GCM `9drive:meta=v1:...` payload instead of a readable `9drive:path=`.
+
+- Crypto lives in `telegram-crypto.service.ts`; cache read/write and the sync
+  fast path in `telegram-metadata-cache.ts`; the user-facing utility in
+  `telegram-security.service.ts` + `telegram-security.routes.ts`.
+- `File` caches `encryptedMetadata`, `metadataFingerprint`, `cryptoVersion`,
+  `physicalFilename` (all nullable — Google/S3 rows are unaffected).
+- Reads never decrypt: downloads, WebDAV, and Jellyfin resolve by
+  `providerFileId` and read names from the DB.
+- Sync compares the caption's ciphertext to the cached copy; identical means no
+  decryption at all. Unreadable payloads become `TELEGRAM_METADATA_UNREADABLE`
+  sync issues and never abort a run.
+- Legacy `9drive:path` captions keep working; migration is opt-in per file.
+
+Full guide: `docs/implementation/telegram-metadata-security.md`.
+
 ## Future improvements
 
+- Key rotation for `TELEGRAM_METADATA_MASTER_KEY` (v1 has none by design; the
+  format's version tag reserves room for a dual-key scheme).
 - Durable retry/queue for Telegram uploads (currently the current retries).
 - Channel pre-warm/parallel part uploads for very large documents.
 - Optional per-file size autosplit for files over the cap.

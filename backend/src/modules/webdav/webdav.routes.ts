@@ -62,15 +62,11 @@ async function streamFile(ctx: v2.HTTPRequestContext, fs: VirtualFileSystem): Pr
   ctx.response.setHeader('ETag', `"${file.id}:${file.updatedAt.getTime()}"`)
   ctx.response.setHeader('Last-Modified', file.updatedAt.toUTCString())
 
-  const stream = await streamProviderFileToReadable(file, range ?? undefined)
+  const stream = await streamProviderFileToReadable(file, range ? `bytes=${range.start}-${range.end}` : undefined)
   stream.on('error', () => {
     ctx.setCode(v2.HTTPCodes.InternalServerError)
     ctx.response.destroy()
   })
-  // Client abort (or response finished) → stop the upstream provider stream so
-  // Telegram downloads do not keep pulling the file after the client left.
-  // Safe on normal completion: 'end' already fired and destroy() is a no-op.
-  ctx.response.on('close', () => stream.destroy())
   if (range) {
     ctx.setCode(v2.HTTPCodes.PartialContent)
     ctx.response.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${size}`)

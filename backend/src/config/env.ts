@@ -3,6 +3,21 @@ import { z } from 'zod'
 
 dotenv.config()
 
+/**
+ * Boolean env-var parser. `z.coerce.boolean()` is NOT used for these flags
+ * because zod v4 coerces the STRING "false" to true (JS truthiness) — a
+ * silent footgun for security toggles. Only explicit true-ish values enable.
+ */
+function booleanEnv(defaultValue: boolean) {
+  return z
+    .string()
+    .optional()
+    .transform((value) => {
+      if (value === undefined || value === '') return defaultValue
+      return ['true', '1', 'yes', 'on'].includes(value.toLowerCase())
+    })
+}
+
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1),
   APP_PORT: z.coerce.number().default(4000),
@@ -110,6 +125,21 @@ const envSchema = z.object({
   // Maximum retries per page on FloodWait. FloodWait itself waits the
   // requested seconds; this caps how many times we re-enter on a row.
   TELEGRAM_SYNC_FLOOD_WAIT_RETRIES: z.coerce.number().int().min(0).max(5).default(3),
+  // ── Telegram metadata protection (encrypted captions + opaque filenames) ─
+  // Master switch for encrypting `9drive:meta` caption metadata on Telegram
+  // storage documents. When enabled, TELEGRAM_METADATA_MASTER_KEY MUST be set
+  // (≥32 chars) or protected writes fail safely — never auto-generate, never
+  // silently fall back to plaintext for new protected uploads.
+  TELEGRAM_METADATA_ENCRYPTION_ENABLED: booleanEnv(false),
+  // Cryptographically secure master secret. Never commit the real value;
+  // losing it makes encrypted Telegram metadata unrecoverable.
+  TELEGRAM_METADATA_MASTER_KEY: z.string().optional(),
+  // Non-secret HKDF salt/context label. Not a substitute for the master key.
+  TELEGRAM_CRYPTO_SALT: z.string().min(1).default('9drive-telegram-v1'),
+  // Obfuscate physical Telegram filenames (`tg_<opaque>.bin`).
+  TELEGRAM_OBFUSCATE_FILENAME_ENABLED: booleanEnv(false),
+  // Hide the original file extension on the physical Telegram filename.
+  TELEGRAM_OBFUSCATE_FILE_EXTENSION: booleanEnv(true),
   // Temp dir for chunked (non-Google) resumable upload staging. Bytes are
   // streamed here before the provider upload commits; removed after commit.
   UPLOAD_TEMP_DIR: z.string().default('./data/upload-tmp'),

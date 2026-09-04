@@ -59,6 +59,14 @@ services:
       # Telegram Drive storage provider (MTProto)
       TELEGRAM_MAX_FILE_BYTES: ${TELEGRAM_MAX_FILE_BYTES:-2147483648}
       TELEGRAM_STORAGE_CHANNEL: ${TELEGRAM_STORAGE_CHANNEL:-9drive}
+      # Telegram metadata protection. No default for the master key: an empty
+      # value means "not configured" and protected uploads fail safely rather
+      # than silently falling back to plaintext.
+      TELEGRAM_METADATA_ENCRYPTION_ENABLED: ${TELEGRAM_METADATA_ENCRYPTION_ENABLED:-false}
+      TELEGRAM_METADATA_MASTER_KEY: ${TELEGRAM_METADATA_MASTER_KEY:-}
+      TELEGRAM_CRYPTO_SALT: ${TELEGRAM_CRYPTO_SALT:-9drive-telegram-v1}
+      TELEGRAM_OBFUSCATE_FILENAME_ENABLED: ${TELEGRAM_OBFUSCATE_FILENAME_ENABLED:-false}
+      TELEGRAM_OBFUSCATE_FILE_EXTENSION: ${TELEGRAM_OBFUSCATE_FILE_EXTENSION:-true}
       # Temp staging dir for chunked (non-Google) resumable uploads
       UPLOAD_TEMP_DIR: /data/upload-tmp
       # Remote Import — queue + temp staging
@@ -138,6 +146,13 @@ services:
       # Telegram Drive storage provider (MTProto) — placement runs in the worker
       TELEGRAM_MAX_FILE_BYTES: ${TELEGRAM_MAX_FILE_BYTES:-2147483648}
       TELEGRAM_STORAGE_CHANNEL: ${TELEGRAM_STORAGE_CHANNEL:-9drive}
+      # Telegram metadata protection — the worker uploads to Telegram too, so it
+      # needs the same key. A mismatch here would write payloads the API cannot read.
+      TELEGRAM_METADATA_ENCRYPTION_ENABLED: ${TELEGRAM_METADATA_ENCRYPTION_ENABLED:-false}
+      TELEGRAM_METADATA_MASTER_KEY: ${TELEGRAM_METADATA_MASTER_KEY:-}
+      TELEGRAM_CRYPTO_SALT: ${TELEGRAM_CRYPTO_SALT:-9drive-telegram-v1}
+      TELEGRAM_OBFUSCATE_FILENAME_ENABLED: ${TELEGRAM_OBFUSCATE_FILENAME_ENABLED:-false}
+      TELEGRAM_OBFUSCATE_FILE_EXTENSION: ${TELEGRAM_OBFUSCATE_FILE_EXTENSION:-true}
       # Remote Import — same queue as the API, temp staging shared with backend
       REDIS_URL: redis://redis:6379
       REMOTE_IMPORT_ENABLED: ${REMOTE_IMPORT_ENABLED:-true}

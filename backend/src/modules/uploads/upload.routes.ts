@@ -14,7 +14,8 @@ import { getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service
 import { buildS3ObjectKey, getS3ConfigForAccount, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
 import { getTelegramConfig, uploadTelegramDocument } from '../telegram/telegram.service.js'
 import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
-import { buildInitialCaption } from '../telegram/telegram-caption.service.js'
+import { uploadTelegramDocumentWithCrypto } from '../telegram/telegram-caption.service.js'
+import { buildTelegramMetadataCache } from '../telegram/telegram-metadata-cache.js'
 import { createAuditLog } from '../../utils/audit.js'
 import { planBatchUploads } from './storage-routing.service.js'
 import { resolveUploadPlacement } from '../storage/upload-placement.service.js'
@@ -66,8 +67,9 @@ async function finalizeNonGoogleUpload(opts: {
   mimeType: string
   sizeBytes: bigint
   tmpPath: string
+  logicalPath?: string | null
 }) {
-  const { userId, account, folderId, fileName, mimeType, sizeBytes, tmpPath } = opts
+  const { userId, account, folderId, fileName, mimeType, sizeBytes, tmpPath, logicalPath } = opts
   const providerFolderId = await resolveProviderRootOrLocation(userId, folderId, account)
 
   if (account.provider === 's3') {
@@ -95,10 +97,25 @@ async function finalizeNonGoogleUpload(opts: {
       // Stamp the stable id BEFORE the upload so the caption carries the
       // identity the very first time the message is observed.
       await prisma.file.update({ where: { id: provisionalFile.id }, data: { telegramStableId: stableId } })
-      const logicalPath = await logicalPathForFileId(userId, provisionalFile.id)
-      const caption = buildInitialCaption(stableId, logicalPath)
-      const remoteId = await uploadTelegramDocument(config, { filePath: tmpPath, name: fileName, mimeType, sizeBytes: Number(sizeBytes), caption: caption ?? undefined })
-      return await prisma.file.update({ where: { id: provisionalFile.id }, data: { providerFileId: remoteId, status: 'active' } })
+      const resolvedLogicalPath = logicalPath ?? (await logicalPathForFileId(userId, provisionalFile.id))
+      const { remoteId } = await uploadTelegramDocumentWithCrypto({
+        config,
+        filePath: tmpPath,
+        fileName,
+        mimeType,
+        sizeBytes: Number(sizeBytes),
+        userId,
+        fileId: stableId,
+        logicalPath: resolvedLogicalPath,
+      })
+      return await prisma.file.update({
+        where: { id: provisionalFile.id },
+        data: {
+          providerFileId: remoteId,
+          status: 'active',
+          ...buildTelegramMetadataCache({ fileId: stableId, name: fileName, path: resolvedLogicalPath, mimeType, size: sizeBytes }),
+        },
+      })
     } catch (error) {
       await prisma.file.update({ where: { id: provisionalFile.id }, data: { status: 'deleted', deletedAt: new Date() } }).catch(() => undefined)
       throw error

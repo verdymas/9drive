@@ -67,7 +67,16 @@ connectedAccountRouter.get('/', requireAuth, async (req: AuthRequest, res, next)
   try {
     // Reauth-required accounts stay visible (with their last-known quota) so
     // the UI can surface the reconnect action.
-    const connectedStatuses = { in: ['connected', 'reauth_required'] }
+    //
+    // `?includeDisconnected=1` additionally lists disconnected accounts.
+    // Disconnect is a soft status change: the row keeps its files AND its
+    // `providerAccountId` claim — which for Telegram IS the storage channel id.
+    // Without this, the account holding an abandoned channel is invisible in
+    // Settings while still blocking a fresh connect with a 409. Opt-in so
+    // every other consumer (drive layout, quota, upload placement) is
+    // unaffected and never offers a dead account as a storage target.
+    const includeDisconnected = req.query.includeDisconnected === '1'
+    const connectedStatuses = { in: includeDisconnected ? ['connected', 'reauth_required', 'disconnected'] : ['connected', 'reauth_required'] }
     const accounts = await prisma.connectedAccount.findMany({
       where: { userId: req.user!.id, status: connectedStatuses },
       include: accountInclude,

@@ -5,6 +5,7 @@ import { Card } from '@/components/ui/card'
 import { DummyModal } from '@/components/drive/DummyModal'
 import { PageHeader } from '@/components/drive/PageHeader'
 import { BrowserCaptureCard } from '@/components/settings/BrowserCaptureCard'
+import { TelegramSecurityCard } from '@/components/settings/TelegramSecurityCard'
 import { apiFetch, formatBytes, API_URL } from '@/lib/api'
 import { getGravatarUrl } from '@/lib/gravatar'
 import { getStoredUser, getAccessToken, clearAuthSession } from '@/lib/auth'
@@ -252,7 +253,10 @@ export function SettingsPage() {
   const selectedAccount = accounts.find((account) => account.id === selectedAccountId) ?? accounts[0] ?? null
 
   async function load() {
-    const data = await apiFetch<{ accounts: ConnectedAccount[] }>('/connected-accounts')
+    // includeDisconnected: a disconnected Telegram account still holds its
+    // storage channel claim, so it must stay reachable here to be reconnected
+    // (abandoned-channel recovery). Only this page asks for them.
+    const data = await apiFetch<{ accounts: ConnectedAccount[] }>('/connected-accounts?includeDisconnected=1')
     setAccounts(data.accounts)
 
     try {
@@ -538,6 +542,8 @@ export function SettingsPage() {
 
           <BrowserCaptureCard />
 
+          <TelegramSecurityCard />
+
           <Card className="p-4">
             <h2 className="text-[16px] font-bold">Connected Storage Accounts</h2>
             <div className="mt-3.5 grid gap-3">
@@ -550,7 +556,7 @@ export function SettingsPage() {
                       {isReauthRequired(selectedAccount) ? <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700" title={reauthMessage(selectedAccount)}>Reconnection Required</span> : null}
                       {!selectedAccount.autoAllocationEnabled ? <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500" title="Excluded from Automatic storage allocation. Existing files and Sync are not affected.">Allocation Disabled</span> : null}
                       <div className="grid grid-cols-2 gap-2 sm:flex">
-                        {isReauthRequired(selectedAccount) ? <Button className="w-full" size="sm" onClick={() => selectedAccount.provider === 'telegram' ? openTelegramConnect(selectedAccount.id) : reconnectDrive(selectedAccount.id)} disabled={connecting}><Link2 className="h-4 w-4" />{connecting ? 'Opening...' : selectedAccount.provider === 'telegram' ? 'Reconnect Telegram' : 'Reconnect Google Drive'}</Button> : null}
+                        {isReauthRequired(selectedAccount) || selectedAccount.status === 'disconnected' ? <Button className="w-full" size="sm" onClick={() => selectedAccount.provider === 'telegram' ? openTelegramConnect(selectedAccount.id) : reconnectDrive(selectedAccount.id)} disabled={connecting}><Link2 className="h-4 w-4" />{connecting ? 'Opening...' : selectedAccount.provider === 'telegram' ? 'Reconnect Telegram' : 'Reconnect Google Drive'}</Button> : null}
                         <Button className="w-full" size="sm" variant="outline" onClick={() => sync(selectedAccount.id)} disabled={syncingAccountId === selectedAccount.id}><RefreshCw className={syncingAccountId === selectedAccount.id ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{syncingAccountId === selectedAccount.id ? 'Syncing...' : 'Sync'}</Button>
                         {selectedAccount.provider === 'telegram' ? <Button className="w-full" size="sm" variant="outline" onClick={() => setChannelAccount(selectedAccount)}><Send className="h-4 w-4" />{selectedAccount.telegram?.channelId ? 'Change Channel' : 'Set Up Channel'}</Button> : null}
                         {selectedAccount.provider === 'telegram' ? <Button className="w-full" size="sm" variant="outline" onClick={() => runTelegramTest(selectedAccount)} disabled={testingTelegramId === selectedAccount.id}><RefreshCw className={testingTelegramId === selectedAccount.id ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{testingTelegramId === selectedAccount.id ? 'Testing...' : 'Test Connection'}</Button> : null}

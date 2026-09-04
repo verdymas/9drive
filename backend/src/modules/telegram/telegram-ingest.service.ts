@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { prisma } from '../../config/prisma.js'
 import { AppError } from '../../utils/app-error.js'
 import { createAuditLog } from '../../utils/audit.js'
@@ -17,6 +18,7 @@ import {
   splitLogicalPath,
   type ParsedMetadata,
 } from './telegram-metadata.js'
+import { resolveCaptionMeta, storeCaptionCiphertext } from './telegram-metadata-cache.js'
 
 /**
  * Telegram → 9Drive ingestion.
@@ -119,22 +121,35 @@ export async function ingestTelegramDocument(
   document: TelegramDocumentSummary,
   caption: string | null,
 ): Promise<IngestOutcome> {
-  const parsed = parseCaption(caption)
+  const rawParsed = parseCaption(caption)
 
   // Case 1: 9Drive stable id → update or no-op by logical identity.
-  if (parsed.stableId) {
+  if (rawParsed.stableId) {
     const file = await prisma.file.findFirst({
-      where: { userId, telegramStableId: parsed.stableId, provider: 'telegram' },
-      select: { id: true, providerFileId: true, name: true, folderId: true, mimeType: true, sizeBytes: true },
+      where: { userId, telegramStableId: rawParsed.stableId, provider: 'telegram' },
+      select: { id: true, providerFileId: true, name: true, folderId: true, mimeType: true, sizeBytes: true, encryptedMetadata: true },
     })
     if (!file) {
       // No matching logical file — the id was new to us; create the row
       // keyed by `providerFileId` and stamp the stable id.
-      return createOrInboxFromParsed(userId, accountId, document, parsed)
+      return createOrInboxFromParsed(userId, accountId, document, mergeMeta(rawParsed, null).parsed)
     }
-    return updateFromParsed(userId, file.id, document, parsed)
+    // Fast path (spec §35): identical ciphertext → nothing is decrypted.
+    const { parsed, refreshed } = mergeMeta(rawParsed, file.encryptedMetadata)
+    const outcome = await updateFromParsed(userId, file.id, document, parsed)
+    if (refreshed && rawParsed.encryptedMeta) {
+      await storeCaptionCiphertext(userId, file.id, rawParsed.encryptedMeta, {
+        fileId: file.id,
+        name: lastSegment(parsed.logicalPath) ?? file.name,
+        path: parsed.logicalPath,
+        mimeType: document.mimeType,
+        size: document.size,
+      })
+    }
+    return outcome
   }
 
+  const parsed = mergeMeta(rawParsed, null).parsed
   // Case 2: 9Drive path only → match by physical providerFileId.
   if (parsed.logicalPath) {
     const file = await prisma.file.findFirst({
@@ -162,6 +177,40 @@ export async function ingestTelegramDocument(
   return 'inboxed'
 }
 
+/**
+ * Merge encrypted recovery metadata into the parsed caption.
+ *
+ * `cached` is the ciphertext already stored on the `File` row. When the
+ * caption's ciphertext is byte-identical, the canonical metadata behind it is
+ * unchanged: nothing is decrypted and the legacy fields are used as-is
+ * (spec §35). When it differs, the payload is decrypted, validated, and its
+ * `path` takes precedence over the plaintext `9drive:path` line. A wrong key,
+ * tampered payload, or unsupported version degrades to the legacy fields and
+ * is reported so the caller can raise a sync issue — it never aborts the run
+ * and never overwrites DB state with a guess.
+ */
+function mergeMeta(
+  parsed: ParsedMetadata,
+  cached: string | null,
+): { parsed: ParsedMetadata; refreshed: boolean; failure: { code: string; message: string } | null } {
+  const resolution = resolveCaptionMeta(parsed.encryptedMeta, cached)
+  if (resolution.status === 'changed') {
+    const path = resolution.meta.path ?? (resolution.meta.name ? normalizeLogicalPath(resolution.meta.name) : null)
+    return { parsed: { ...parsed, logicalPath: path ?? parsed.logicalPath }, refreshed: true, failure: null }
+  }
+  if (resolution.status === 'failed') {
+    return { parsed, refreshed: false, failure: { code: resolution.code, message: resolution.message } }
+  }
+  return { parsed, refreshed: false, failure: null }
+}
+
+/** Last path segment of a logical path (the filename), or null. */
+function lastSegment(logicalPath: string | null): string | null {
+  if (!logicalPath) return null
+  const segments = splitLogicalPath(logicalPath)
+  return segments.length > 0 ? segments[segments.length - 1] : null
+}
+
 async function createOrInboxFromParsed(
   userId: string,
   accountId: string,
@@ -183,20 +232,29 @@ async function createOrInboxFromParsed(
   if (folderSegments.length > 0) {
     folderId = await ensureFolderPathBySegments(userId, folderSegments, 'sync')
   }
+  // A path-only caption carries no 9Drive identity, so mint one: the row id
+  // doubles as the stable id (same convention as the upload path). Without it
+  // a later rename could never write its caption back to Telegram, because
+  // `updateTelegramDocumentCaption` no-ops on a null stable id.
+  const id = parsed.stableId ?? randomUUID()
   await prisma.file.create({
     data: {
+      id,
       userId,
       connectedAccountId: accountId,
       folderId,
       provider: 'telegram',
       providerFileId: document.remoteId,
-      telegramStableId: parsed.stableId,
+      telegramStableId: id,
       name: filename,
       mimeType: document.mimeType ?? 'application/octet-stream',
       sizeBytes: BigInt(document.size),
     },
   })
-  return parsed.stableId ? 'created' : 'inboxed'
+  // The file WAS placed at its logical path — that is a create, not an inbox
+  // fallback. Reporting 'inboxed' made sync mislabel it `strategy:'recovered'`
+  // and log `reason:'unresolvable_path'` for a path it resolved perfectly.
+  return 'created'
 }
 
 async function updateFromParsed(
@@ -259,13 +317,19 @@ async function syncPhysicalFieldsOnly(userId: string, fileId: string, document: 
 
 async function createInboxFile(userId: string, accountId: string, document: TelegramDocumentSummary) {
   const inbox = await getOrCreateRecoveredFolder(userId)
+  // Mint a stable id here too (see `createOrInboxFromParsed`): a recovered
+  // file with no id can never have its caption rewritten, which is the whole
+  // point of recovering it — rename it in 9Drive, the caption follows.
+  const id = randomUUID()
   await prisma.file.create({
     data: {
+      id,
       userId,
       connectedAccountId: accountId,
       folderId: inbox.id,
       provider: 'telegram',
       providerFileId: document.remoteId,
+      telegramStableId: id,
       name: document.name,
       mimeType: document.mimeType ?? 'application/octet-stream',
       sizeBytes: BigInt(document.size),

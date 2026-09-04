@@ -1,12 +1,9 @@
 import type { ConnectedAccount, File, TelegramStorageConfig } from '@prisma/client'
 import type { Response } from 'express'
-import { Readable } from 'node:stream'
-import { createHash } from 'node:crypto'
 import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { AppError } from '../../utils/app-error.js'
 import { decryptText } from '../../utils/crypto.js'
-import { evictTelegramClient, getPooledTelegramClient } from './telegram-client-pool.js'
 import type { TelegramClient } from 'teleproto'
 
 type TelegramConfig = TelegramStorageConfig & { connectedAccount: ConnectedAccount }
@@ -43,10 +40,9 @@ export type TelegramConnectionTest = {
  * provider.
  *
  * Telegram is used strictly as private blob storage in a user-owned private
- * channel. No chats / contacts / messaging are exposed. Clients are pooled per
- * credential set (see telegram-client-pool.ts) — one connected client per
- * encrypted `StringSession`, reused across operations so playback/seeks do not
- * pay a fresh MTProto handshake each time.
+ * channel. No chats / contacts / messaging are exposed. One short-lived client
+ * per operation, built from the per-user encrypted `StringSession`, disconnected
+ * in `finally`.
  *
  * Remote identities are `telegram://<channelId>/<messageId>` stored in
  * `File.providerFileId`. The database (Files/Folders) remains the source of
@@ -307,30 +303,10 @@ export async function createTelegramClient(config: CredentialsSource) {
     const apiId = Number(decryptText(config.apiIdEncrypted))
     const apiHash = decryptText(config.apiHashEncrypted)
     const session = decryptText(config.sessionEncrypted)
-    // Silent logger: the default logs INFO per connect ("Running teleproto
-    // version ...", "Using LAYER ..."), which spams the backend logs whenever
-    // a client is created/connected. Errors are wrapped as AppErrors by
-    // classifyTelegramError regardless of this logger.
-    const silentLogger = new telegram.Logger()
-    silentLogger.log = () => undefined
-    return new telegram.TelegramClient(new telegram.sessions.StringSession(session), apiId, apiHash, {
-      baseLogger: silentLogger,
-    }) as TelegramClient
+    return new telegram.TelegramClient(new telegram.sessions.StringSession(session), apiId, apiHash, {}) as TelegramClient
   } catch (error) {
     throw classifyTelegramError(error)
   }
-}
-
-/**
- * Pool key for a Telegram credential set: a hash of the decrypted
- * apiId:apiHash:session. A session rotation (auth wizard writes a new
- * `sessionEncrypted`) yields a new key → a fresh pooled client, while the old
- * pooled client self-heals via 401 eviction (Telegram unregisters rotated
- * sessions).
- */
-export function telegramClientSessionKey(config: CredentialsSource): string {
-  const raw = `${decryptText(config.apiIdEncrypted)}:${decryptText(config.apiHashEncrypted)}:${decryptText(config.sessionEncrypted)}`
-  return createHash('sha256').update(raw).digest('hex')
 }
 
 /** Serialize the current teleproto client session into an encrypted string session. */
@@ -338,30 +314,19 @@ export async function saveSessionString(client: TelegramClient): Promise<string>
   return String((client.session as unknown as { save(): string | Promise<string> }).save?.() ?? '')
 }
 
-/** Run `fn` with the pooled connected client for this credential set (reused across operations, owned by the pool). */
+/** Run `fn` with a fresh connected client, disconnected in `finally`. */
 export async function withTelegramClient<T>(
   config: CredentialsSource,
   fn: (client: TelegramClient) => Promise<T>,
 ): Promise<T> {
-  const key = telegramClientSessionKey(config)
-  let client: TelegramClient
+  const client = await createTelegramClient(config)
   try {
-    client = await getPooledTelegramClient(key, () => createTelegramClient(config))
-  } catch (error) {
-    // Creation/connect failed — keep the historical contract that a fresh
-    // client's connect errors are classified AppErrors (e.g. revoked session).
-    throw classifyTelegramError(error)
-  }
-  try {
+    await client.connect()
     return await fn(client)
   } catch (error) {
-    const classified = classifyTelegramError(error)
-    // Session revoked / client dropped: drop the pooled entry so the next
-    // operation builds a fresh client instead of reusing a dead one.
-    if (classified.status === 401 || !client.connected) {
-      void evictTelegramClient(key)
-    }
-    throw classified
+    throw classifyTelegramError(error)
+  } finally {
+    client.disconnect().catch(() => undefined)
   }
 }
 
@@ -595,29 +560,13 @@ export async function deleteTelegramDocuments(config: CredentialsSource, remoteI
 }
 
 /**
- * Open a Telegram document for byte streaming (batch download / zip export /
- * WebDAV range reads).
- *
- * `range` (optional, backward compatible): download only the given byte span.
- * teleproto's `iterDownload` sends `upload.getFile({ offset, precise: true })`,
- * so `offset` is honored exactly (no chunk-alignment math needed). `limit` is
- * approximate — the stream overshoots by up to one `requestSize` chunk — so
- * callers that need exact byte counts must trim (see `telegramDownloadToReadable`).
- *
+ * Open a Telegram document for byte streaming (batch download / zip export).
  * Returns the async iterable plus a `close()` that MUST be awaited when the
- * consumer is done. The client is owned by the pool and stays connected for
- * reuse — `close()` is a release no-op; destroying the returned stream stops
- * the download (iterDownload's generator terminates between chunks), it does
- * not tear down the shared client.
+ * consumer is done (it disconnects the short-lived client).
  */
-export async function openTelegramDocument(config: CredentialsSource, remoteId: string, range?: { offset: number; limit: number }) {
-  const key = telegramClientSessionKey(config)
-  let client: TelegramClient
-  try {
-    client = await getPooledTelegramClient(key, () => createTelegramClient(config))
-  } catch (error) {
-    throw classifyTelegramError(error)
-  }
+export async function openTelegramDocument(config: CredentialsSource, remoteId: string) {
+  const client = await createTelegramClient(config)
+  await client.connect()
   try {
     const { channelId, messageId } = parseTelegramRemoteId(remoteId)
     const channel = await resolveConfiguredChannel(client, channelId)
@@ -628,68 +577,13 @@ export async function openTelegramDocument(config: CredentialsSource, remoteId: 
     }
     return {
       remoteId,
-      stream: client.iterDownload(message.media as never, {
-        requestSize: 512 * 1024,
-        ...(range ? { offset: range.offset, limit: range.limit } : {}),
-      }) as AsyncIterable<Buffer>,
-      close: () => Promise.resolve(),
+      stream: client.iterDownload(message.media as never, { requestSize: 512 * 1024 }) as AsyncIterable<Buffer>,
+      close: () => client.disconnect().catch(() => undefined),
     }
   } catch (error) {
-    const classified = classifyTelegramError(error)
-    if (classified.status === 401 || !client.connected) {
-      void evictTelegramClient(key)
-    }
-    throw classified
+    await client.disconnect().catch(() => undefined)
+    throw error
   }
-}
-
-/**
- * Yield only the first `limit` bytes of a stream. `iterDownload`'s `limit` is
- * rounded up to whole `requestSize` chunks, so the final chunk must be trimmed
- * to the exact byte count — otherwise a piped HTTP response overshoots its
- * `Content-Length` and Node destroys the connection
- * (`ERR_HTTP_CONTENT_LENGTH_MISMATCH`).
- */
-async function* trimToLimit(stream: AsyncIterable<Buffer>, limit: number): AsyncGenerator<Buffer> {
-  let emitted = 0
-  for await (const chunk of stream) {
-    const remaining = limit - emitted
-    if (remaining <= 0) return
-    if (chunk.length <= remaining) {
-      emitted += chunk.length
-      yield chunk
-    } else {
-      yield chunk.subarray(0, remaining)
-      return
-    }
-  }
-}
-
-/**
- * Wrap an `openTelegramDocument` result as a Node `Readable`. Trims to an exact
- * byte `limit` when given (HTTP `Content-Length` must match the body exactly).
- * Calls the download's `close()` exactly once when the readable ends, errors,
- * or is destroyed — `Readable.from` calls the source iterator's `return()`,
- * which propagates through `trimToLimit` into teleproto's `iterDownload` and
- * stops the Telegram download, so a client abort does not keep pulling the
- * rest of a large file. `close()` is a release no-op with the pooled client
- * (it stays warm for the next request), not a disconnect.
- */
-export function telegramDownloadToReadable(
-  download: { stream: AsyncIterable<Buffer>; close: () => Promise<void> },
-  limit?: number,
-): Readable {
-  const readable = Readable.from(limit !== undefined ? trimToLimit(download.stream, limit) : download.stream)
-  let closed = false
-  const disconnect = () => {
-    if (closed) return
-    closed = true
-    void download.close()
-  }
-  readable.once('end', disconnect)
-  readable.once('error', disconnect)
-  readable.once('close', disconnect)
-  return readable
 }
 
 /** Stream a Telegram document to `res` as a full `200` response (no Range). */

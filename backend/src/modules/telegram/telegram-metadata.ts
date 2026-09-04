@@ -25,6 +25,7 @@
 
 export const NINE_DRIVE_ID_KEY = '9drive:id'
 export const NINE_DRIVE_PATH_KEY = '9drive:path'
+export const NINE_DRIVE_META_KEY = '9drive:meta'
 
 /** Stable-id format: ASCII letters/digits/`-`/`_`/`.`, 1..36 chars. UUIDs fit. */
 const STABLE_ID_RE = /^[A-Za-z0-9._-]{1,36}$/
@@ -56,6 +57,11 @@ export type ParsedMetadata = {
    *  filename in 9Drive; the parser does not split it off — that is the
    *  caller's job (the file model already owns the filename column). */
   logicalPath: string | null
+  /** Encrypted recovery metadata line value (`v1:<payload>`) from
+   *  `9drive:meta=`, or `null` when not present / invalid. Callers must
+   *  NOT decrypt it for normal reads — only sync / recovery / manual
+   *  repair. Legacy plaintext `9drive:path` remains supported. */
+  encryptedMeta: string | null
   /** Original caption lines minus the recognized 9Drive lines, preserved
    *  in order so we don't lose user-written captions. */
   extraLines: string[]
@@ -72,6 +78,9 @@ export type ParsedMetadata = {
     pathSeen: number
     pathKept: boolean
     pathReason?: 'missing' | 'malformed' | 'empty' | 'duplicate'
+    metaSeen: number
+    metaKept: boolean
+    metaReason?: 'missing' | 'malformed' | 'duplicate'
   }
 }
 
@@ -82,6 +91,9 @@ const EMPTY_DIAGNOSTICS: ParsedMetadata['diagnostics'] = {
   pathSeen: 0,
   pathKept: false,
   pathReason: 'missing',
+  metaSeen: 0,
+  metaKept: false,
+  metaReason: 'missing',
 }
 
 /** Split a caption on the only separator that survives captions intact: LF.
@@ -100,7 +112,11 @@ function splitCaptionLines(caption: string | null | undefined): string[] {
  *  keys, and mixed-case keys are deliberate no-ops to avoid silently
  *  accepting malformed input. */
 function isNineDriveLine(line: string): boolean {
-  return line.startsWith(`${NINE_DRIVE_ID_KEY}=`) || line.startsWith(`${NINE_DRIVE_PATH_KEY}=`)
+  return (
+    line.startsWith(`${NINE_DRIVE_ID_KEY}=`) ||
+    line.startsWith(`${NINE_DRIVE_PATH_KEY}=`) ||
+    line.startsWith(`${NINE_DRIVE_META_KEY}=`)
+  )
 }
 
 /** Encode a logical path (slash-joined, NFC) into a single caption line.
@@ -139,10 +155,20 @@ function encodePath(path: string): string | null {
 export function encodeCaption(input: {
   stableId: string
   logicalPath?: string | null
+  /** Pre-encrypted `9drive:meta` line VALUE (`v1:<payload>`), emitted when
+   *  the caller has encrypted the recovery metadata. Callers must produce
+   *  it via the crypto service — this module never encrypts. */
+  encryptedMeta?: string | null
   extras?: string[] | null
 }): string | null {
   if (!STABLE_ID_RE.test(input.stableId)) return null
   const lines: string[] = [`${NINE_DRIVE_ID_KEY}=${input.stableId}`]
+  if (input.encryptedMeta) {
+    const clean = input.encryptedMeta.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '').trim()
+    if (clean !== '' && clean.length <= TELEGRAM_CAPTION_MAX - `${NINE_DRIVE_META_KEY}=`.length) {
+      lines.push(`${NINE_DRIVE_META_KEY}=${clean}`)
+    }
+  }
   if (input.logicalPath) {
     const pathLine = encodePath(input.logicalPath)
     if (pathLine) lines.push(pathLine)
@@ -177,6 +203,7 @@ export function parseCaption(caption: string | null | undefined): ParsedMetadata
   const diagnostics: ParsedMetadata['diagnostics'] = { ...EMPTY_DIAGNOSTICS }
   let stableId: string | null = null
   let logicalPath: string | null = null
+  let encryptedMeta: string | null = null
   const extraLines: string[] = []
 
   for (const line of lines) {
@@ -213,14 +240,31 @@ export function parseCaption(caption: string | null | undefined): ParsedMetadata
       }
       continue
     }
+    if (line.startsWith(`${NINE_DRIVE_META_KEY}=`)) {
+      diagnostics.metaSeen += 1
+      const value = line.slice(NINE_DRIVE_META_KEY.length + 1)
+      if (encryptedMeta !== null) {
+        diagnostics.metaReason = 'duplicate'
+        continue
+      }
+      if (value === '') {
+        diagnostics.metaReason = 'malformed'
+      } else {
+        encryptedMeta = value
+        diagnostics.metaKept = true
+        diagnostics.metaReason = undefined
+      }
+      continue
+    }
     extraLines.push(line)
   }
 
   return {
     stableId,
     logicalPath,
+    encryptedMeta,
     extraLines,
-    hasAny: stableId !== null || logicalPath !== null,
+    hasAny: stableId !== null || logicalPath !== null || encryptedMeta !== null,
     diagnostics,
   }
 }
@@ -278,5 +322,9 @@ export function buildLogicalPath(segments: string[]): string | null {
  *  key is present, valid or not). */
 export function looksLikeNineDriveCaption(caption: string | null | undefined): boolean {
   if (!caption) return false
-  return caption.includes(`${NINE_DRIVE_ID_KEY}=`) || caption.includes(`${NINE_DRIVE_PATH_KEY}=`)
+  return (
+    caption.includes(`${NINE_DRIVE_ID_KEY}=`) ||
+    caption.includes(`${NINE_DRIVE_PATH_KEY}=`) ||
+    caption.includes(`${NINE_DRIVE_META_KEY}=`)
+  )
 }

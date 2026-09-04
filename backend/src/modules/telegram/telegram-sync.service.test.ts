@@ -93,6 +93,36 @@ function fakeClientWithCaptions(opts: {
   } as unknown as TelegramClient
 }
 
+/**
+ * Client whose `iterMessages` honours the real teleproto contract: `minId`
+ * (camelCase) is an exclusive lower bound, `reverse: true` yields ascending.
+ * `seen` records the options of every page fetch — this is what catches a
+ * dropped cursor (a snake_case `min_id` would leave `minId` undefined and the
+ * scan would loop over the same first page forever).
+ */
+function paginatingClient(
+  documents: Array<{ messageId: number; name: string; size: number; mimeType: string | null }>,
+  seen: Array<{ minId?: number; limit?: number; reverse?: boolean }>,
+): TelegramClient {
+  return {
+    async connect() {},
+    async disconnect() {},
+    async getInputEntity() { return {} as never },
+    async getEntity() { return fakeChannel() },
+    iterMessages(_channel: unknown, params: { minId?: number; limit?: number; reverse?: boolean }) {
+      seen.push(params)
+      const from = params.minId ?? 0
+      const ordered = [...documents].sort((a, b) => params.reverse ? a.messageId - b.messageId : b.messageId - a.messageId)
+      const page = ordered.filter((d) => params.reverse ? d.messageId > from : true).slice(0, params.limit ?? 100)
+      return (async function* () {
+        for (const d of page) {
+          yield { id: d.messageId, document: { size: d.size, mimeType: d.mimeType, attributes: [{ fileName: d.name }] } }
+        }
+      })()
+    },
+  } as unknown as TelegramClient
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   // Re-establish the default prisma mock implementations after
@@ -188,9 +218,9 @@ describe('runTelegramSync — incremental sync', () => {
       status: 'up_to_date', lastMessageId: 5n, lastScanAt: new Date(),
       errorCode: null, errorMessage: null, connectedAccountId: 'acc-1', userId: 'user-1',
     }
-    // New run iterates from min_id=5; the iterMessages mock ignores
-    // min_id (it just yields the documents it's given), but the test
-    // proves the cursor is read. Pass only 2 documents.
+    // New run iterates from minId=5; the fakeClient mock ignores the params
+    // (it just yields the documents it's given), but the test proves the
+    // cursor is read. Pass only 2 documents.
     h.withTelegramClientMock.mockImplementation(async (_cfg: unknown, fn: (client: TelegramClient) => Promise<unknown>) => fn(fakeClient({ documents: [
       { messageId: 6, name: 'new1.txt', size: 100, mimeType: 'text/plain' },
       { messageId: 7, name: 'new2.txt', size: 100, mimeType: 'text/plain' },
@@ -199,6 +229,31 @@ describe('runTelegramSync — incremental sync', () => {
     const result = await runTelegramSync('user-1', 'acc-1')
     expect(result.scannedCount).toBe(2)
     expect(result.importedCount).toBe(2)
+  })
+
+  it('never flags REMOTE_FILE_MISSING on an incremental run', async () => {
+    // Pass 2 compares an account-wide row snapshot against only this run's
+    // pages, so on an incremental run every row below the cursor looks
+    // "unseen". Missing-detection is full-scan only.
+    h.state.syncState = {
+      status: 'up_to_date', lastMessageId: 5n, lastScanAt: new Date(),
+      errorCode: null, errorMessage: null, connectedAccountId: 'acc-1', userId: 'user-1',
+    }
+    h.state.fileRows = [
+      { id: 'f1', providerFileId: 'telegram://4458806678/1', name: 'old.txt', mimeType: 'text/plain', sizeBytes: 100n, folderId: null, telegramStableId: null, status: 'active' },
+    ]
+    h.withTelegramClientMock.mockImplementation(async (_cfg: unknown, fn: (client: TelegramClient) => Promise<unknown>) => fn(fakeClient({ documents: [
+      { messageId: 6, name: 'new1.txt', size: 100, mimeType: 'text/plain' },
+    ] })))
+
+    const incremental = await runTelegramSync('user-1', 'acc-1')
+    expect(incremental.missingCount).toBe(0)
+    expect(h.state.issues.length).toBe(0)
+
+    // Same fixture as a full scan → the row IS flagged.
+    const full = await runTelegramSync('user-1', 'acc-1', { full: true })
+    expect(full.missingCount).toBe(1)
+    expect(h.state.issues.map((i) => i.kind)).toEqual(['REMOTE_FILE_MISSING'])
   })
 })
 
@@ -277,24 +332,24 @@ describe('runTelegramSync — single-flight + error handling', () => {
 })
 
 describe('runTelegramSync — pagination / large channel', () => {
-  it('processes documents across multiple pages', async () => {
-    // The fake client yields a single iterable; we assert that the
-    // orchestrator processes more than one page worth and stops on a
-    // short page (the fake returns all 250 docs on every call, but the
-    // service breaks after `limit` items per call).
+  it('drains a 250-document channel with a forward cursor', async () => {
+    // Regression: `min_id` (snake_case) is silently dropped by teleproto, so
+    // every page restarted from the newest message and only the newest ~100
+    // documents were ever scanned. The mock honours `minId`/`reverse`, so a
+    // dropped cursor would stall at 100.
     const docs = Array.from({ length: 250 }, (_, i) => ({
       messageId: i + 1, name: `f${i + 1}.txt`, size: 100, mimeType: 'text/plain',
     }))
-    h.withTelegramClientMock.mockImplementation(async (_cfg: unknown, fn: (client: TelegramClient) => Promise<unknown>) => fn(fakeClient({ documents: docs })))
+    const seen: Array<{ minId?: number; limit?: number; reverse?: boolean }> = []
+    h.withTelegramClientMock.mockImplementation(async (_cfg: unknown, fn: (client: TelegramClient) => Promise<unknown>) => fn(paginatingClient(docs, seen)))
 
     const result = await runTelegramSync('user-1', 'acc-1')
 
-    // We processed at least the first 200 documents across the first
-    // two pages; the exact count depends on the fake's iteration
-    // (it returns the same docs every call, so the safety check
-    // `lastMessageId <= minId` stops the loop at page 3).
-    expect(result.scannedCount).toBeGreaterThanOrEqual(200)
-    expect(result.importedCount).toBeGreaterThanOrEqual(200)
+    expect(result.scannedCount).toBe(250)
+    expect(result.importedCount).toBe(250)
+    // 3 pages: 100, 100, 50 (the short page ends the scan).
+    expect(seen.map((s) => s.minId)).toEqual([0, 100, 200])
+    expect(seen.every((s) => s.reverse === true)).toBe(true)
   })
 })
 

@@ -346,6 +346,49 @@ describe('PATCH /connected-accounts/:id — autoAllocationEnabled', () => {
   })
 })
 
+describe('GET /connected-accounts — ?includeDisconnected', () => {
+  beforeEach(() => {
+    reset()
+    // Rows already have a synced quota, so the handler does not re-query.
+    ;(h.prismaMock.connectedAccount.findMany as ReturnType<typeof vi.fn>).mockImplementation(async ({ where }: { where: any }) => {
+      return h.accounts
+        .filter((a) => a.userId === where.userId && where.status.in.includes(a.status))
+        .map((a) => ({ ...a, storageAccount: { ...a.storageAccount, lastSyncedAt: h.now, trashBytes: null } }))
+    })
+  })
+
+  it('hides disconnected accounts by default', async () => {
+    const dead = h.account('acc-dead', 'user-1')
+    dead.status = 'disconnected'
+    h.accounts.push(h.account('acc-live', 'user-1'), dead)
+
+    const res = await api('GET', '')
+    expect(res.status).toBe(200)
+    expect(res.json.accounts.map((a: any) => a.id)).toEqual(['acc-live'])
+  })
+
+  it('lists them with ?includeDisconnected=1 so an abandoned channel can be reconnected', async () => {
+    // A disconnected Telegram account still holds its `providerAccountId` (the
+    // channel id), so it must be reachable in Settings or the channel is
+    // permanently blocked by a 409 with no way to release it.
+    const dead = h.account('acc-dead', 'user-1')
+    dead.status = 'disconnected'
+    h.accounts.push(h.account('acc-live', 'user-1'), dead)
+
+    const res = await api('GET', '?includeDisconnected=1')
+    expect(res.status).toBe(200)
+    expect(res.json.accounts.map((a: any) => a.id).sort()).toEqual(['acc-dead', 'acc-live'])
+  })
+
+  it('ignores any other value for the flag', async () => {
+    const dead = h.account('acc-dead', 'user-1')
+    dead.status = 'disconnected'
+    h.accounts.push(dead)
+
+    expect((await api('GET', '?includeDisconnected=true')).json.accounts).toEqual([])
+  })
+})
+
 describe('POST /connected-accounts/:id/reconnect', () => {
   beforeEach(reset)
 

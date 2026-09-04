@@ -6,6 +6,7 @@ import {
   classifyTelegramError,
   parseTelegramRemoteId,
   resolveConfiguredChannel,
+  uploadTelegramDocument,
   withTelegramClient,
 } from './telegram.service.js'
 import { encodeCaption, normalizeLogicalPath, TELEGRAM_CAPTION_MAX } from './telegram-metadata.js'
@@ -40,12 +41,17 @@ export type CaptionUpdateResult = {
  * account. `logicalPath` is the post-mutation path (built by the caller
  * from `Folder` ancestry + filename). No-op when the existing caption
  * already matches.
+ *
+ * `encryptedMeta` (a full `9drive:meta=v1:...` line) is included in the
+ * caption when protected metadata is enabled. The physical document — bytes
+ * and filename alike — is never touched.
  */
 export async function updateTelegramDocumentCaption(
   userId: string,
   file: FileWithStableId,
   config: TelegramConfig,
   logicalPath: string | null,
+  encryptedMeta?: string | null,
 ): Promise<CaptionUpdateResult> {
   if (file.telegramStableId === null || file.telegramStableId === undefined) {
     // A file without a stable id has no 9Drive metadata to refresh — the
@@ -58,6 +64,7 @@ export async function updateTelegramDocumentCaption(
   const nextCaption = encodeCaption({
     stableId,
     logicalPath: normalizedPath,
+    ...(encryptedMeta ? { encryptedMeta } : {}),
   })
   if (!nextCaption) {
     throw new AppError('TELEGRAM_METADATA_INVALID', 'Could not encode the 9Drive metadata caption for this file.', 400)
@@ -118,6 +125,52 @@ export async function updateTelegramDocumentCaption(
  */
 export function buildInitialCaption(stableId: string, logicalPath: string | null): string | null {
   return encodeCaption({ stableId, logicalPath })
+}
+
+/**
+ * Shared Telegram upload helper used by BOTH the normal upload path and the
+ * remote-import processor so the two never diverge on caption/metadata
+ * handling (spec §26 — no duplicated crypto logic).
+ *
+ * When encryption/obfuscation is enabled it encrypts the recovery metadata
+ * into a `9drive:meta=v1:...` caption line and substitutes the opaque
+ * physical filename; otherwise it preserves the current plaintext behavior
+ * (`9drive:path` caption + logical filename) exactly.
+ *
+ * Returns `{ remoteId, caption, uploadName }` so the caller can persist the
+ * cache block in the same update that stores `providerFileId`.
+ */
+export async function uploadTelegramDocumentWithCrypto(opts: {
+  config: TelegramConfig
+  filePath: string
+  fileName: string
+  mimeType: string
+  sizeBytes: number
+  userId: string
+  fileId: string
+  logicalPath: string | null
+  onProgress?: (pct: number) => void
+}): Promise<{ remoteId: string; caption: string | null; uploadName: string }> {
+  const { config, filePath, fileName, mimeType, sizeBytes, fileId, logicalPath, onProgress } = opts
+  const { buildTelegramMetadataCache } = await import('./telegram-metadata-cache.js')
+
+  const cache = buildTelegramMetadataCache({ fileId, name: fileName, path: logicalPath, mimeType, size: sizeBytes })
+  const caption = encodeCaption({
+    stableId: fileId,
+    logicalPath,
+    ...(typeof cache.encryptedMetadata === 'string' ? { encryptedMeta: cache.encryptedMetadata } : {}),
+  })
+  const uploadName = typeof cache.physicalFilename === 'string' ? cache.physicalFilename : fileName
+
+  const remoteId = await uploadTelegramDocument(config, {
+    filePath,
+    name: uploadName,
+    mimeType,
+    sizeBytes,
+    caption: caption ?? undefined,
+    ...(onProgress ? { onProgress } : {}),
+  })
+  return { remoteId, caption, uploadName }
 }
 
 /**

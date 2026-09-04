@@ -187,8 +187,23 @@ vi.mock('../telegram/telegram-usage.service.js', () => ({
   syncTelegramUsage: vi.fn(async () => undefined),
 }))
 
+// The shared upload helper is mocked at the same seam as the raw uploader so
+// this test keeps asserting the caption/name the processor produces without
+// re-testing the crypto layer (covered by telegram-crypto.service.test.ts).
 vi.mock('../telegram/telegram-caption.service.js', () => ({
   buildInitialCaption: (...args: unknown[]) => h.buildCaption(...args),
+  uploadTelegramDocumentWithCrypto: async (opts: any) => {
+    const caption = h.buildCaption(opts.fileId, opts.logicalPath)
+    const remoteId = await h.uploadTelegram(opts.config, {
+      filePath: opts.filePath,
+      name: opts.fileName,
+      mimeType: opts.mimeType,
+      sizeBytes: opts.sizeBytes,
+      caption: caption ?? undefined,
+      ...(opts.onProgress ? { onProgress: opts.onProgress } : {}),
+    })
+    return { remoteId, caption, uploadName: opts.fileName }
+  },
 }))
 
 vi.mock('../files/file-logical-path.js', () => ({
