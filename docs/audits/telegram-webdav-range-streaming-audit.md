@@ -117,15 +117,47 @@ WebDAV stays provider-agnostic: provider-specific transport logic (including Tel
 
 - **Google Drive:** untouched branch (header string byte-identical to before); full WebDAV suite + manual regression required.
 - **rclone:** PROPFIND/HEAD/GET flow unchanged for all providers.
-- **Jellyfin:** seeks now issue ranged GETs; each seek opens a new short-lived Telegram client (existing 9Drive pattern — no pooling in this task; matches teledrive).
+- **Jellyfin:** seeks now issue ranged GETs; the Telegram client is pooled per account (round 2) so each seek reuses the warm connection instead of a fresh DH handshake.
 - **Memory:** no whole-file buffering — streaming only; `Readable.from` + `pipe()` honor backpressure.
-- **Rate limits:** no new retry logic; existing `classifyTelegramError` (FloodWait → 429) is preserved. Jellyfin can issue many range requests; each is a fresh client connect — known cost, unchanged from the REST path.
+- **Rate limits:** no new retry logic; existing `classifyTelegramError` (FloodWait → 429) is preserved. Jellyfin can issue many range requests; the pooled client reuses one connection instead of a fresh connect per request (round 2).
 - **Metadata drift** (DB size ≠ actual Telegram file size): stream ends at EOF, body shorter than declared Content-Length — pre-existing semantics shared by all providers.
 - **Unsatisfiable/malformed/multi-range headers:** unchanged behavior — full 200 fallback (existing WebDAV semantics; no 416 introduced).
 - **REST `streamTelegramFile` range support:** deliberately out of scope (in-app preview works on full 200s; seeking-beyond-buffer is a known degradation). `ponytail:` — extract `parseRange` into a shared module and reuse `telegramDownloadToReadable` when the in-app player reports broken Telegram seeking.
 
+## M. Round 2 — Playback Still Buffering: Per-Request Client Cost (root cause #2)
+
+After round 1, Jellyfin could list Telegram files but playback **still buffered forever**. New root cause (proven by code trace + observed logs):
+
+**Every WebDAV GET created a brand-new MTProto client.** `openTelegramDocument` / `withTelegramClient` called `createTelegramClient()` (new `TelegramClient` + fresh `StringSession`) and `connect()` per operation, then disconnected in `finally`/`close()`. The cost before the first byte streams:
+
+| Step | Telegram RPC(s) | Approx latency |
+|---|---|---|
+| `client.connect()` | TCP + 2048-bit DH key exchange + `InvokeWithLayer(InitConnection(help.GetConfig))` | 200–600 ms |
+| `resolveConfiguredChannel()` | entity lookup (`getEntity` — cache miss on a fresh session) | 100–300 ms |
+| `client.getMessages()` | message metadata | 100–300 ms |
+| `client.iterDownload()` first chunk | `upload.GetFile` | 100–500 ms |
+
+**Total: ~400–1700 ms per request before the first byte.** Jellyfin issues rapid sequential Range requests for buffering/seeking; each paid the handshake + 4 RPCs, so playback stalled ("always buffering"). The fresh-connect churn (teleproto "Running teleproto version"/"Using LAYER" lines every ~2 s) also risks exhausting Telegram's per-account auth-key limit — teleproto's own `sessions/Memory.js` documents that fresh DH per connection eventually trips the server's per-account auth-key cap and downloads get dropped.
+
+Concurrency note: teleproto supports concurrent `iterDownload` on one client — each routes through `_leaseSender` → `Network.lease` → `SenderSlot`, which reference-counts concurrent leases. So one pooled client per session serves parallel Jellyfin range requests safely.
+
+## N. Resolution — Per-Account Client Pool (round 2)
+
+- **NEW `backend/src/modules/telegram/telegram-client-pool.ts`** — generic per-key pool (single-flight connect, eviction, close-all). One connected client per key, reused across requests.
+- **`backend/src/modules/telegram/telegram.service.ts`**
+  - `telegramClientSessionKey(config)` — SHA-256 of decrypted `apiId:apiHash:session`; session rotation yields a new key → fresh client, old one self-heals via 401 eviction.
+  - `withTelegramClient` — pool-ified; no longer disconnects in `finally` (pool owns the client); evicts on 401 or `!client.connected`.
+  - `openTelegramDocument` — pool-ified; returned `close()` is now a release no-op (destroying the stream stops the download; the shared client stays warm); evicts on 401 / disconnect.
+- **NEW `backend/src/modules/telegram/telegram-client-pool.test.ts`** — 8 tests: reuse per key, distinct keys, single-flight, failed-creation retry, connect-failure retry, stale-client replacement, eviction, close-all.
+- No idle timeout yet — exactly one client per session string, bounded by account count. `ponytail:` add idle eviction if many accounts idle-hold connections.
+
 ## Verification Results
 
+Round 1:
 - `npx tsc --noEmit` — PASS
-- `npx vitest run` — 70 files / 931 tests PASS (incl. new `telegram-download.test.ts`, 5 tests)
-- Manual verification (curl/rclone/Jellyfin) — pending per implementation plan §45 Phase 5
+- `npx vitest run` — 70 files / 931 tests PASS (incl. `telegram-download.test.ts`, 5 tests)
+
+Round 2 (pool):
+- `npx tsc --noEmit` — PASS
+- `npx vitest run` — 71 files / 939 tests PASS (incl. `telegram-client-pool.test.ts`, 8 tests)
+- Manual verification (curl/rclone/Jellyfin; requires `docker compose build backend` since the Dockerfile builds fresh `dist/`) — pending per implementation plan §45 Phase 5
