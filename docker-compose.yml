@@ -65,6 +65,7 @@ services:
       TELEGRAM_SYNC_PAGE_SIZE: ${TELEGRAM_SYNC_PAGE_SIZE:-100}
       TELEGRAM_SYNC_CONCURRENCY: ${TELEGRAM_SYNC_CONCURRENCY:-2}
       TELEGRAM_SYNC_FLOOD_WAIT_RETRIES: ${TELEGRAM_SYNC_FLOOD_WAIT_RETRIES:-3}
+      TELEGRAM_SYNC_FULL_EVERY_MINUTES: ${TELEGRAM_SYNC_FULL_EVERY_MINUTES:-360}
       TELEGRAM_SYNC_TRASH_MISSING: ${TELEGRAM_SYNC_TRASH_MISSING:-false}
       # Telegram metadata protection. No default for the master key: an empty
       # value means "not configured" and protected uploads fail safely rather
@@ -159,6 +160,7 @@ services:
       TELEGRAM_SYNC_PAGE_SIZE: ${TELEGRAM_SYNC_PAGE_SIZE:-100}
       TELEGRAM_SYNC_CONCURRENCY: ${TELEGRAM_SYNC_CONCURRENCY:-2}
       TELEGRAM_SYNC_FLOOD_WAIT_RETRIES: ${TELEGRAM_SYNC_FLOOD_WAIT_RETRIES:-3}
+      TELEGRAM_SYNC_FULL_EVERY_MINUTES: ${TELEGRAM_SYNC_FULL_EVERY_MINUTES:-360}
       TELEGRAM_SYNC_TRASH_MISSING: ${TELEGRAM_SYNC_TRASH_MISSING:-false}
       # Telegram metadata protection — the worker uploads to Telegram too, so it
       # needs the same key. A mismatch here would write payloads the API cannot read.

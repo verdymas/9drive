@@ -774,6 +774,10 @@ model TelegramSyncState {
   // scan. Incremental sync resumes at `min_id = lastMessageId`.
   lastMessageId      BigInt?          @map("last_message_id")
   lastScanAt         DateTime?        @map("last_scan_at")
+  // Stamped on a successful full scan only. The scheduler uses this
+  // to decide when to promote its next auto-tick from incremental
+  // to full — Pass 2 (deleted-message detection) is full-scan only.
+  lastFullScanAt     DateTime?        @map("last_full_scan_at")
   // never_synced | syncing | up_to_date | changes_detected |
   // needs_attention | sync_failed
   status             String           @default("never_synced") @map("status") @db.VarChar(32)

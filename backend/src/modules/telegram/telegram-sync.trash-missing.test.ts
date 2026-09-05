@@ -23,6 +23,7 @@ const h = vi.hoisted(() => {
     priorMissingFlags: [] as Array<{ fileId: string }>,
     lockAcquired: true,
     auditEvents: [] as Array<{ action: string; entity: string; entityId: string; meta: any }>,
+    errorCount: 0,
   }
   const prismaMock = {
     connectedAccount: { findFirst: vi.fn() },
@@ -157,30 +158,15 @@ beforeEach(() => {
   h.state.priorMissingFlags = []
   h.state.lockAcquired = true
   h.state.auditEvents = []
+  h.state.errorCount = 0
 })
 
 describe('runTelegramSync — TELEGRAM_SYNC_TRASH_MISSING (opt-in)', () => {
-  it('first full scan: flags the row but does NOT trash it', async () => {
+  it('clean full scan: trashes the row immediately', async () => {
     h.state.fileRows = [
       { id: 'f1', providerFileId: 'telegram://4458806678/42', name: 'gone.txt', mimeType: 'text/plain', sizeBytes: 100n, folderId: null, telegramStableId: null, status: 'active', deletedAt: null },
     ]
-    setWithClient([])
-
-    const result = await runTelegramSync('user-1', 'acc-1')
-
-    expect(result.missingCount).toBe(1)
-    expect(result.trashedCount).toBe(0)
-    expect(h.state.fileUpdates.length).toBe(0)
-    expect(h.state.issues.length).toBe(1)
-    expect(h.state.issues[0].kind).toBe('REMOTE_FILE_MISSING')
-    expect(h.state.fileRows[0].status).toBe('active')
-  })
-
-  it('second full scan with prior unresolved flag: trashes the row', async () => {
-    h.state.fileRows = [
-      { id: 'f1', providerFileId: 'telegram://4458806678/42', name: 'gone.txt', mimeType: 'text/plain', sizeBytes: 100n, folderId: null, telegramStableId: null, status: 'active', deletedAt: null },
-    ]
-    h.state.priorMissingFlags = [{ fileId: 'f1' }]
+    h.state.priorMissingFlags = []
     setWithClient([])
 
     const result = await runTelegramSync('user-1', 'acc-1')
@@ -195,29 +181,37 @@ describe('runTelegramSync — TELEGRAM_SYNC_TRASH_MISSING (opt-in)', () => {
     expect(h.state.auditEvents.some((a) => a.action === 'telegram.sync.trash_missing' && a.entityId === 'f1')).toBe(true)
   })
 
-  it('does NOT trash when the prior issue was already resolved by the user', async () => {
+  it('flags but does NOT trash when any per-document error occurred (scan was incomplete)', async () => {
+    // Trashing is destructive, so it requires a CLEAN scan. Pass 1
+    // swallows per-document errors and continues — with two-run gone,
+    // `seenFileIds` may be incomplete, so a row absent only because its
+    // page errored must not be mistaken for a deleted message.
     h.state.fileRows = [
       { id: 'f1', providerFileId: 'telegram://4458806678/42', name: 'gone.txt', mimeType: 'text/plain', sizeBytes: 100n, folderId: null, telegramStableId: null, status: 'active', deletedAt: null },
     ]
-    // priorMissingFlags empty: the prior issue was resolved, so Pass 2's
-    // `findMany({ resolvedAt: null })` returns no rows.
-    h.state.priorMissingFlags = []
-    setWithClient([])
+    // Trigger the per-doc catch at :461 by making the orphan's ingest
+    // throw — stats.errorCount > 0, but Pass 2 still flags the missing
+    // row. The trash step is gated on errorCount === 0.
+    setWithClient([{ messageId: 99, name: 'orphan.txt', size: 10, mimeType: 'text/plain' }])
+    const { ingestTelegramDocument } = await import('./telegram-ingest.service.js')
+    vi.mocked(ingestTelegramDocument).mockImplementationOnce(async () => {
+      throw Object.assign(new Error('FLOOD_WAIT'), { code: 'FLOOD_WAIT' })
+    })
 
     const result = await runTelegramSync('user-1', 'acc-1')
 
+    expect(result.errorCount).toBeGreaterThan(0)
     expect(result.missingCount).toBe(1)
     expect(result.trashedCount).toBe(0)
     expect(h.state.fileUpdates.length).toBe(0)
     expect(h.state.fileRows[0].status).toBe('active')
   })
 
-  it('incremental run: Pass 2 skipped, nothing trashed even with prior flag', async () => {
+  it('incremental run: Pass 2 skipped, nothing trashed', async () => {
     h.state.syncState = { status: 'up_to_date', lastMessageId: 5n, lastScanAt: new Date(), errorCode: null, errorMessage: null, connectedAccountId: 'acc-1', userId: 'user-1' }
     h.state.fileRows = [
       { id: 'f1', providerFileId: 'telegram://4458806678/1', name: 'a.txt', mimeType: 'text/plain', sizeBytes: 100n, folderId: null, telegramStableId: null, status: 'active', deletedAt: null },
     ]
-    h.state.priorMissingFlags = [{ fileId: 'f1' }]
     setWithClient([{ messageId: 6, name: 'new.txt', size: 50, mimeType: 'text/plain' }])
 
     const result = await runTelegramSync('user-1', 'acc-1')
@@ -232,7 +226,6 @@ describe('runTelegramSync — TELEGRAM_SYNC_TRASH_MISSING (opt-in)', () => {
     h.state.fileRows = [
       { id: 'f1', providerFileId: 'telegram://4458806678/42', name: 'trashed.txt', mimeType: 'text/plain', sizeBytes: 100n, folderId: null, telegramStableId: null, status: 'deleted', deletedAt: new Date() },
     ]
-    h.state.priorMissingFlags = [{ fileId: 'f1' }]
     setWithClient([])
 
     const result = await runTelegramSync('user-1', 'acc-1')

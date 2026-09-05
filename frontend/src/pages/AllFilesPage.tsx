@@ -330,9 +330,9 @@ export function AllFilesPage() {
         removed += res.stats.filesMissing
         // `filesFlagged` is Telegram-only: files whose Telegram message
         // disappeared and that the sync wrote a REMOTE_FILE_MISSING issue
-        // for. The user must resolve them — the sync only removes them
-        // when the opt-in TELEGRAM_SYNC_TRASH_MISSING flag confirms it on
-        // a second scan. Surface the count so the deletion is visible.
+        // for. With TELEGRAM_SYNC_TRASH_MISSING enabled the sync soft-deletes
+        // them on the same full scan; otherwise the user resolves them.
+        // Surface the count either way so the finding is visible.
         flagged += res.stats.filesFlagged ?? 0
       }
       const accounts = response.results.length

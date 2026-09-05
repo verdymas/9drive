@@ -13,6 +13,19 @@ vi.mock('./telegram-sync.queue.js', () => ({
 
 vi.mock('../../config/prisma.js', () => ({ prisma: h.prismaMock }))
 
+// Pin the scheduler's config. `env.ts` parses `.env` once at import, so
+// mutating `process.env` in a beforeEach does nothing — these tests used
+// to pass only because `z.coerce.boolean()` turned the string "false"
+// into true. With `booleanEnv` reading it correctly, a developer whose
+// `.env` disables auto-sync would otherwise fail the suite.
+vi.mock('../../config/env.js', () => ({
+  env: {
+    TELEGRAM_SYNC_AUTO_ENABLED: true,
+    TELEGRAM_SYNC_INTERVAL_MINUTES: 30,
+    TELEGRAM_SYNC_FULL_EVERY_MINUTES: 360,
+  },
+}))
+
 import {
   isSchedulerRunning,
   startTelegramSyncScheduler,
@@ -23,7 +36,6 @@ import {
 beforeEach(() => {
   vi.clearAllMocks()
   stopTelegramSyncScheduler()
-  process.env.TELEGRAM_SYNC_AUTO_ENABLED = 'true'
 })
 
 afterEach(() => {
@@ -42,7 +54,7 @@ describe('triggerSweepOnce', () => {
 
     expect(result.enqueued).toBe(1)
     expect(h.enqueueMock).toHaveBeenCalledTimes(1)
-    expect(h.enqueueMock).toHaveBeenCalledWith({ accountId: 'acc-1', trigger: 'auto', full: false })
+    expect(h.enqueueMock).toHaveBeenCalledWith({ accountId: 'acc-1', trigger: 'auto', full: true })
   })
 
   it('skips accounts that already have a syncing state row', async () => {

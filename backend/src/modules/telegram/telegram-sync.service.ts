@@ -94,9 +94,9 @@ export type TelegramSyncRunStats = {
   matchedByPathCount: number
   recoveredCount: number
   // Files the sync actually soft-deleted this run because the opt-in
-  // TELEGRAM_SYNC_TRASH_MISSING flag was set AND the file was already
-  // flagged missing on a previous full scan. Always 0 in the spec's
-  // default mode (telegram-drive.md:87).
+  // TELEGRAM_SYNC_TRASH_MISSING flag was set AND this full scan found
+  // their Telegram message gone AND the scan was clean (errorCount 0).
+  // Always 0 in the spec's default mode (telegram-drive.md:87).
   trashedCount: number
 }
 
@@ -258,6 +258,9 @@ export async function runTelegramSync(
           status: finalStatus,
           lastMessageId: result.maxSeenMessageId ?? state.lastMessageId ?? null,
           lastScanAt: finishedAt,
+          // Stamp a full-scan completion only on success + full request
+          // so a failed or cancelled run does not defer the next full scan.
+          ...(options.full ? { lastFullScanAt: finishedAt } : {}),
           errorCode: null,
           errorMessage: null,
         },
@@ -490,29 +493,14 @@ async function scanChannel(input: {
     // every row below the cursor is "unseen" and would be falsely flagged.
     // Missing-detection needs a complete scan to be meaningful.
     if (resumeFromMessageId === null) {
-      // Two-run confirmation: a Telegram message can vanish from one scan
-      // for reasons other than deletion (partial page fetch, FloodWait
-      // mid-run, permission change). An unresolved `REMOTE_FILE_MISSING`
-      // issue for the same `fileId` is the durable record that a previous
-      // run flagged it — and the `telegram_sync_issues_file_idx` index
-      // makes this lookup cheap. No new schema column needed.
-      const priorMissingFlagFileIds = new Set(
-        (
-          await prisma.telegramSyncIssue.findMany({
-            where: {
-              userId,
-              connectedAccountId: accountId,
-              kind: 'REMOTE_FILE_MISSING',
-              resolvedAt: null,
-              // Same run is impossible (we haven't written its issue yet)
-              // but exclude it defensively for the racy overlap case.
-              runId: { not: input.runId },
-            },
-            select: { fileId: true },
-          })
-        ).flatMap((i) => (i.fileId ? [i.fileId] : [])),
-      )
-      const trashMissing = env.TELEGRAM_SYNC_TRASH_MISSING
+      // Trashing is destructive, so it requires a CLEAN scan. Pass 1
+      // swallows per-document errors and continues (see classifyOne catch
+      // at ~:457-471), which can leave `seenFileIds` incomplete — a row
+      // absent only because its page errored must not be mistaken for a
+      // deleted message. Flagging still happens either way; only the
+      // soft-delete is withheld when any per-document error occurred.
+      // Whole-page fetch failures already abort the run before Pass 2.
+      const trashMissing = env.TELEGRAM_SYNC_TRASH_MISSING && stats.errorCount === 0
       for (const row of existingRows) {
         if (seenFileIds.has(row.providerFileId)) continue
         // Soft-deleted rows that were manually removed in 9Drive should
@@ -531,12 +519,10 @@ async function scanChannel(input: {
             metadata: { name: row.name },
           },
         })
-        // Opt-in auto-trash. Two-run confirmation: a previous full scan
-        // must have already flagged this file as missing AND the user
-        // must not have resolved that flag. Soft-delete only (recoverable
-        // from Trash), never hard-delete, never touches the Telegram
-        // message itself — Telegram has already lost it on its own.
-        if (trashMissing && priorMissingFlagFileIds.has(row.id)) {
+        // Opt-in auto-trash. Soft-delete only (recoverable from Trash),
+        // never hard-delete, never touches the Telegram message itself
+        // — Telegram has already lost it on its own.
+        if (trashMissing) {
           await prisma.file.update({
             where: { id: row.id, userId },
             data: { status: 'deleted', deletedAt: new Date() },

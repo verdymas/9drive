@@ -240,7 +240,7 @@ vi.mock('../s3/s3.service.js', () => ({
 // orphans under `Recovered from Telegram`), and never calls
 // `provider-folder.service` write methods.
 vi.mock('../telegram/telegram-sync.service.js', () => ({
-  runTelegramSync: vi.fn(async (userId: string, accountId: string) => ({
+  runTelegramSync: vi.fn(async (_userId: string, accountId: string, _options?: { full?: boolean }) => ({
     id: `telegram-run-${accountId}`,
     status: 'completed' as const,
     startedAt: new Date(),
@@ -266,6 +266,7 @@ vi.mock('../telegram/telegram-usage.service.js', () => ({
 }))
 
 import { runSyncAll, runAccountSync } from './sync.service.js'
+import { runTelegramSync } from '../telegram/telegram-sync.service.js'
 
 type FakeItem = { id: string; name: string; mimeType: string; size?: string }
 const FOLDER = 'application/vnd.google-apps.folder'
@@ -369,6 +370,20 @@ describe('sync boundary — provider is READ-ONLY (§29/§70)', () => {
     for (const fn of ['ensureProviderRoot', 'createProviderFolder', 'renameProviderFolder', 'moveProviderFolder', 'deleteProviderFolder'] as const) {
       expect(h.providerWrites[fn]).not.toHaveBeenCalled()
     }
+  })
+
+  it('manual Sync requests a FULL Telegram scan (regression: `!cancelled` vs `!cancelled()`)', async () => {
+    // `isCancelled()` returns a FUNCTION, so the original `full: !cancelled`
+    // was always `false` — negating a function object. That kept the
+    // cursor at `state.lastMessageId` (telegram-sync.service.ts:224), and
+    // Pass 2 (deleted-message detection) is full-scans-only by design, so
+    // it could never run from the UI. Assert the flag itself: the bug lives
+    // in the argument, not in any observable output of the mocked service.
+    h.ACCOUNTS.push({ id: 'acc-tg', userId: 'u1', provider: 'telegram', status: 'connected' })
+
+    await runAccountSync('u1', 'acc-tg')
+
+    expect(vi.mocked(runTelegramSync)).toHaveBeenCalledWith('u1', 'acc-tg', { full: true })
   })
 
   it('full Sync All makes ZERO provider write calls', async () => {

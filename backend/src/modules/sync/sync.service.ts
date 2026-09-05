@@ -99,7 +99,7 @@ export async function runAccountSync(userId: string, connectedAccountId: string)
       // `reconcileMissing(ctx, stats)` call further down in this function,
       // which uses `lastSeenSyncRunId` and is intentionally Telegram-blind
       // (this branch returns before that line is reached).
-      const syncSummary = await runTelegramSync(userId, account.id, { full: !cancelled })
+      const syncSummary = await runTelegramSync(userId, account.id, { full: !cancelled() })
       syncTelegramUsage(account.id).catch(() => undefined)
       // Map Telegram-shaped stats onto the Google/S3-shaped `SyncStats`
       // shape. The Telegram summary's per-strategy counters are surfaced

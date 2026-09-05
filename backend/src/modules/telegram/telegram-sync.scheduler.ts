@@ -29,6 +29,11 @@ async function sweepOnce(): Promise<{ due: number; enqueued: number }> {
   try {
     const intervalMsValue = intervalMs()
     const cutoff = new Date(Date.now() - intervalMsValue)
+    // Cadence for the periodic FULL scan. Pass 2 (deleted-message
+    // detection) is full-scan only, so this is what makes background
+    // detection work. Must be >= TELEGRAM_SYNC_INTERVAL_MINUTES.
+    const fullEveryMs = Math.max(intervalMsValue, env.TELEGRAM_SYNC_FULL_EVERY_MINUTES * 60_000)
+    const fullCutoff = new Date(Date.now() - fullEveryMs)
 
     // Eligible accounts: connected Telegram accounts with a configured
     // storage channel. `last_scan_at` is null (never synced) OR older
@@ -44,27 +49,33 @@ async function sweepOnce(): Promise<{ due: number; enqueued: number }> {
       },
       select: {
         id: true,
-        telegramSyncStates: { select: { status: true, lastScanAt: true } },
+        telegramSyncStates: { select: { status: true, lastScanAt: true, lastFullScanAt: true } },
       },
     })
 
-    const due: string[] = []
+    type Due = { id: string; full: boolean }
+    const due: Due[] = []
     for (const account of eligible) {
       const state = account.telegramSyncStates[0]
       if (!state) {
-        // No state row yet — never synced.
-        due.push(account.id)
+        // No state row yet — never synced; first run is full so Pass 2
+        // can pick up any pre-existing deletions from day one.
+        due.push({ id: account.id, full: true })
         continue
       }
       if (state.status === 'syncing') continue // actively syncing
       if (!state.lastScanAt || state.lastScanAt < cutoff) {
-        due.push(account.id)
+        // Promote to a full scan when the last full scan is missing or
+        // older than the full-cutoff — incremental ticks in between
+        // stay cheap and only catch new uploads.
+        const full = !state.lastFullScanAt || state.lastFullScanAt < fullCutoff
+        due.push({ id: account.id, full })
       }
     }
 
     let enqueued = 0
-    for (const accountId of due) {
-      const result = await enqueueTelegramSync({ accountId, trigger: 'auto', full: false }).catch(() => null)
+    for (const target of due) {
+      const result = await enqueueTelegramSync({ accountId: target.id, trigger: 'auto', full: target.full }).catch(() => null)
       if (result?.queued) enqueued += 1
     }
 

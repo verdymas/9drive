@@ -113,7 +113,7 @@ const envSchema = z.object({
   // ── Telegram Synchronization (channel ↔ 9Drive reconciliation) ─────────
   // Master switch for the periodic sweep. Manual `POST /telegram/sync` is
   // always allowed; this only gates the setInterval-driven auto sync.
-  TELEGRAM_SYNC_AUTO_ENABLED: z.coerce.boolean().default(true),
+  TELEGRAM_SYNC_AUTO_ENABLED: booleanEnv(true),
   // Sweep cadence (minutes). Spec recommends 15–30; default 30 keeps load
   // bounded while still catching newly-deleted / uploaded files quickly.
   TELEGRAM_SYNC_INTERVAL_MINUTES: z.coerce.number().int().min(15).max(720).default(30),
@@ -125,10 +125,15 @@ const envSchema = z.object({
   // Maximum retries per page on FloodWait. FloodWait itself waits the
   // requested seconds; this caps how many times we re-enter on a row.
   TELEGRAM_SYNC_FLOOD_WAIT_RETRIES: z.coerce.number().int().min(0).max(5).default(3),
-  // Soft-delete (trash) a 9Drive row when its Telegram message has been gone
-  // for two consecutive FULL scans. Default false — the spec's rule is that
-  // Telegram deletion never removes a 9Drive row (telegram-drive.md:87). When
-  // true, rows are moved to Trash (recoverable), never hard-deleted.
+  // Cadence for the periodic FULL scan. Pass 2 (deleted-message
+  // detection) is full-scan only, so this is what makes background
+  // detection work. Must be >= TELEGRAM_SYNC_INTERVAL_MINUTES. The
+  // scheduler clamps to the higher of the two.
+  TELEGRAM_SYNC_FULL_EVERY_MINUTES: z.coerce.number().int().min(15).max(10080).default(360),
+  // Soft-delete (trash) a 9Drive row when its Telegram message disappeared
+  // and a FULL scan detected it (Pass 2). Default false — the spec's rule is
+  // that Telegram deletion never removes a 9Drive row (telegram-drive.md:87).
+  // When true, rows are moved to Trash (recoverable), never hard-deleted.
   TELEGRAM_SYNC_TRASH_MISSING: booleanEnv(false),
   // ── Telegram metadata protection (encrypted captions + opaque filenames) ──
   // Master switch for encrypting `9drive:meta` caption metadata on Telegram

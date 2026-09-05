@@ -87,7 +87,7 @@ The metadata rules (single source of truth — see
 - **Telegram deletion must not automatically delete a 9drive file.** The
   ingest path is additive only — missing messages are skipped, never used
   to soft-delete rows.
-  *(Opt-in: TELEGRAM_SYNC_TRASH_MISSING=true soft-deletes a row only after it has been flagged missing on a previous full scan. Default preserves this rule.)
+  *(Opt-in: TELEGRAM_SYNC_TRASH_MISSING=true soft-deletes a row on the first full scan that finds its message gone. Default preserves this rule.)
 
 ### Stable identity — `File.telegramStableId`
 
@@ -177,7 +177,7 @@ calls `editMessage`. No-op when the caption already matches.
   remoteId. A 9Drive file stays present even after the Telegram message
   is manually deleted, with `providerFileId` pointing to a now-stale
   reference. Permanent delete is the only way to reconcile.
-  *(Opt-in: TELEGRAM_SYNC_TRASH_MISSING=true trashes a row after two consecutive full scans flag it missing. Off by default.)
+  *(Opt-in: TELEGRAM_SYNC_TRASH_MISSING=true trashes a row on the first full scan that flags it missing. Off by default.)
 
 ### No Topic-to-folder mapping
 
@@ -570,13 +570,15 @@ row and the Telegram message. **No automatic re-upload** happens on
 missing-remote (spec §13).
 
 **Opt-in auto-trash:** with `TELEGRAM_SYNC_TRASH_MISSING=true`, a row
-that is missing on *two consecutive* full scans (i.e. it carries an
-unresolved `REMOTE_FILE_MISSING` issue from the previous run) is
-soft-deleted — moved to Trash, never hard-deleted, recoverable via
-`POST /files/batch/restore`. Two-run confirmation guards against
-transient scans (partial pages, mid-run FloodWait, permission
-changes) acting on a file that wasn't really deleted. The flag is
-off by default; the spec's never-delete rule is the default behavior.
+whose message is absent from a full scan is soft-deleted — moved to
+Trash, never hard-deleted, recoverable via
+`POST /files/batch/restore`. The trash step requires a *clean* scan
+(`stats.errorCount === 0`): Pass 1 swallows per-document errors and
+continues, so a row absent only because its page errored must not be
+mistaken for a deleted message. Such a run still flags the issue but
+withholds the soft-delete. Full scans only — an incremental run has
+no complete view of the channel. The flag is off by default; the
+spec's never-delete rule is the default behavior.
 
 ### Conflict handling
 
