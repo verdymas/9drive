@@ -9,7 +9,7 @@ import pytest
 from app.core.config import settings
 from app.core.errors import AppError
 from app.observability import StreamMetrics
-from app.telegram.engine import _peer, iter_bytes
+from app.telegram.engine import _classify, _peer, iter_bytes
 from app.telegram.file_resolver import ResolvedLocation
 
 
@@ -85,3 +85,20 @@ async def test_request_size_is_clamped_to_telethon_max(monkeypatch: pytest.Monke
 def test_peer_gets_the_100_marker_exactly_once() -> None:
     assert _peer("4458806678") == -1004458806678
     assert _peer("-1004458806678") == -1004458806678
+
+
+# Telethon raised TypeNotFoundError when Telegram served a `message` constructor
+# the installed release didn't know — the failure mode of a layer drift on a
+# shared auth key. The mapping MUST produce a 502 with the right code, not a
+# bare 500; otherwise every library scan crashes the request with no log line.
+def test_type_not_found_maps_to_layer_mismatch_502() -> None:
+    from telethon.errors import TypeNotFoundError
+
+    mapped = _classify(TypeNotFoundError(0x7600B9D3, b""))
+    assert mapped is not None
+    assert mapped.status == 502
+    assert mapped.code == "TELEGRAM_LAYER_MISMATCH"
+
+
+def test_unclassified_exception_returns_none() -> None:
+    assert _classify(RuntimeError("not a Telethon error")) is None

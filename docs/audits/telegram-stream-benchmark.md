@@ -211,5 +211,14 @@ TTFB is 67–695 ms and throughput 32 Mbps on a full sequential read, so the
 sequential single-request design (§4, `engine.py` `ponytail:`) is not the
 bottleneck for typical playback bitrates. No prefetch added.
 
+**Client parity.** `telegram-stream` is Telethon 1.44.0 (layer 227,
+`message#7600b9d3`); the backend upload/sync stack is teleproto 1.229.0
+(layer 229, same `message` constructor). The auth key is shared, so Telegram
+serves the newer constructor to both. Earlier Telethon releases (≤ 1.43) did
+not know `7600b9d3` and would crash a `messages.getMessages` response with an
+unhandled `TypeNotFoundError`; the fix is the bump plus a `_classify` clause
+mapping that error to `TELEGRAM_LAYER_MISMATCH` / 502 so any future drift
+degrades to a logged, enveloped failure rather than a bare 500.
+
 **Still not proven here:** Jellyfin/rclone behaviour end to end (§10 runbook)
 and sustained multi-GB playback.

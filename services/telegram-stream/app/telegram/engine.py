@@ -82,6 +82,12 @@ def _classify(exc: BaseException) -> AppError | None:
         return AppError("TELEGRAM_FLOOD_WAIT", f"Telegram rate limit; retry in {exc.seconds}s.", 429)
     if isinstance(exc, (errors.ChannelPrivateError, errors.ChannelInvalidError)):
         return AppError("CHANNEL_UNAVAILABLE", "The storage channel is not reachable by this account.", 403)
+    # Telegram negotiated a higher API layer than this Telethon release knows
+    # (e.g. the backend's teleproto just moved up). The server sends a
+    # constructor the parser doesn't recognise, mid-deserialization. The
+    # request is unservable until the library catches up.
+    if isinstance(exc, errors.TypeNotFoundError):
+        return AppError("TELEGRAM_LAYER_MISMATCH", "Telegram sent an object this client cannot parse.", 502)
     return None
 
 
