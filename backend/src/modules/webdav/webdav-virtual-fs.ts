@@ -352,7 +352,12 @@ export class VirtualFileSystem extends FileSystem {
       .catch((error) => callback(error, undefined))
   }
 
-  /** Open a read stream for a file. Range handling happens in the routes layer. */
+  /** Open a read stream for a file. Range handling happens in the routes layer.
+   *  Note: this library hook is bypassed by our custom `getHandler` in
+   *  webdav.routes.ts, which is the one the WebDAV server actually uses.
+   *  Kept here only as a defensive fallback for any path that doesn't go
+   *  through `getHandler` (e.g. HEAD or PROPFIND which don't read bytes).
+   */
   protected _openReadStream(path: Path, _ctx: unknown, callback: ReturnCallback<Readable>): void {
     this.resolvePath(path)
       .then(async (node) => {
@@ -364,7 +369,11 @@ export class VirtualFileSystem extends FileSystem {
         }
         const file = await this.cache.file(node.id)
         if (!file) throw RESOURCE_NOT_FOUND
-        const stream = await streamProviderFileToReadable(file)
+        const result = await streamProviderFileToReadable(file)
+        // For the legacy path (Google/S3) the result is a Readable; for
+        // Telegram it's a ProviderStreamResult. The library doesn't know
+        // about the new shape, so we return the body for Telegram too.
+        const stream = (result as { body?: Readable }).body ?? (result as Readable)
         callback(undefined, stream)
       })
       .catch((error) => callback(error, undefined))
@@ -404,8 +413,28 @@ export class VirtualFileSystem extends FileSystem {
   }
 }
 
+/** A provider stream result: bytes + the response status/headers the upstream
+ * actually returned. The WebDAV routes layer uses this for Telegram, where the
+ * upstream's status/Content-Range/Content-Length must be honored, not
+ * pre-committed from DB metadata.
+ */
+export interface ProviderStreamResult {
+  body: Readable
+  status: number
+  headers: Record<string, string>
+}
+
+export class TelegramStreamNotConfigured extends Error {
+  constructor() {
+    super('telegram-stream is not configured')
+  }
+}
+
 /** Stream a provider file's bytes as a Node Readable. Range is applied by the routes layer. */
-export async function streamProviderFileToReadable(file: FileWithAccount, range?: string): Promise<Readable> {
+export async function streamProviderFileToReadable(
+  file: FileWithAccount,
+  range?: string,
+): Promise<Readable | ProviderStreamResult> {
   if (file.provider === 's3') {
     const config = await getS3ConfigForAccount(file.connectedAccountId)
     const client = createS3Client(config)
@@ -416,15 +445,10 @@ export async function streamProviderFileToReadable(file: FileWithAccount, range?
   }
 
   if (file.provider === 'telegram') {
-    // Provider detection is from the DB mapping (file.provider), never from
-    // filename heuristics (phase spec §07). When the streaming service is
-    // configured, the gateway is the byte source; otherwise we fall through
-    // to the legacy path (which can only do full-GET) so WebDAV still
-    // returns a (200) body — better than a 500.
-    if (isTelegramStreamConfigured()) {
-      return fetchTelegramStreamAsReadable(file, range)
+    if (!isTelegramStreamConfigured()) {
+      throw new TelegramStreamNotConfigured()
     }
-    return Readable.from([])
+    return fetchTelegramStreamAsReadable(file, range)
   }
 
   // Google Drive

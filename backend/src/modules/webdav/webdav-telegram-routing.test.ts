@@ -71,14 +71,20 @@ describe('streamProviderFileToReadable — Telegram routing', () => {
       }), { status: 206, headers: { 'content-range': 'bytes 0-4/100' } }),
     )
     const { streamProviderFileToReadable } = await import('./webdav-virtual-fs.js')
-    const node = await streamProviderFileToReadable(fileRow, 'bytes=0-4')
+    const result = await streamProviderFileToReadable(fileRow, 'bytes=0-4')
     expect(fetchMock).toHaveBeenCalledOnce()
     const [urlArg, initArg] = fetchMock.mock.calls[0]
     expect(String(urlArg)).toContain('/v1/stream')
     const headers = (initArg as RequestInit).headers as Record<string, string>
     expect(headers.Range).toBe('bytes=0-4')
     expect(headers['X-Stream-Signature']).toMatch(/^[0-9a-f]{64}$/)
-    expect(typeof (node as { pipe?: unknown }).pipe).toBe('function')
+    // Telegram returns a ProviderStreamResult (object with body/status/headers),
+    // not a bare Readable. The WebDAV routes layer distinguishes by
+    // `file.provider === 'telegram'`.
+    const r = result as { body: { pipe?: unknown }; status: number; headers: Record<string, string> }
+    expect(r.status).toBe(206)
+    expect(r.headers['content-range']).toBe('bytes 0-4/100')
+    expect(typeof r.body.pipe).toBe('function')
   })
 
   it('the metadata crypto module is never loaded by the WebDAV read path', async () => {

@@ -56,26 +56,69 @@ async function streamFile(ctx: v2.HTTPRequestContext, fs: VirtualFileSystem): Pr
   const rangeHeader = ctx.headers.find('Range')
   const range = parseRange(rangeHeader ?? '', size)
 
+  // Logical metadata (owned by 9Drive) — safe to set pre-flight.
   ctx.response.setHeader('Content-Type', file.mimeType ?? 'application/octet-stream')
   ctx.response.setHeader('Accept-Ranges', 'bytes')
-  if (size > 0) ctx.response.setHeader('Content-Length', String(size))
   ctx.response.setHeader('ETag', `"${file.id}:${file.updatedAt.getTime()}"`)
   ctx.response.setHeader('Last-Modified', file.updatedAt.toUTCString())
 
-  const stream = await streamProviderFileToReadable(file, range ? `bytes=${range.start}-${range.end}` : undefined)
-  stream.on('error', () => {
+  // For Telegram files, defer status + Content-Range/Content-Length to the
+  // upstream response — its 200/206/416 is authoritative, and the upstream
+  // may clip the range (so Content-Length must come from upstream, not
+  // from a db metadata guess). For Google/S3, the old pre-commit path
+  // still works because those providers honor our Range header exactly.
+  let stream: import('node:stream').Readable
+  let upstreamStatus: number | null = null
+  let upstreamHeaders: Record<string, string> = {}
+
+  try {
+    const result = await streamProviderFileToReadable(
+      file,
+      range ? `bytes=${range.start}-${range.end}` : undefined,
+    )
+    if (file.provider === 'telegram') {
+      const t = result as { body: import('node:stream').Readable; status: number; headers: Record<string, string> }
+      stream = t.body
+      upstreamStatus = t.status
+      upstreamHeaders = t.headers
+    } else {
+      stream = result as import('node:stream').Readable
+    }
+  } catch (err) {
+    console.error('[webdav] stream open failed:', err)
     ctx.setCode(v2.HTTPCodes.InternalServerError)
-    ctx.response.destroy()
+    ctx.exit()
+    return
+  }
+
+  stream.on('error', (e) => {
+    console.error('[webdav] stream error:', e)
+    if (!ctx.response.headersSent) {
+      ctx.setCode(v2.HTTPCodes.BadGateway)
+      ctx.exit()
+    } else {
+      ctx.response.destroy()
+    }
   })
-  if (range) {
+
+  if (file.provider === 'telegram' && upstreamStatus !== null) {
+    // Forward upstream byte-range headers (Content-Range, range Content-Length,
+    // Accept-Ranges). The streaming service is the source of truth for these.
+    for (const [name, value] of Object.entries(upstreamHeaders)) {
+      ctx.response.setHeader(name, value)
+    }
+    // 9Drive-owned headers stay set above.
+    ctx.setCode(upstreamStatus)
+  } else if (range) {
     ctx.setCode(v2.HTTPCodes.PartialContent)
     ctx.response.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${size}`)
     ctx.response.setHeader('Content-Length', String(range.end - range.start + 1))
-    stream.pipe(ctx.response)
   } else {
     ctx.setCode(v2.HTTPCodes.OK)
-    stream.pipe(ctx.response)
+    if (size > 0) ctx.response.setHeader('Content-Length', String(size))
   }
+
+  stream.pipe(ctx.response)
   stream.on('end', () => ctx.exit())
 }
 

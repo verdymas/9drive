@@ -1,11 +1,14 @@
 /**
  * WebDAV-friendly Readable variant of the streaming gateway.
  *
- * WebDAV hands the stream back to the webdav-server lib which writes
- * headers itself and only needs a Node Readable. We reuse the same
- * signed-request + abort plumbing as `telegramStreamGateway.streamFile`
- * but skip the header-mutation pass (the WebDAV layer owns the
- * response).
+ * Returns BOTH the Node Readable and the upstream's status + headers
+ * so the caller (WebDAV routes layer) can apply them to its own
+ * response. This matters: the WebDAV layer was previously
+ * pre-committing headers from DB metadata (size, content-type, etc.)
+ * and then piping the body — but the upstream's actual response may
+ * differ (e.g. 416 for an out-of-range request, or a different
+ * Content-Length for a server-side clipped range). We must not
+ * pre-commit headers we can't honor.
  */
 import { Readable } from 'node:stream'
 
@@ -17,10 +20,16 @@ import { signStreamRequest } from './telegram-stream-auth.js'
 
 type FileWithAccount = FileRecord & { connectedAccount: ConnectedAccount }
 
+export interface TelegramStreamUpstream {
+  status: number
+  headers: Record<string, string>
+  body: Readable
+}
+
 export async function fetchTelegramStreamAsReadable(
   file: FileWithAccount,
   range: string | undefined,
-): Promise<Readable> {
+): Promise<TelegramStreamUpstream> {
   const parsed = parseTelegramRemoteId(file.providerFileId)
   const channelId = String(parsed.channelId)
   const messageId = String(parsed.messageId)
@@ -41,27 +50,39 @@ export async function fetchTelegramStreamAsReadable(
   url.searchParams.set('messageId', messageId)
   url.searchParams.set('knownSize', String(knownSize))
 
-  const headers: Record<string, string> = {
+  const upstreamHeaders: Record<string, string> = {
     'X-Stream-Timestamp': String(ts),
     'X-Stream-Signature': signature,
   }
-  if (range) headers['Range'] = range
+  if (range) upstreamHeaders['Range'] = range
 
   // Correlation: a short per-request id is forwarded so the streaming
   // service's logs can be cross-referenced with the gateway log line.
   // Never a secret.
   const requestId =
     (file as unknown as { __requestId?: string }).__requestId ?? undefined
-  if (requestId) headers['X-Request-Id'] = requestId
+  if (requestId) upstreamHeaders['X-Request-Id'] = requestId
 
   const abort = new AbortController()
-  const r = await fetch(url, { method: 'GET', headers, signal: abort.signal })
+  const r = await fetch(url, { method: 'GET', headers: upstreamHeaders, signal: abort.signal })
+
+  // Translate the upstream Headers into a plain dict. Lowercased keys.
+  const headers: Record<string, string> = {}
+  r.headers.forEach((value, key) => {
+    const lower = key.toLowerCase()
+    if (
+      lower === 'content-range' ||
+      lower === 'content-length' ||
+      lower === 'accept-ranges'
+    ) {
+      headers[lower] = value
+    }
+  })
+
   if (!r.body) {
-    return Readable.from([])
+    return { status: r.status, headers, body: Readable.from([]) }
   }
-  // When the WebDAV request closes, the returned Readable's `close` fires;
-  // bridge that to the AbortController so telegram-stream stops fetching.
   const node = Readable.fromWeb(r.body as never)
   node.on('close', () => abort.abort())
-  return node
+  return { status: r.status, headers, body: node }
 }
