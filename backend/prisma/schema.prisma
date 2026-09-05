@@ -222,6 +222,9 @@ model TelegramStorageConfig {
   apiIdEncrypted     String           @map("api_id_encrypted") @db.Text
   apiHashEncrypted   String           @map("api_hash_encrypted") @db.Text
   sessionEncrypted   String           @map("session_encrypted") @db.Text
+  // Login phone, encrypted like every other Telegram credential. Held ONLY to
+  // label the account in the UI (masked to prefix + last 4); never serialized.
+  phoneEncrypted     String?          @map("phone_encrypted") @db.Text
   channelId          String?          @map("channel_id") @db.VarChar(191)
   channelTitle       String?          @map("channel_title") @db.VarChar(191)
   createdAt          DateTime         @default(now()) @map("created_at")

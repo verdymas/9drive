@@ -87,6 +87,7 @@ The metadata rules (single source of truth — see
 - **Telegram deletion must not automatically delete a 9drive file.** The
   ingest path is additive only — missing messages are skipped, never used
   to soft-delete rows.
+  *(Opt-in: TELEGRAM_SYNC_TRASH_MISSING=true soft-deletes a row only after it has been flagged missing on a previous full scan. Default preserves this rule.)
 
 ### Stable identity — `File.telegramStableId`
 
@@ -176,6 +177,7 @@ calls `editMessage`. No-op when the caption already matches.
   remoteId. A 9Drive file stays present even after the Telegram message
   is manually deleted, with `providerFileId` pointing to a now-stale
   reference. Permanent delete is the only way to reconcile.
+  *(Opt-in: TELEGRAM_SYNC_TRASH_MISSING=true trashes a row after two consecutive full scans flag it missing. Off by default.)
 
 ### No Topic-to-folder mapping
 
@@ -567,6 +569,15 @@ existing 9Drive-side permanent-delete flow
 row and the Telegram message. **No automatic re-upload** happens on
 missing-remote (spec §13).
 
+**Opt-in auto-trash:** with `TELEGRAM_SYNC_TRASH_MISSING=true`, a row
+that is missing on *two consecutive* full scans (i.e. it carries an
+unresolved `REMOTE_FILE_MISSING` issue from the previous run) is
+soft-deleted — moved to Trash, never hard-deleted, recoverable via
+`POST /files/batch/restore`. Two-run confirmation guards against
+transient scans (partial pages, mid-run FloodWait, permission
+changes) acting on a file that wasn't really deleted. The flag is
+off by default; the spec's never-delete rule is the default behavior.
+
 ### Conflict handling
 
 A DB row whose Telegram metadata (size / mimeType) disagrees with the
@@ -581,7 +592,7 @@ NEVER auto-resolves a conflict.
 | DB row                     | Telegram message                  | Outcome                |
 | -------------------------- | --------------------------------- | ---------------------- |
 | exists, matches            | exists, matches metadata          | `matched`              |
-| exists, | no Telegram message              | `REMOTE_FILE_MISSING` |
+| exists, matches | no Telegram message              | `REMOTE_FILE_MISSING` |
 | no DB row                  | exists                            | `imported` (inbox)     |
 | exists, mismatched metadata| exists                            | `TELEGRAM_METADATA_MISMATCH` |
 
@@ -698,7 +709,7 @@ jobId, so two concurrent enqueues result in one queued job
 - `telegram-sync.scheduler.test.ts` — sweep enqueues only eligible
   accounts, respects the syncing guard, respects the interval,
   idempotent `start` / `stop`.
-- All pre-existing tests remain green (67 files, 899 tests).
+- All pre-existing tests remain green (77 files, 1001 tests).
 
 ## Metadata protection (encrypted captions + opaque filenames)
 

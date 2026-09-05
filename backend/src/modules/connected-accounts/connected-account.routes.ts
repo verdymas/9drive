@@ -469,9 +469,22 @@ connectedAccountRouter.patch('/:id', requireAuth, async (req: AuthRequest, res, 
 connectedAccountRouter.delete('/:id', requireAuth, async (req: AuthRequest, res, next) => {
   try {
     const accountId = String(req.params.id)
+    // ?purge=1 destroys the row and all of its cascades (file records, folder
+    // storage locations, telegram storage config with the encrypted session,
+    // telegram sync state/runs/issues, sync runs, storage account, …). The
+    // Telegram channel itself and every document in it are UNTOUCHED — a
+    // future reconnect + sync can recover them. The default soft disconnect
+    // is unchanged; purge is opt-in.
+    if (req.query.purge === '1') {
+      const { count } = await prisma.connectedAccount.deleteMany({ where: { id: accountId, userId: req.user!.id } })
+      if (count === 0) throw new AppError('STORAGE_ACCOUNT_NOT_FOUND', 'The storage account does not exist.', 404)
+      await createAuditLog(req.user!.id, 'storage.account.purged', 'connected_account', accountId, {})
+      return res.json({ status: 'ok' })
+    }
     await prisma.connectedAccount.updateMany({ where: { id: accountId, userId: req.user!.id }, data: { status: 'disconnected' } })
     return res.json({ status: 'ok' })
   } catch (error) {
+    if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
     return next(error)
   }
 })

@@ -37,10 +37,10 @@ export async function createTelegramChannel(accountId: string, title?: string): 
   })
 }
 
-export async function selectTelegramChannel(accountId: string, channelId: string): Promise<{ account: { telegram: TelegramChannelInfo } }> {
+export async function selectTelegramChannel(accountId: string, channelId: string, transfer?: boolean): Promise<{ account: { telegram: TelegramChannelInfo } }> {
   return apiFetch(`/telegram/accounts/${accountId}/channel`, {
     method: 'POST',
-    body: JSON.stringify({ action: 'select', channelId }),
+    body: JSON.stringify({ action: 'select', channelId, ...(transfer ? { transfer: true } : {}) }),
   })
 }
 

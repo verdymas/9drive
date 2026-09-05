@@ -147,6 +147,23 @@ export function deriveTelegramChannelStatus(accountStatus: string, channelId: st
 }
 
 /**
+ * Display label for a Telegram login phone: country prefix + last 4 digits,
+ * never the full number. Short inputs are masked aggressively (we only need
+ * enough for a user to tell two of their own accounts apart).
+ */
+export function maskPhone(phone: string): string {
+  const digits = phone.replace(/[^\d+]/g, '')
+  if (digits.length <= 7) return `•••${digits.slice(-2)}`
+  return `${digits.slice(0, 3)}${'•'.repeat(digits.length - 7)}${digits.slice(-4)}`
+}
+
+/** Account label: masked phone (or generic placeholder), plus channel title when one is configured. */
+export function telegramDisplayName(phone: string | null, channelTitle: string | null): string {
+  const left = phone ? maskPhone(phone) : 'Telegram Drive'
+  return channelTitle ? `${left} · ${channelTitle}` : left
+}
+
+/**
  * Classify a teleproto/Telegram thrown error into an AppError with a stable
  * code, user-friendly message and HTTP status. Handles FloodWait, revoked/
  * expired/unregistered sessions, invalid credentials, and lookup failures.

@@ -38,6 +38,9 @@ export function TelegramChannelModal({
   const [selectedChannelId, setSelectedChannelId] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  // Set when the previous save attempt 409'd on a claimed channel. Surfaces
+  // a 'Take over this channel' button so the user can opt in to the transfer.
+  const [takenChannelId, setTakenChannelId] = useState<string | null>(null)
   const [test, setTest] = useState<TelegramConnectionTest | null>(null)
   const [testing, setTesting] = useState(false)
 
@@ -51,6 +54,7 @@ export function TelegramChannelModal({
       setSelectedChannelId('')
       setError('')
       setTest(null)
+      setTakenChannelId(null)
     }
   }, [open, account?.id])
 
@@ -83,7 +87,7 @@ export function TelegramChannelModal({
     }
   }
 
-  async function save() {
+  async function save(transfer = false) {
     if (!account) return
     setBusy(true)
     setError('')
@@ -96,12 +100,18 @@ export function TelegramChannelModal({
           setBusy(false)
           return
         }
-        await selectTelegramChannel(account.id, selectedChannelId)
+        await selectTelegramChannel(account.id, selectedChannelId, transfer || undefined)
       }
       onSaved()
       onClose()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to configure the storage channel.')
+      const code = (err as { code?: string } | null)?.code
+      if (!transfer && mode === 'select' && code === 'TELEGRAM_CHANNEL_IN_USE') {
+        setTakenChannelId(selectedChannelId)
+        setError('This storage channel is already used by another 9Drive account. Take over to move its files to this account.')
+      } else {
+        setError(err instanceof Error ? err.message : 'Failed to configure the storage channel.')
+      }
     } finally {
       setBusy(false)
     }
@@ -229,12 +239,18 @@ export function TelegramChannelModal({
 
         {error ? <p className="rounded-xl bg-red-50 p-3 text-xs text-red-700 dark:bg-red-500/10 dark:text-red-300">{error}</p> : null}
 
+        {takenChannelId ? (
+          <Button type="button" variant="danger" onClick={() => save(true)} disabled={busy || testing}>
+            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+            Take over this channel
+          </Button>
+        ) : null}
         <div className="grid gap-3 sm:flex sm:justify-end">
           <Button variant="outline" type="button" onClick={runTest} disabled={busy || testing}>
             {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
             {testing ? 'Testing…' : 'Test Connection'}
           </Button>
-          <Button type="button" onClick={save} disabled={busy || testing}>
+          <Button type="button" onClick={() => save(false)} disabled={busy || testing}>
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
             {busy ? 'Saving…' : 'Save Channel'}
           </Button>

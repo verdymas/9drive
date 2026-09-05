@@ -4,7 +4,7 @@ import { prisma } from '../../config/prisma.js'
 import { AppError } from '../../utils/app-error.js'
 import { createAuditLog } from '../../utils/audit.js'
 import { decryptText, encryptText } from '../../utils/crypto.js'
-import { classifyTelegramError, serializeTelegramAccount } from './telegram.service.js'
+import { classifyTelegramError, serializeTelegramAccount, telegramDisplayName } from './telegram.service.js'
 import { syncTelegramUsage } from './telegram-usage.service.js'
 
 /**
@@ -181,7 +181,7 @@ export async function verifyTelegramAuth(userId: string, authId: string, input: 
 
 async function finalizeTelegramAuth(
   userId: string,
-  state: Pick<TelegramAuthState, 'id' | 'connectedAccountId'>,
+  state: Pick<TelegramAuthState, 'id' | 'connectedAccountId' | 'phoneEncrypted'>,
   credentials: ApiCredentials,
   session: string,
   // ponytail: no getMe() identity check on Telegram reconnect — deliberate, it is
@@ -203,9 +203,19 @@ async function finalizeTelegramAuth(
       const existingConfig = await prisma.telegramStorageConfig.findFirst({ where: { connectedAccountId: existing.id } })
       previousChannelId = existingConfig?.channelId
       previousChannelTitle = existingConfig?.channelTitle
+      // Reconnect relabels the account too: the new login may belong to a
+      // different number (abandoned-channel recovery) so the UI's only identity
+      // cue must follow the active session, not the row's birth-time label.
+      const reconnectPhone = state.phoneEncrypted ? decryptText(state.phoneEncrypted) : null
       account = await prisma.connectedAccount.update({
         where: { id: existing.id },
-        data: { status: 'connected', reauthRequiredAt: null, lastAuthErrorCode: null, lastError: null },
+        data: {
+          status: 'connected',
+          reauthRequiredAt: null,
+          lastAuthErrorCode: null,
+          lastError: null,
+          displayName: telegramDisplayName(reconnectPhone, previousChannelTitle ?? null),
+        },
       })
     }
   }
@@ -221,7 +231,10 @@ async function finalizeTelegramAuth(
         provider: 'telegram',
         providerAccountId: 'pending', // replaced with the channel id during channel setup
         email: 'telegram@pending',
-        displayName: 'Telegram Drive',
+        displayName: telegramDisplayName(
+          state.phoneEncrypted ? decryptText(state.phoneEncrypted) : null,
+          null,
+        ),
         scopes: [],
         status: 'connected',
       },
@@ -241,6 +254,7 @@ async function finalizeTelegramAuth(
       apiIdEncrypted: encryptText(String(credentials.apiId)),
       apiHashEncrypted: encryptText(credentials.apiHash),
       sessionEncrypted: encryptText(session),
+      phoneEncrypted: state.phoneEncrypted ?? null,
       channelId: null,
       channelTitle: null,
     },
@@ -248,6 +262,9 @@ async function finalizeTelegramAuth(
       apiIdEncrypted: encryptText(String(credentials.apiId)),
       apiHashEncrypted: encryptText(credentials.apiHash),
       sessionEncrypted: encryptText(session),
+      // Refresh the stored phone: reconnect is also when the number changes
+      // (different login). If a prior reconnect left no phone behind, preserve null.
+      ...(state.phoneEncrypted ? { phoneEncrypted: state.phoneEncrypted } : {}),
       // Preserve an already-configured channel across reconnects.
       ...(previousChannelId
         ? { channelId: previousChannelId, ...(previousChannelTitle ? { channelTitle: previousChannelTitle } : {}) }

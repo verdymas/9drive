@@ -367,7 +367,29 @@ export function SettingsPage() {
       await load()
       window.dispatchEvent(new Event('9drive:storage-changed'))
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Failed to disconnect Google Drive account')
+      setMessage(error instanceof Error ? error.message : 'Failed to disconnect storage account')
+    } finally {
+      setDisconnectingAccountId(null)
+    }
+  }
+
+  // Hard delete (?purge=1): cascades every file record, sync state, encrypted
+  // session and storage account the row owned. The remote storage (Telegram
+  // channel and its documents, S3 bucket, Google account) is untouched — a
+  // future reconnect + sync can recover it. No undo.
+  async function purgeAccount() {
+    if (!accountToDisconnect) return
+    if (!window.confirm('Delete this storage account from 9Drive forever? File records, sync history and encrypted credentials will be removed. The remote storage (e.g. your Telegram channel and its documents) is not touched.')) return
+    setDisconnectingAccountId(accountToDisconnect.id)
+    setMessage('')
+    try {
+      await apiFetch(`/connected-accounts/${accountToDisconnect.id}?purge=1`, { method: 'DELETE' })
+      setAccountToDisconnect(null)
+      setMessage('Storage account deleted.')
+      await load()
+      window.dispatchEvent(new Event('9drive:storage-changed'))
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Failed to delete storage account')
     } finally {
       setDisconnectingAccountId(null)
     }
@@ -822,12 +844,13 @@ export function SettingsPage() {
       <DummyModal open={Boolean(accountToDisconnect)} title="Disconnect storage?" description="This will remove this storage account from 9Drive. Existing file records for this account may no longer be usable." onClose={() => setAccountToDisconnect(null)}>
         <div className="grid gap-4">
           <div className="rounded-xl bg-slate-50 p-4 text-sm text-slate-600">
-            <p className="font-semibold text-slate-950">{accountToDisconnect?.email}</p>
+            <p className="font-semibold text-slate-950">{accountToDisconnect?.displayName || accountToDisconnect?.email}</p>
             <p className="mt-1">Used storage: {formatBytes(accountToDisconnect?.storageAccount?.usedBytes)}</p>
           </div>
           <div className="grid gap-3 sm:flex sm:justify-end">
             <Button variant="outline" onClick={() => setAccountToDisconnect(null)} disabled={Boolean(disconnectingAccountId)}>Cancel</Button>
             <Button variant="danger" onClick={disconnect} disabled={Boolean(disconnectingAccountId)}><Trash2 className="h-4 w-4" />{disconnectingAccountId ? 'Disconnecting...' : 'Disconnect'}</Button>
+            <Button variant="danger" onClick={purgeAccount} disabled={Boolean(disconnectingAccountId)} title="Delete this account forever. File records, sync history and the encrypted session are removed. Remote storage is not touched."><Trash2 className="h-4 w-4" />Delete Completely</Button>
           </div>
         </div>
       </DummyModal>

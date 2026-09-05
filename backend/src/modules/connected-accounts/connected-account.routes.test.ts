@@ -69,6 +69,16 @@ const h = vi.hoisted(() => {
         return out
       }),
       updateMany: vi.fn(async () => ({ count: 0 })),
+      deleteMany: vi.fn(async ({ where }: { where?: any } = {}) => {
+        const before = accounts.length
+        for (let i = accounts.length - 1; i >= 0; i--) {
+          const a = accounts[i]
+          if (where?.id && a.id !== where.id) continue
+          if (where?.userId && a.userId !== where.userId) continue
+          accounts.splice(i, 1)
+        }
+        return { count: before - accounts.length }
+      }),
       findMany: vi.fn(async () => []),
       findUnique: vi.fn(async ({ where }: { where: any }) => {
         return accounts.find((a) => {
@@ -498,5 +508,39 @@ describe('GET /google/callback — reconnect flow', () => {
     // the error page, matching the pre-existing connect-callback behavior.
     expect(res.status).toBe(302)
     expect(res.headers.get('location')).toContain('google-connected?status=error')
+  })
+})
+
+
+describe('DELETE /connected-accounts/:id — ?purge=1', () => {
+  beforeEach(reset)
+  it('calls deleteMany (not updateMany) and removes the row from the in-memory store', async () => {
+    const acc = h.account('acc-purge', 'user-1', { provider: 'telegram', providerAccountId: '4458806678' })
+    h.accounts.push(acc)
+    const res = await fetch(`${baseUrl}/connected-accounts/acc-purge?purge=1`, { method: 'DELETE', headers: { authorization: 'Bearer user-1' } })
+    expect(res.status).toBe(200)
+    expect((await res.json())).toEqual({ status: 'ok' })
+    // The destructive branch used deleteMany, not the soft updateMany.
+    expect((h.prismaMock.connectedAccount.deleteMany as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThanOrEqual(1)
+    expect(h.accounts.find((a) => a.id === 'acc-purge')).toBeUndefined()
+  })
+
+  it('returns 404 when the id matches no row of this user', async () => {
+    const res = await fetch(`${baseUrl}/connected-accounts/does-not-exist?purge=1`, { method: 'DELETE', headers: { authorization: 'Bearer user-1' } })
+    expect(res.status).toBe(404)
+    expect((await res.json()).code).toBe('STORAGE_ACCOUNT_NOT_FOUND')
+  })
+
+  it('plain DELETE without ?purge=1 does NOT call deleteMany (soft-disconnect path untouched)', async () => {
+    const acc = h.account('acc-soft', 'user-1')
+    h.accounts.push(acc)
+    ;(h.prismaMock.connectedAccount.deleteMany as ReturnType<typeof vi.fn>).mockClear()
+    const res = await fetch(`${baseUrl}/connected-accounts/acc-soft`, { method: 'DELETE', headers: { authorization: 'Bearer user-1' } })
+    expect(res.status).toBe(200)
+    // The shared updateMany mock is a no-op (returns count 0) and does not
+    // mutate the row, so we cannot assert the new status here. What we CAN
+    // assert: the soft path does not touch deleteMany.
+    expect((h.prismaMock.connectedAccount.deleteMany as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0)
+    expect((h.prismaMock.connectedAccount.updateMany as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1)
   })
 })

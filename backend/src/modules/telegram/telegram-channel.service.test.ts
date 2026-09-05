@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 // A channel already claimed by another of the user's Telegram accounts must be
 // rejected — and rejected WITHOUT leaving this account's storage config pointing
@@ -23,13 +23,26 @@ const h = vi.hoisted(() => {
           h.calls.push('config.update')
           return {}
         }),
+        updateMany: vi.fn(async () => ({ count: 1 })),
       },
+      file: { updateMany: vi.fn(async () => ({ count: 0 })) },
+      folderStorageLocation: {
+        findMany: vi.fn(async () => []),
+        deleteMany: vi.fn(async () => ({ count: 0 })),
+        updateMany: vi.fn(async () => ({ count: 0 })),
+      },
+      telegramSyncState: {
+        deleteMany: vi.fn(async () => ({ count: 0 })),
+        updateMany: vi.fn(async () => ({ count: 0 })),
+      },
+      $transaction: vi.fn(async (fn) => fn({})),
     },
   }
 })
 
 vi.mock('../../config/prisma.js', () => ({ prisma: h.prisma }))
 vi.mock('../../utils/audit.js', () => ({ createAuditLog: vi.fn(async () => undefined) }))
+vi.mock('../../utils/crypto.js', () => ({ decryptText: (v: string) => v.replace('ENC_', ''), encryptText: (v: string) => 'ENC_' + v }))
 vi.mock('./telegram-usage.service.js', () => ({ syncTelegramUsage: vi.fn(async () => undefined) }))
 vi.mock('./telegram.service.js', async () => {
   const actual = await vi.importActual<typeof import('./telegram.service.js')>('./telegram.service.js')
@@ -43,7 +56,7 @@ vi.mock('./telegram.service.js', async () => {
   }
 })
 
-import { selectTelegramStorageChannel } from './telegram-channel.service.js'
+import { selectTelegramStorageChannel, transferChannelOwnership } from './telegram-channel.service.js'
 import { AppError } from '../../utils/app-error.js'
 
 const config = { connectedAccount: { id: 'acc-new' } } as never
@@ -70,5 +83,72 @@ describe('selectTelegramStorageChannel — channel already claimed', () => {
     expect((error as AppError).code).toBe('TELEGRAM_CHANNEL_IN_USE')
     expect((error as AppError).message).not.toContain('reconnect that account')
     expect(h.calls).toEqual(['account.update'])
+  })
+})
+
+
+
+describe('transferChannelOwnership', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    h.prisma.connectedAccount.update.mockImplementation(async () => { h.calls.push('account.update'); throw h.P2002 })
+    h.prisma.connectedAccount.findFirst.mockImplementation(async () => ({ status: h.holderStatus.value }))
+    h.prisma.telegramStorageConfig.update.mockImplementation(async () => { h.calls.push('config.update'); return {} })
+    h.prisma.telegramStorageConfig.updateMany.mockResolvedValue({ count: 1 })
+    h.prisma.file.updateMany.mockResolvedValue({ count: 3 })
+    h.prisma.folderStorageLocation.findMany.mockResolvedValue([])
+    h.prisma.folderStorageLocation.deleteMany.mockResolvedValue({ count: 0 })
+    h.prisma.folderStorageLocation.updateMany.mockResolvedValue({ count: 0 })
+    h.prisma.telegramSyncState.deleteMany.mockResolvedValue({ count: 0 })
+    h.prisma.telegramSyncState.updateMany.mockResolvedValue({ count: 0 })
+    h.prisma.$transaction.mockImplementation(async (fn) => fn({}))
+  })
+
+  it('moves files, folder locations, and sync cursor inside one transaction', async () => {
+    // Holder lookup (first findFirst) returns a different account.
+    h.prisma.connectedAccount.findFirst.mockResolvedValueOnce({ id: 'acc-old', telegramStorageConfig: { phoneEncrypted: 'ENC_FROM' } })
+    // Run the tx fn ourselves so we can assert call order inside the transaction.
+    h.prisma.$transaction.mockImplementationOnce(async (fn) => {
+      const txCalls: string[] = []
+      const tx = {
+        connectedAccount: { update: vi.fn(async () => { txCalls.push('acct.update') }) },
+        telegramStorageConfig: { update: vi.fn(async () => { txCalls.push('cfg.update') }), updateMany: vi.fn(async () => { txCalls.push('cfg.updateMany') }) },
+        file: { updateMany: vi.fn(async () => { txCalls.push('file.updateMany') }) },
+        folderStorageLocation: {
+          deleteMany: vi.fn(async () => { txCalls.push('loc.deleteMany(target)') }),
+          updateMany: vi.fn(async () => { txCalls.push('loc.updateMany(source)') }),
+        },
+        telegramSyncState: {
+          deleteMany: vi.fn(async () => { txCalls.push('state.deleteMany(target)') }),
+          updateMany: vi.fn(async () => { txCalls.push('state.updateMany(source)') }),
+        },
+      }
+      await fn(tx)
+      // Release is first (the source's connectedAccount.update), then source
+      // config cleared, then claim (target's connectedAccount.update), then
+      // file move, then locations drop+move, then state.
+      // The order in the service: release acct → clear source cfg → claim
+      // acct → write target cfg → move files → drop+move locations → drop+move state.
+      expect(txCalls[0]).toBe('acct.update')
+      expect(txCalls[1]).toBe('cfg.updateMany')
+      expect(txCalls[2]).toBe('acct.update')
+      expect(txCalls[3]).toBe('cfg.update')
+      expect(txCalls).toContain('file.updateMany')
+      expect(txCalls.indexOf('loc.deleteMany(target)')).toBeLessThan(txCalls.indexOf('loc.updateMany(source)'))
+      expect(txCalls.indexOf('state.deleteMany(target)')).toBeLessThan(txCalls.indexOf('state.updateMany(source)'))
+      return undefined
+    })
+
+    const transferConfig = { connectedAccount: { id: 'acc-new' }, phoneEncrypted: 'ENC_TO' } as never
+    await transferChannelOwnership('user-1', transferConfig, { channelId: '-1001', channelTitle: 'Movies' })
+    expect(h.prisma.$transaction).toHaveBeenCalledTimes(1)
+  })
+
+  it('refuses to transfer to itself (caller already holds the channel)', async () => {
+    h.prisma.connectedAccount.findFirst.mockResolvedValueOnce({ id: 'acc-new', telegramStorageConfig: { phoneEncrypted: null } })
+    const transferConfig = { connectedAccount: { id: 'acc-new' }, phoneEncrypted: 'ENC_TO' } as never
+    const err = await transferChannelOwnership('user-1', transferConfig, { channelId: '-1001', channelTitle: 'Movies' }).catch((e) => e)
+    expect((err as { code: string }).code).toBe('TELEGRAM_CHANNEL_ALREADY_OWNED')
+    expect(h.prisma.$transaction).not.toHaveBeenCalled()
   })
 })

@@ -163,13 +163,21 @@ export function encodeCaption(input: {
 }): string | null {
   if (!STABLE_ID_RE.test(input.stableId)) return null
   const lines: string[] = [`${NINE_DRIVE_ID_KEY}=${input.stableId}`]
+  // The encrypted `9drive:meta` payload already carries the logical path
+  // (see RecoveryMetadata.path). Emitting the plaintext `9drive:path` line
+  // beside it would defeat the encryption: anyone with channel access could
+  // read the path the spec was trying to hide. Mutually exclusive here so
+  // callers don't have to remember — the plaintext line is the fallback
+  // only when the encrypted line is dropped (empty / oversized ciphertext).
+  let metaEmitted = false
   if (input.encryptedMeta) {
     const clean = input.encryptedMeta.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '').trim()
     if (clean !== '' && clean.length <= TELEGRAM_CAPTION_MAX - `${NINE_DRIVE_META_KEY}=`.length) {
       lines.push(`${NINE_DRIVE_META_KEY}=${clean}`)
+      metaEmitted = true
     }
   }
-  if (input.logicalPath) {
+  if (input.logicalPath && !metaEmitted) {
     const pathLine = encodePath(input.logicalPath)
     if (pathLine) lines.push(pathLine)
   }

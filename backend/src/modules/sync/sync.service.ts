@@ -108,7 +108,15 @@ export async function runAccountSync(userId: string, connectedAccountId: string)
       const telegramStats: SyncStats = {
         ...emptyStats(),
         filesCreated: syncSummary.importedCount,
-        filesMissing: syncSummary.missingCount,
+        // `filesMissing` carries files actually removed from the listing:
+        // for Telegram that is `trashedCount` (rows soft-deleted by the
+        // opt-in TELEGRAM_SYNC_TRASH_MISSING flag) — 0 by default to
+        // preserve the spec's never-delete rule (telegram-drive.md:87).
+        // The detected-but-pending count is exposed separately as
+        // `filesFlagged` so the UI can tell the user something was found
+        // without claiming a deletion happened.
+        filesMissing: syncSummary.trashedCount,
+        filesFlagged: syncSummary.missingCount,
         // collisionsDetected keeps the same name as the Google/S3
         // meaning; Telegram reports conflicts separately.
         collisionsDetected: syncSummary.conflictCount,

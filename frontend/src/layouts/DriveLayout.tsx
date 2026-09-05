@@ -105,7 +105,7 @@ function SystemInfoDropdown({ storage }: { storage: any }) {
                   </span>
                 </div>
                 {group.accounts.map((acc: any) => (
-                  <p key={acc.id} className="text-[11px] text-slate-500 truncate px-2.5 mt-1">— {acc.email}</p>
+                  <p key={acc.id} className="text-[11px] text-slate-500 truncate px-2.5 mt-1">— {acc.displayName || acc.email}</p>
                 ))}
               </div>
             ))}
@@ -236,6 +236,7 @@ type ConnectedAccount = {
   id: string
   email: string
   provider: string
+  displayName?: string | null
 }
 
 export type DriveLayoutContext = {
@@ -498,7 +499,7 @@ export function DriveLayout() {
                       <select value={filterAccountId} onChange={(e) => setFilterAccountId(e.target.value)} className="mt-1 block w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm focus:border-blue-500 focus:bg-white focus:outline-none">
                         <option value="">All Accounts</option>
                         {accounts.map((acc) => (
-                          <option key={acc.id} value={acc.id}>{acc.email} ({acc.provider === 's3' ? 'S3' : acc.provider === 'telegram' ? 'Telegram' : 'Google Drive'})</option>
+                          <option key={acc.id} value={acc.id}>{acc.displayName || acc.email} ({acc.provider === 's3' ? 'S3' : acc.provider === 'telegram' ? 'Telegram' : 'Google Drive'})</option>
                         ))}
                       </select>
                     </div>

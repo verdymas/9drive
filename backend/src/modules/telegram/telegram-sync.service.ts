@@ -46,6 +46,12 @@ import { parseCaption } from './telegram-metadata.js'
  * `ORPHAN_REMOTE_FILE` candidates for import; DB rows with no
  * Telegram message become `REMOTE_FILE_MISSING` candidates. The user
  * resolves issues manually (spec §13).
+ *
+ * Opt-in: with TELEGRAM_SYNC_TRASH_MISSING=true, a row that has been
+ * flagged missing on a *previous* full scan is moved to Trash (soft-
+ * delete, recoverable). Default off to preserve the spec rule; pass
+ * 2 only soft-deletes, never hard-deletes, never touches the Telegram
+ * message itself.
  */
 
 export const TELEGRAM_SYNC_STATUSES = [
@@ -87,6 +93,11 @@ export type TelegramSyncRunStats = {
   matchedByIdCount: number
   matchedByPathCount: number
   recoveredCount: number
+  // Files the sync actually soft-deleted this run because the opt-in
+  // TELEGRAM_SYNC_TRASH_MISSING flag was set AND the file was already
+  // flagged missing on a previous full scan. Always 0 in the spec's
+  // default mode (telegram-drive.md:87).
+  trashedCount: number
 }
 
 export type TelegramSyncRunSummary = TelegramSyncRunStats & {
@@ -110,6 +121,7 @@ const emptyStats = (): TelegramSyncRunStats => ({
   matchedByIdCount: 0,
   matchedByPathCount: 0,
   recoveredCount: 0,
+  trashedCount: 0,
 })
 
 export type TelegramSyncOptions = {
@@ -478,6 +490,29 @@ async function scanChannel(input: {
     // every row below the cursor is "unseen" and would be falsely flagged.
     // Missing-detection needs a complete scan to be meaningful.
     if (resumeFromMessageId === null) {
+      // Two-run confirmation: a Telegram message can vanish from one scan
+      // for reasons other than deletion (partial page fetch, FloodWait
+      // mid-run, permission change). An unresolved `REMOTE_FILE_MISSING`
+      // issue for the same `fileId` is the durable record that a previous
+      // run flagged it — and the `telegram_sync_issues_file_idx` index
+      // makes this lookup cheap. No new schema column needed.
+      const priorMissingFlagFileIds = new Set(
+        (
+          await prisma.telegramSyncIssue.findMany({
+            where: {
+              userId,
+              connectedAccountId: accountId,
+              kind: 'REMOTE_FILE_MISSING',
+              resolvedAt: null,
+              // Same run is impossible (we haven't written its issue yet)
+              // but exclude it defensively for the racy overlap case.
+              runId: { not: input.runId },
+            },
+            select: { fileId: true },
+          })
+        ).flatMap((i) => (i.fileId ? [i.fileId] : [])),
+      )
+      const trashMissing = env.TELEGRAM_SYNC_TRASH_MISSING
       for (const row of existingRows) {
         if (seenFileIds.has(row.providerFileId)) continue
         // Soft-deleted rows that were manually removed in 9Drive should
@@ -496,6 +531,19 @@ async function scanChannel(input: {
             metadata: { name: row.name },
           },
         })
+        // Opt-in auto-trash. Two-run confirmation: a previous full scan
+        // must have already flagged this file as missing AND the user
+        // must not have resolved that flag. Soft-delete only (recoverable
+        // from Trash), never hard-delete, never touches the Telegram
+        // message itself — Telegram has already lost it on its own.
+        if (trashMissing && priorMissingFlagFileIds.has(row.id)) {
+          await prisma.file.update({
+            where: { id: row.id, userId },
+            data: { status: 'deleted', deletedAt: new Date() },
+          })
+          stats.trashedCount += 1
+          await createAuditLog(userId, 'telegram.sync.trash_missing', 'file', row.id, { name: row.name })
+        }
       }
     }
   })
@@ -673,9 +721,15 @@ function applyOutcomeStats(stats: TelegramSyncRunStats, outcome: DocumentOutcome
 function logSyncDocument(input: { runId: string; accountId: string; outcome: DocumentOutcome }): void {
   const { runId, accountId, outcome } = input
   if (outcome.kind === 'imported') {
-    const pathResolution = outcome.virtualPath ? 'success' : 'failed'
+    // pathResolution tracks whether the file was placed at its logical path
+    // (success) or fell through to the recovery folder (failed). The caption
+    // never carries the path for protected documents — `virtualPath` is
+    // always null there — so derive it from `strategy` instead, which is
+    // the actual routing decision. virtualPath stays null for protected
+    // files on purpose: the spec keeps that sensitive field out of logs.
+    const pathResolution = outcome.strategy === 'recovered' ? 'failed' : 'success'
     const reason = outcome.strategy === 'recovered'
-      ? (outcome.virtualPath ? 'unresolvable_path' : 'missing_metadata')
+      ? 'missing_metadata'
       : outcome.strategy === 'none'
         ? 'missing_metadata'
         : undefined

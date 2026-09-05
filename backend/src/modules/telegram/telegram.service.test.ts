@@ -4,9 +4,11 @@ import {
   channelLookupCandidates,
   classifyTelegramError,
   isStorageChannelCandidate,
+  maskPhone,
   normalizeChannelId,
   parseTelegramRemoteId,
   resolveConfiguredChannel,
+  telegramDisplayName,
 } from './telegram.service.js'
 import type { TelegramClient } from 'teleproto'
 
@@ -153,5 +155,42 @@ describe('resolveConfiguredChannel (marked-peer fallback)', () => {
       throw { name: 'RPCError', code: 400, errorMessage: 'CHANNEL_PRIVATE' }
     })
     await expect(resolveConfiguredChannel(client, '4458806678')).rejects.toMatchObject({ code: 'TELEGRAM_CHANNEL_UNAVAILABLE', status: 410 })
+  })
+})
+
+describe('maskPhone', () => {
+  it('keeps the country prefix and the last four digits, hides everything between', () => {
+    expect(maskPhone('+6281234567890')).toBe('+62•••••••7890')
+  })
+  it('masks a short number aggressively (only the last 2 may remain)', () => {
+    const out = maskPhone('12345')
+    expect(out.endsWith('45')).toBe(true)
+    expect(out).not.toContain('123')
+  })
+  it('output length never reveals more digits than the input has', () => {
+    // maskPhone never returns more real digits than the input carried; 2 digits
+    // in means 2 digits out, the rest are bullets.
+    const out = maskPhone('+62')
+    expect(out).toBe('•••62')
+    expect(out).not.toContain('+')
+  })
+  it('tolerates formatting (spaces, dashes, parens)', () => {
+    const out = maskPhone('+62 (812) 345-67890')
+    // Last 4 of the digit-only form are 7890; the prefix is +62.
+    expect(out.endsWith('7890')).toBe(true)
+    expect(out.startsWith('+62')).toBe(true)
+  })
+})
+
+describe('telegramDisplayName', () => {
+  it('uses masked phone when the channel has no title yet', () => {
+    expect(telegramDisplayName('+6281234567890', null)).toBe('+62•••••••7890')
+  })
+  it('combines masked phone and channel title with the middot separator', () => {
+    expect(telegramDisplayName('+6281234567890', 'Movies')).toBe('+62•••••••7890 · Movies')
+  })
+  it('falls back to the generic placeholder when no phone is stored', () => {
+    expect(telegramDisplayName(null, 'Movies')).toBe('Telegram Drive · Movies')
+    expect(telegramDisplayName(null, null)).toBe('Telegram Drive')
   })
 })

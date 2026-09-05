@@ -66,6 +66,12 @@ describe('telegram-security.service', () => {
 
     expect(out.caption).toContain('9drive:id=file-1')
     expect(out.caption).toContain('9drive:meta=v1:')
+    // The path is encrypted inside 9drive:meta — it must not also appear in
+    // cleartext as a 9drive:path= line, and the logical name/path strings
+    // must not leak into the caption in any other form.
+    expect(out.caption).not.toContain('9drive:path=')
+    expect(out.caption).not.toContain('Movies/movie.mkv')
+    expect(out.caption).not.toContain('movie.mkv')
     expect(out.metaLine).toMatch(/^9drive:meta=v1:/)
     expect(out.physicalFilename).toMatch(/^tg_[a-f0-9]{32}\.bin$/)
     expect(JSON.stringify(out)).not.toContain(TEST_KEY)

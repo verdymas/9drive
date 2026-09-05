@@ -3,12 +3,14 @@ import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { AppError } from '../../utils/app-error.js'
 import { createAuditLog } from '../../utils/audit.js'
+import { decryptText } from '../../utils/crypto.js'
 import {
   isStorageChannelCandidate,
   normalizeChannelId,
   probeChannelCapabilities,
   resolveConfiguredChannel,
   serializeTelegramAccount,
+  telegramDisplayName,
   withTelegramClient,
 } from './telegram.service.js'
 import { syncTelegramUsage } from './telegram-usage.service.js'
@@ -93,7 +95,7 @@ export async function createTelegramStorageChannel(
 export async function selectTelegramStorageChannel(
   userId: string,
   config: TelegramConfig,
-  opts: { channelId: string },
+  opts: { channelId: string; transfer?: boolean },
 ): Promise<{ account: unknown }> {
   const result = await withTelegramClient(config, async (client) => {
     const entity = await resolveConfiguredChannel(client, opts.channelId)
@@ -109,11 +111,20 @@ export async function selectTelegramStorageChannel(
   })
 
   assertProbeOk(result.probe, result.channelTitle)
-  const account = await persistChannelConfig(userId, config, {
-    channelId: result.channelId,
-    channelTitle: result.channelTitle,
-  })
-  await createAuditLog(userId, 'telegram.channel_select', 'connected_account', config.connectedAccount.id, {
+  let account: unknown
+  try {
+    account = await persistChannelConfig(userId, config, {
+      channelId: result.channelId,
+      channelTitle: result.channelTitle,
+    })
+  } catch (error) {
+    // Opt-in takeover. The probe above already proved this account can read/
+    // write/delete the channel; the unique constraint is the only thing left
+    // in the way. Never implicit — explicit `transfer: true` from the client.
+    if (!opts.transfer || (error as { code?: string }).code !== 'TELEGRAM_CHANNEL_IN_USE') throw error
+    account = await transferChannelOwnership(userId, config, { channelId: result.channelId, channelTitle: result.channelTitle })
+  }
+  await createAuditLog(userId, opts.transfer ? 'telegram.channel_transfer' : 'telegram.channel_select', 'connected_account', config.connectedAccount.id, {
     channelId: result.channelId,
   })
   return { account }
@@ -150,6 +161,10 @@ async function persistChannelConfig(
       data: {
         providerAccountId: channel.channelId,
         email: `telegram@${channel.channelId}`,
+        displayName: telegramDisplayName(
+          config.phoneEncrypted ? decryptText(config.phoneEncrypted) : null,
+          channel.channelTitle,
+        ),
         status: 'connected',
         reauthRequiredAt: null,
         lastAuthErrorCode: null,
@@ -185,4 +200,116 @@ async function channelInUseError(userId: string, channelId: string): Promise<App
       ? ' A disconnected 9Drive account still holds it — reconnect that account instead of connecting a new one; its channel and files are preserved.'
       : ''
   return new AppError('TELEGRAM_CHANNEL_IN_USE', `This storage channel is already used by another 9Drive account.${hint}`, 409)
+}
+
+
+/**
+ * Take an already-claimed channel away from another of the user's 9Drive
+ * accounts and bind it to this one — files, folder locations, and sync cursor
+ * all move with the channel. The source keeps its row but loses the channel
+ * claim and is left in a "storage channel required" state.
+ *
+ * Single transaction: a half-applied transfer strands files on an account that
+ * can no longer reach the channel, or vice versa. The MySQL unique index
+ * forces a release-then-claim order; the target's folder locations and sync
+ * state describe its previous channel and must be dropped before the source's
+ * are moved over.
+ */
+export async function transferChannelOwnership(
+  userId: string,
+  config: TelegramConfig,
+  channel: { channelId: string; channelTitle: string },
+): Promise<unknown> {
+  const toId = config.connectedAccount.id
+  const holder = await prisma.connectedAccount.findFirst({
+    where: { userId, provider: 'telegram', providerAccountId: channel.channelId },
+    select: { id: true, telegramStorageConfig: { select: { phoneEncrypted: true } } },
+  })
+  if (!holder) {
+    // The unique constraint is the source of truth; this should be impossible
+    // (we were called from a P2002 catch). Fail loudly rather than pretend.
+    throw new AppError('TELEGRAM_CHANNEL_IN_USE', 'This storage channel is already used by another 9Drive account.', 409)
+  }
+  if (holder.id === toId) {
+    throw new AppError('TELEGRAM_CHANNEL_ALREADY_OWNED', 'This storage channel is already bound to this 9Drive account.', 409)
+  }
+  const fromId = holder.id
+  const fromPhone = holder.telegramStorageConfig?.phoneEncrypted
+    ? decryptText(holder.telegramStorageConfig.phoneEncrypted)
+    : null
+  const toPhone = config.phoneEncrypted ? decryptText(config.phoneEncrypted) : null
+
+  await prisma.$transaction(async (tx) => {
+    // Release FIRST: the @@unique([userId, provider, providerAccountId]) index
+    // is checked per statement, so both rows cannot hold the channel id at
+    // once. Uploads read the config, not the identity, so the source's config
+    // must be cleared too — otherwise it would silently keep writing in.
+    await tx.connectedAccount.update({
+      where: { id: fromId },
+      data: {
+        providerAccountId: `pending:${fromId}`,
+        email: 'telegram@pending',
+        displayName: telegramDisplayName(fromPhone, null),
+      },
+    })
+    await tx.telegramStorageConfig.updateMany({
+      where: { connectedAccountId: fromId },
+      data: { channelId: null, channelTitle: null },
+    })
+    // Claim. The same writes `persistChannelConfig` would make, on the new row.
+    await tx.connectedAccount.update({
+      where: { id: toId },
+      data: {
+        providerAccountId: channel.channelId,
+        email: `telegram@${channel.channelId}`,
+        displayName: telegramDisplayName(toPhone, channel.channelTitle),
+        status: 'connected',
+        reauthRequiredAt: null,
+        lastAuthErrorCode: null,
+        lastError: null,
+      },
+    })
+    await tx.telegramStorageConfig.update({
+      where: { connectedAccountId: toId },
+      data: { channelId: channel.channelId, channelTitle: channel.channelTitle },
+    })
+    // Files follow the channel. `providerFileId` already carries the channel
+    // id, so no rewrite — only the owning account changes.
+    await tx.file.updateMany({
+      where: { connectedAccountId: fromId },
+      data: { connectedAccountId: toId },
+    })
+    // Folder locations map folders to physical ids IN A CHANNEL. The target's
+    // own rows describe whatever channel it had before, so they are now wrong;
+    // drop them wholesale. A bare updateMany would also trip
+    // @@unique([folderId, connectedAccountId]) for any shared folder.
+    await tx.folderStorageLocation.deleteMany({ where: { connectedAccountId: toId } })
+    await tx.folderStorageLocation.updateMany({
+      where: { connectedAccountId: fromId },
+      data: { connectedAccountId: toId },
+    })
+    // `lastMessageId` is a per-channel cursor: inherit the source's, discard
+    // the target's. Never max() them — they count messages in different channels.
+    await tx.telegramSyncState.deleteMany({ where: { connectedAccountId: toId } })
+    await tx.telegramSyncState.updateMany({
+      where: { connectedAccountId: fromId },
+      data: { connectedAccountId: toId },
+    })
+    // History (TelegramSyncRun / TelegramSyncIssue / SyncRun) is NOT reassigned
+    // on purpose: the target should not be credited with runs it never made.
+    // It cascades away only when the source row is purged.
+  })
+
+  // Recompute quota from the new File distribution. syncTelegramUsage derives
+  // usedBytes + fileCount from File rows, so we don't have to touch StorageAccount.
+  await Promise.all([
+    syncTelegramUsage(fromId).catch(() => undefined),
+    syncTelegramUsage(toId).catch(() => undefined),
+  ])
+  await createAuditLog(userId, 'telegram.channel_transfer_complete', 'connected_account', toId, {
+    channelId: channel.channelId,
+    fromAccountId: fromId,
+    toAccountId: toId,
+  })
+  return serializeTelegramAccount(userId, toId)
 }

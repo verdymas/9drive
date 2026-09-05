@@ -125,7 +125,12 @@ const envSchema = z.object({
   // Maximum retries per page on FloodWait. FloodWait itself waits the
   // requested seconds; this caps how many times we re-enter on a row.
   TELEGRAM_SYNC_FLOOD_WAIT_RETRIES: z.coerce.number().int().min(0).max(5).default(3),
-  // ── Telegram metadata protection (encrypted captions + opaque filenames) ─
+  // Soft-delete (trash) a 9Drive row when its Telegram message has been gone
+  // for two consecutive FULL scans. Default false — the spec's rule is that
+  // Telegram deletion never removes a 9Drive row (telegram-drive.md:87). When
+  // true, rows are moved to Trash (recoverable), never hard-deleted.
+  TELEGRAM_SYNC_TRASH_MISSING: booleanEnv(false),
+  // ── Telegram metadata protection (encrypted captions + opaque filenames) ──
   // Master switch for encrypting `9drive:meta` caption metadata on Telegram
   // storage documents. When enabled, TELEGRAM_METADATA_MASTER_KEY MUST be set
   // (≥32 chars) or protected writes fail safely — never auto-generate, never

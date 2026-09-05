@@ -236,13 +236,32 @@ describe('telegram-metadata — encoder', () => {
     expect(parsed.logicalPath).toBeNull()
   })
 
-  it('emits id + meta + legacy path together (transitional captions)', () => {
+  it('omits the plaintext path when the encrypted meta line is emitted (no leak)', () => {
+    // The path lives inside the AES-256-GCM payload — emitting it in cleartext
+    // beside the ciphertext would defeat the encryption. The encoder must
+    // choose one representation and stay silent on the other.
     const caption = encodeCaption({ stableId: 'abc', encryptedMeta: 'v1:xyz', logicalPath: 'A/B.md' })
     expect(caption).not.toBeNull()
-    const parsed = parseCaption(caption!)
-    expect(parsed.stableId).toBe('abc')
-    expect(parsed.encryptedMeta).toBe('v1:xyz')
-    expect(parsed.logicalPath).toBe('A/B.md')
+    expect(caption!.includes(`${NINE_DRIVE_PATH_KEY}=`)).toBe(false)
+    expect(caption!.includes(`${NINE_DRIVE_META_KEY}=v1:xyz`)).toBe(true)
+    // The plaintext path segment must not leak into the caption, including
+    // through any other line — the filename is the only thing that survives.
+    expect(caption!.includes('A/B.md')).toBe(false)
+  })
+
+  it('keeps the plaintext path when the meta line is dropped (empty / oversized)', () => {
+    // If the ciphertext is unusable, the path is the only recovery hint —
+    // the encoder must fall back to the legacy line in that case.
+    const empty = encodeCaption({ stableId: 'abc', encryptedMeta: '', logicalPath: 'A/B.md' })
+    expect(empty).not.toBeNull()
+    expect(empty!.includes(`${NINE_DRIVE_META_KEY}=`)).toBe(false)
+    expect(empty!.includes(`${NINE_DRIVE_PATH_KEY}=A/B.md`)).toBe(true)
+
+    const filler = 'x'.repeat(TELEGRAM_CAPTION_MAX)
+    const oversized = encodeCaption({ stableId: 'abc', encryptedMeta: `v1:${filler}`, logicalPath: 'A/B.md' })
+    expect(oversized).not.toBeNull()
+    expect(oversized!.includes(`${NINE_DRIVE_META_KEY}=`)).toBe(false)
+    expect(oversized!.includes(`${NINE_DRIVE_PATH_KEY}=A/B.md`)).toBe(true)
   })
 
   it('drops an empty / oversized meta value while keeping the id', () => {

@@ -24,6 +24,10 @@ export type SyncStats = {
   filesMissing: number
   mappingsMissing: number
   collisionsDetected: number
+  // Telegram-only: rows whose Telegram message disappeared and that the
+  // sync flagged for the user (vs. filesMissing which counts files actually
+  // moved to Trash by the opt-in `TELEGRAM_SYNC_TRASH_MISSING` flag).
+  filesFlagged: number
 }
 
 export const emptyStats = (): SyncStats => ({
@@ -39,6 +43,7 @@ export const emptyStats = (): SyncStats => ({
   filesMissing: 0,
   mappingsMissing: 0,
   collisionsDetected: 0,
+  filesFlagged: 0,
 })
 
 /** Statuses are plain string constants — no enums in this schema. */

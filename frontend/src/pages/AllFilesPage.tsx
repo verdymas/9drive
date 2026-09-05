@@ -289,7 +289,7 @@ export function AllFilesPage() {
     const uploadingFiles = [...selectedFiles]
     const targetFolderId = activeFolderId || selectedFolderId
     const targetAccountId = selectedTargetAccountId || null
-    const pinnedAccountName = connectedAccounts.find((account) => account.id === targetAccountId)?.email || undefined
+    const pinnedAccountName = connectedAccounts.find((account) => account.id === targetAccountId)?.displayName || connectedAccounts.find((account) => account.id === targetAccountId)?.email || undefined
 
     setSelectedFiles([])
     setSelectedFolderId('')
@@ -320,18 +320,27 @@ export function AllFilesPage() {
     try {
       // Multi-storage Provider → Virtual sync (all accounts, bounded
       // concurrency). Per-account stats are scalar SyncRun fields.
-      const response = await apiFetch<{ results: { accountId: string; provider: string; status: string; stats: { filesCreated: number; filesUpdated: number; filesMoved: number; filesMissing: number } }[] }>('/sync/all', { method: 'POST', body: JSON.stringify({}) })
+      const response = await apiFetch<{ results: { accountId: string; provider: string; status: string; stats: { filesCreated: number; filesUpdated: number; filesMoved: number; filesMissing: number; filesFlagged?: number } }[] }>('/sync/all', { method: 'POST', body: JSON.stringify({}) })
 
-      let created = 0, updated = 0, moved = 0, removed = 0
+      let created = 0, updated = 0, moved = 0, removed = 0, flagged = 0
       for (const res of response.results) {
         created += res.stats.filesCreated
         updated += res.stats.filesUpdated
         moved += res.stats.filesMoved
         removed += res.stats.filesMissing
+        // `filesFlagged` is Telegram-only: files whose Telegram message
+        // disappeared and that the sync wrote a REMOTE_FILE_MISSING issue
+        // for. The user must resolve them — the sync only removes them
+        // when the opt-in TELEGRAM_SYNC_TRASH_MISSING flag confirms it on
+        // a second scan. Surface the count so the deletion is visible.
+        flagged += res.stats.filesFlagged ?? 0
       }
       const accounts = response.results.length
+      const flaggedNote = flagged > 0
+        ? ` ${flagged} file${flagged === 1 ? '' : 's'} no longer exist on Telegram — check Trash or review sync issues.`
+        : ''
 
-      setMessage(`Synced ${accounts} account${accounts === 1 ? '' : 's'}. ${created} added, ${updated} updated, ${moved} moved, ${removed} removed.`)
+      setMessage(`Synced ${accounts} account${accounts === 1 ? '' : 's'}. ${created} added, ${updated} updated, ${moved} moved, ${removed} removed.${flaggedNote}`)
       await loadAll()
       window.dispatchEvent(new Event('9drive:storage-changed'))
     } catch (error) {
@@ -783,7 +792,7 @@ export function AllFilesPage() {
               <option value="">Automatic (Default)</option>
               {connectedAccounts.map((account) => (
                 <option key={account.id} value={account.id}>
-                  {account.email || account.displayName || account.id} ({account.provider === 's3' ? 'S3' : account.provider === 'telegram' ? 'Telegram' : 'Google Drive'})
+                  {account.displayName || account.email || account.id} ({account.provider === 's3' ? 'S3' : account.provider === 'telegram' ? 'Telegram' : 'Google Drive'})
                 </option>
               ))}
             </select>

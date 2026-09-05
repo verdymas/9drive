@@ -29,7 +29,7 @@ const authVerifySchema = z.object({
 
 const channelActionSchema = z.discriminatedUnion('action', [
   z.object({ action: z.literal('create'), title: z.string().trim().min(1).max(191).optional() }),
-  z.object({ action: z.literal('select'), channelId: z.string().trim().min(1) }),
+  z.object({ action: z.literal('select'), channelId: z.string().trim().min(1), transfer: z.boolean().optional() }),
 ])
 
 telegramRouter.post('/auth/start', requireAuth, async (req: AuthRequest, res, next) => {
@@ -90,7 +90,7 @@ telegramRouter.post('/accounts/:accountId/channel', requireAuth, async (req: Aut
 
     const result = body.action === 'create'
       ? await createTelegramStorageChannel(req.user!.id, config, { title: body.title })
-      : await selectTelegramStorageChannel(req.user!.id, config, { channelId: body.channelId })
+      : await selectTelegramStorageChannel(req.user!.id, config, { channelId: body.channelId, ...(body.transfer ? { transfer: true } : {}) })
 
     return res.json(result)
   } catch (error) {
