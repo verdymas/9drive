@@ -118,11 +118,46 @@ services:
       REMOTE_IMPORT_REQUEST_CONTEXT_MAX_CURL_BYTES: ${REMOTE_IMPORT_REQUEST_CONTEXT_MAX_CURL_BYTES:-65536}
       REMOTE_IMPORT_REQUEST_CONTEXT_MAX_COOKIE_BYTES: ${REMOTE_IMPORT_REQUEST_CONTEXT_MAX_COOKIE_BYTES:-16384}
       REMOTE_IMPORT_REQUEST_CONTEXT_COOKIE_SCOPE: ${REMOTE_IMPORT_REQUEST_CONTEXT_COOKIE_SCOPE:-source-host}
+      # ── Telegram Stream (internal byte-range service) ──────────────────
+      TELEGRAM_STREAM_NODE_URL: ${TELEGRAM_STREAM_NODE_URL:-http://telegram-stream:8081}
+      TELEGRAM_STREAM_INTERNAL_SECRET: ${TELEGRAM_STREAM_INTERNAL_SECRET:-}
+      TELEGRAM_STREAM_CHUNK_SIZE_BYTES: ${TELEGRAM_STREAM_CHUNK_SIZE_BYTES:-1048576}
+      TELEGRAM_STREAM_PREFETCH: ${TELEGRAM_STREAM_PREFETCH:-3}
+      TELEGRAM_STREAM_PARALLELISM: ${TELEGRAM_STREAM_PARALLELISM:-2}
     volumes:
       - remote_import_tmp:/data/remote-import-tmp
       - upload_tmp:/data/upload-tmp
     ports:
       - "4000:4000"
+
+  telegram-stream:
+    build:
+      context: ./services/telegram-stream
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    # Internal-only: no host port. Backend talks to it via DNS
+    # `telegram-stream:8081` over the default compose network.
+    expose:
+      - "8081"
+    environment:
+      TELEGRAM_STREAM_HOST: "0.0.0.0"
+      TELEGRAM_STREAM_PORT: "8081"
+      TELEGRAM_STREAM_INTERNAL_SECRET: ${TELEGRAM_STREAM_INTERNAL_SECRET:-}
+      TELEGRAM_STREAM_CHUNK_SIZE_BYTES: ${TELEGRAM_STREAM_CHUNK_SIZE_BYTES:-1048576}
+      TELEGRAM_STREAM_PREFETCH: ${TELEGRAM_STREAM_PREFETCH:-3}
+      TELEGRAM_STREAM_PARALLELISM: ${TELEGRAM_STREAM_PARALLELISM:-2}
+      TELEGRAM_STREAM_LOG_LEVEL: ${TELEGRAM_STREAM_LOG_LEVEL:-info}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8081/health',timeout=3); sys.exit(0 if r.status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Resource hints: a single Telegram stream worker is enough for
+    # a Jellyfin + rclone deployment; the in-process client cache means
+    # memory grows with the number of *connected* accounts, not the
+    # number of streams.
+    mem_limit: 512m
 
   remote-import-worker:
     build:

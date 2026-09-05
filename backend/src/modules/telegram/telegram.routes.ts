@@ -11,6 +11,12 @@ import { indexTelegramAccount } from './telegram-index.service.js'
 import { ingestTelegramAccount } from './telegram-ingest.service.js'
 import { updateTelegramDocumentCaption } from './telegram-caption.service.js'
 import { logicalPathForFileId } from '../files/file-logical-path.js'
+import { env } from '../../config/env.js'
+import { requireInternalStreamSecret } from './telegram-stream-auth.middleware.js'
+import {
+  readStreamSessionCiphertext,
+  writeStreamSession,
+} from './telegram-stream-session.service.js'
 
 export const telegramRouter = Router()
 
@@ -185,4 +191,50 @@ telegramRouter.post('/files/:fileId/sync-caption', requireAuth, async (req: Auth
     if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
     return next(error)
   }
+})
+
+// ── Telegram stream control plane (internal) ──────────────────────────────
+//
+// The streaming service hits these from the internal Docker network only.
+// Auth is a shared HMAC secret (TELEGRAM_STREAM_INTERNAL_SECRET) via the
+// `requireInternalStreamSecret` middleware. The service is single-tenant
+// per account: it asks for the streaming session ciphertext, decrypts it
+// locally, and re-uploads a fresh PyroFork session if it had to re-login.
+
+const streamSessionSchema = z.object({
+  connectedAccountId: z.string().trim().min(1),
+  session: z.string().trim().min(1),
+})
+
+telegramRouter.get('/stream/session/:connectedAccountId', requireInternalStreamSecret, async (req, res, next) => {
+  try {
+    const connectedAccountId = String(req.params.connectedAccountId)
+    const ciphertext = await readStreamSessionCiphertext(prisma, connectedAccountId)
+    if (!ciphertext) {
+      return res.status(404).json({ code: 'STREAM_SESSION_UNAVAILABLE', message: 'No PyroFork session provisioned for this account.' })
+    }
+    return res.json({ connectedAccountId, ciphertext })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+telegramRouter.put('/stream/session', requireInternalStreamSecret, async (req, res, next) => {
+  try {
+    const body = streamSessionSchema.parse(req.body)
+    await writeStreamSession(prisma, body.connectedAccountId, body.session)
+    return res.json({ connectedAccountId: body.connectedAccountId, stored: true })
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ code: 'BAD_REQUEST', message: 'Invalid streaming session payload.', details: error.flatten() })
+    }
+    if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
+    return next(error)
+  }
+})
+
+// Quick liveness for compose healthcheck. Always returns 200 if the route
+// is wired; the streaming service is the source of truth for its own health.
+telegramRouter.get('/stream/control/health', requireInternalStreamSecret, (_req, res) => {
+  return res.json({ ok: true, streamConfigured: Boolean(env.TELEGRAM_STREAM_NODE_URL) })
 })

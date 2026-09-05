@@ -6,6 +6,8 @@ import { prisma } from '../../config/prisma.js'
 import { googleDownloadExportMimeTypes, normalizeHeaders } from '../files/stream-google-file.js'
 import { getAuthedGoogleClient } from '../google/google.service.js'
 import { createS3Client, getS3ConfigForAccount } from '../s3/s3.service.js'
+import { isTelegramStreamConfigured } from '../telegram/telegram-stream-auth.js'
+import { fetchTelegramStreamAsReadable } from '../telegram/telegram-stream-readable.js'
 
 const { FileSystem, LocalLockManager, LocalPropertyManager, ResourceType } = v2
 
@@ -411,6 +413,18 @@ export async function streamProviderFileToReadable(file: FileWithAccount, range?
     const body = response.Body as Readable | undefined
     if (!body) return Readable.from([])
     return body
+  }
+
+  if (file.provider === 'telegram') {
+    // Provider detection is from the DB mapping (file.provider), never from
+    // filename heuristics (phase spec §07). When the streaming service is
+    // configured, the gateway is the byte source; otherwise we fall through
+    // to the legacy path (which can only do full-GET) so WebDAV still
+    // returns a (200) body — better than a 500.
+    if (isTelegramStreamConfigured()) {
+      return fetchTelegramStreamAsReadable(file, range)
+    }
+    return Readable.from([])
   }
 
   // Google Drive

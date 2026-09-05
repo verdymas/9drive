@@ -18,6 +18,35 @@ database stays the source of truth for the virtual file tree — Telegram is
   from the wizard form) and **reconnect** (stored credentials reused).
   Authentication no longer creates or resolves a storage channel — that is a
   separate, explicit step (§3, §5).
+- `backend/src/modules/telegram/telegram-stream-gateway.ts` — internal
+  signed-HTTP gateway to the `telegram-stream` service. Owns the request
+  signing, abort propagation, and header split. WebDAV reads of Telegram
+  files go through this gateway when the service is configured; the
+  legacy full-GET path is used as a fallback when it is not.
+- `backend/src/modules/telegram/telegram-stream-readable.ts` — WebDAV
+  variant of the gateway that returns a Node Readable (the WebDAV layer
+  owns the response object and headers).
+- `backend/src/modules/telegram/telegram-stream-auth.ts` +
+  `telegram-stream-auth.middleware.ts` — HMAC-SHA256 signer for backend
+  requests and the symmetric control-plane verifier.
+- `backend/src/modules/telegram/telegram-stream-session.service.ts` —
+  storage for the PyroFork streaming session ciphertext (column
+  `stream_session_encrypted`). The streaming service is the single
+  writer; the backend is the single reader. Invalidation runs from
+  `markTelegramReauthRequired` so a revoked teleproto session cannot
+  persist for telegram-stream.
+- `services/telegram-stream/` — internal FastAPI byte-range service.
+  See `docs/implementation/telegram-stream.md` and
+  `docs/audits/telegram-stream-architecture-audit.md` for the full
+  architecture. Key entry points: `app/main.py` (FastAPI app),
+  `app/api/stream.py` (GET /v1/stream), `app/api/health.py` (liveness
+  + readiness), `app/security/internal_auth.py` (HMAC verification),
+  `app/telegram/client_manager.py` (reusable PyroFork client, no login
+  per range), `app/telegram/file_resolver.py` (channel+message →
+  document with stale-FILE_REFERENCE refresh), `app/telegram/byte_streamer.py`
+  (range → exact bytes via `upload.GetFile`), `app/telegram/prefetched_streamer.py`
+  (bounded prefetch, ordered output, cancellation), `app/observability.py`
+  (structured JSON logs, secret redaction, per-stream metrics).
 - `backend/src/modules/telegram/telegram-channel.service.ts` — explicit storage
   channel setup: list candidate private channels, create a new private channel,
   or select an existing one. Every selection is capability-probed (read/write/
