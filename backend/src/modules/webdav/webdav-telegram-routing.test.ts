@@ -95,4 +95,40 @@ describe('streamProviderFileToReadable — Telegram routing', () => {
     await streamProviderFileToReadable(fileRow, 'bytes=0-4')
     expect(h.cryptoLoaded).toBe(false)
   })
+
+  // A suffix range is how ffprobe/rclone read a Matroska tail (Cues live at
+  // the end). The WebDAV layer used to drop it — its own parseRange has no
+  // suffix form — turning a 1 KiB tail read into a full-file download.
+  it('forwards a suffix range verbatim instead of dropping it', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(new ReadableStream({ start(c) { c.close() } }), {
+        status: 206,
+        headers: { 'content-range': 'bytes 96-99/100' },
+      }),
+    )
+    const { streamProviderFileToReadable } = await import('./webdav-virtual-fs.js')
+    await streamProviderFileToReadable(fileRow, 'bytes=-4')
+    const headers = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>
+    expect(headers.Range).toBe('bytes=-4')
+  })
+
+  // The abort wiring is what stops an abandoned seek from holding the
+  // account's single sequential Telethon sender.
+  it('destroying the body aborts the upstream request', async () => {
+    let signal: AbortSignal | undefined
+    fetchMock.mockImplementationOnce((_url: unknown, init: RequestInit) => {
+      signal = init.signal ?? undefined
+      return Promise.resolve(
+        new Response(new ReadableStream({ start(c) { c.enqueue(new Uint8Array([1])) } }), { status: 206 }),
+      )
+    })
+    const { streamProviderFileToReadable } = await import('./webdav-virtual-fs.js')
+    const r = (await streamProviderFileToReadable(fileRow, 'bytes=0-0')) as {
+      body: import('node:stream').Readable
+    }
+    expect(signal?.aborted).toBe(false)
+    r.body.destroy()
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(signal?.aborted).toBe(true)
+  })
 })

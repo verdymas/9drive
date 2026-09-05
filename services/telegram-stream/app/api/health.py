@@ -3,13 +3,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.observability import (
-    ACTIVE_STREAMS,
-    TOTAL_CANCELLATIONS,
-    TOTAL_FILE_REFERENCE_REFRESHES,
-    TOTAL_FLOOD_WAITS,
-    TOTAL_STREAMS,
-)
+# Import the module, not the names: `from ... import ACTIVE_STREAMS` binds the
+# int once at import and /ready would report 0 forever.
+from app import observability as obs
 
 router = APIRouter()
 
@@ -28,9 +24,9 @@ async def health() -> dict[str, object]:
 async def ready() -> dict[str, object]:
     return {
         "status": "ok",
-        "active_streams": ACTIVE_STREAMS,
-        "total_streams": TOTAL_STREAMS,
-        "total_cancellations": TOTAL_CANCELLATIONS,
-        "total_file_reference_refreshes": TOTAL_FILE_REFERENCE_REFRESHES,
-        "total_flood_waits": TOTAL_FLOOD_WAITS,
+        "active_streams": obs.ACTIVE_STREAMS,
+        "total_streams": obs.TOTAL_STREAMS,
+        "total_cancellations": obs.TOTAL_CANCELLATIONS,
+        "total_file_reference_refreshes": obs.TOTAL_FILE_REFERENCE_REFRESHES,
+        "total_flood_waits": obs.TOTAL_FLOOD_WAITS,
     }

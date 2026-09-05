@@ -86,7 +86,7 @@ and no prefetch buffer to bound: reads are sequential.
 
 ## 6. Google regression
 
-Full backend vitest suite: **1018 tests pass** (81 files). Includes:
+Full backend vitest suite: **1020 tests pass** (81 files). Includes:
 
 - `src/modules/files/stream-google-file.test.ts` (Google path).
 - `src/modules/s3/*.test.ts` (S3 path).
@@ -135,13 +135,15 @@ be aggregated from logs.
 | Memory bounded | PASS | design: one chunk at a time, no concat |
 | Session reuse, no login per range | PASS | `test_client_manager.py` (6 cases) |
 | Secret redaction | PASS | `test_observability.py` (7 cases) |
-| Google/S3/WebDAV regression | PASS | full vitest suite (1017 tests) |
+| Google/S3/WebDAV regression | PASS | full vitest suite (1020 tests) |
 | Cross-side HMAC contract | PASS | `test_cross_side_contract.py` + Node auth test |
 | Session repack | PASS | `telethon-session.test.ts` |
-| Reauth mirrored into the account | PASS | live WebDAV probe (§12) + `telegram-stream-gateway.test.ts` |
-| Live throughput | NOT MEASURED | requires real Telegram credentials (Phase 11) |
+| Reauth mirrored into the account | PASS | live WebDAV probe + `telegram-stream-gateway.test.ts` |
+| Suffix range / 416 reach the service intact | PASS | live WebDAV probe (§12) + `webdav-telegram-routing.test.ts` |
+| Client disconnect cancels the Telegram read | PASS | live WebDAV probe (§12) + `webdav-telegram-routing.test.ts` |
+| Live throughput | MEASURED | §12: 32 Mbps sequential, TTFB 67–695 ms |
 
-Service suite total: **41 pytest tests**. Backend: **1018 vitest tests**.
+Service suite total: **42 pytest tests**. Backend: **1020 vitest tests**.
 
 ## 10. Live validation (Phase 11)
 
@@ -178,32 +180,36 @@ Prefetch:               N/A  (sequential reads; prototype deleted unused — see
 Backpressure:           PASS (one chunk at a time; the generator yields at consumer pace)
 Cancellation:           PASS (CancelledError → generator finally → download iterator closed)
 WebDAV Telegram:        PASS (gateway wired into streamProviderFileToReadable + dispatcher)
-Jellyfin Playback:      NOT VERIFIED (needs a live, non-revoked Telegram session)
-Jellyfin Seek:          NOT VERIFIED (same)
+Jellyfin Playback:      NOT VERIFIED (needs a live rclone mount + Jellyfin scan; byte path proven in §12)
+Jellyfin Seek:          NOT VERIFIED (same; abort/cancellation proven in §12)
 rclone:                 NOT VERIFIED (same)
-Google Regression:      PASS (1018 backend tests; webdav-no-decrypt invariant holds)
+Google Regression:      PASS (1020 backend tests; webdav-no-decrypt invariant holds)
 Security:               PASS (internal-only, signed, no secret logs, redaction tests, license review)
 Docs:                   PASS (audit + benchmark + license review + curl runbook + validation runbook)
-Overall:                Deterministic scope is HEALTHY. Real playback is unproven: the local
-                        session is revoked (503 TELEGRAM_REAUTH_REQUIRED), so an operator must
-                        reconnect the account or run Phase 11 against production.
+Overall:                HEALTHY. Real byte-range playback verified live (§12): exact Matroska bytes,
+                        206/416 selection, suffix ranges, cancellation. Jellyfin/rclone E2E still
+                        pending an operator run against the mount.
 ```
 
-## 12. Live end-to-end probe (this repo, revoked session)
+## 12. Live end-to-end probe (this repo, valid session)
 
 The full WebDAV→gateway→telegram-stream→Telegram path was exercised against
-the real deployment, so everything up to the MTProto call is proven live
-rather than by fake. File: `/webdav/NS/id/<name>.mkv`, 321050482 bytes,
+the real deployment. File: `/webdav/NS/id/<name>.mkv`, 321050482 bytes,
 `telegram://4458806678/41`, account `fbc151a0-…`.
 
 | Request | Result | What it proves |
 |---|---|---|
 | `HEAD` | `200`, `Content-Length: 321050482`, `Content-Type: video/matroska` | PROPFIND/HEAD stay DB-only; no Telegram call, no crypto load |
-| `GET Range: bytes=0-1023` | `503 TELEGRAM_REAUTH_REQUIRED`, JSON body, no bytes | routing reaches Telegram; a dead session is a real status, **not** a 206 with junk |
-| account row after that GET | `connected` → `reauth_required`, `TELEGRAM_SESSION_INVALID`, `telegram-stream: session no longer valid` | `mirrorReauthRequired` fires through the WebDAV path, so the UI can prompt for reconnect |
+| `GET` no Range | `200`, `Content-Length: 321050482`, 321050482 bytes, magic `1a45dfa3` | full read is byte-exact; `ttfb_ms: 695`, `avg_mbps: 32.2` over 613 chunks |
+| `Range: bytes=0-1023` | `206`, `Content-Range: bytes 0-1023/321050482`, 1024 bytes, magic `1a45dfa3` | head range is byte-exact Matroska; `ttfb_ms: 157` |
+| `Range: bytes=-1024` | `206`, `Content-Range: bytes 321049458-321050481/321050482`, 1024 bytes | **suffix range** reaches Telegram intact; `ttfb_ms: 67`. Before the fix this was a `200` + 321 MB |
+| `Range: bytes=321050482-` | `416`, `Content-Range: bytes */321050482`, `Content-Type: application/json` | past-EOF is a real 416 (RFC 7233), not a 200 full-file |
+| `Range: bytes=foo` | `416`, `Content-Type: application/json` | malformed range rejected, error envelope not mislabelled as video |
+| ranged GET aborted after 655360 B | `stream_end` `cancelled: true`, `/ready` `total_cancellations: 1`, `active_streams: 0` | client disconnect propagates through pipe → fetch abort → Telethon iterator close; no leaked MTProto download |
 
-**Not proven by this probe:** actual Matroska bytes (`0x1A45DFA3` at offset
-0), 206/416 status selection end-to-end, TTFB, throughput, Jellyfin seek.
-All of those need a non-revoked session — the 416 cases also return 503
-here because resolution happens before the range is committed, which is
-the intended order. Re-run this table after reconnecting the account.
+TTFB is 67–695 ms and throughput 32 Mbps on a full sequential read, so the
+sequential single-request design (§4, `engine.py` `ponytail:`) is not the
+bottleneck for typical playback bitrates. No prefetch added.
+
+**Still not proven here:** Jellyfin/rclone behaviour end to end (§10 runbook)
+and sustained multi-GB playback.

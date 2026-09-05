@@ -54,6 +54,7 @@ async function streamFile(ctx: v2.HTTPRequestContext, fs: VirtualFileSystem): Pr
 
   const size = Number(file.sizeBytes ?? 0n)
   const rangeHeader = ctx.headers.find('Range')
+  const isTelegram = file.provider === 'telegram'
   const range = parseRange(rangeHeader ?? '', size)
 
   // Logical metadata (owned by 9Drive) — safe to set pre-flight.
@@ -74,9 +75,16 @@ async function streamFile(ctx: v2.HTTPRequestContext, fs: VirtualFileSystem): Pr
   try {
     const result = await streamProviderFileToReadable(
       file,
-      range ? `bytes=${range.start}-${range.end}` : undefined,
+      // Telegram: forward the client's header verbatim. telegram-stream
+      // already implements the whole grammar (suffix `bytes=-N`, past-EOF
+      // → 416 + `Content-Range: bytes */TOTAL`), while `parseRange` below
+      // only understands `bytes=N-M` and answers everything else with
+      // `null` — which used to become a full-file 200 from byte 0. That
+      // turned an ffprobe tail read (rclone/Jellyfin issue them to find
+      // the Matroska Cues) into a whole-file download.
+      isTelegram ? rangeHeader || undefined : range ? `bytes=${range.start}-${range.end}` : undefined,
     )
-    if (file.provider === 'telegram') {
+    if (isTelegram) {
       const t = result as { body: import('node:stream').Readable; status: number; headers: Record<string, string> }
       stream = t.body
       upstreamStatus = t.status
@@ -101,12 +109,26 @@ async function streamFile(ctx: v2.HTTPRequestContext, fs: VirtualFileSystem): Pr
     }
   })
 
-  if (file.provider === 'telegram' && upstreamStatus !== null) {
+  // `.pipe()` does not destroy the source when the destination dies, so a
+  // client that walks away (every rclone/Jellyfin seek and readahead abort)
+  // would leave the upstream fetch — and its Telethon `iter_download` —
+  // running. One account has one Telethon client with a sequential sender,
+  // so abandoned reads queue in front of the live one and playback stalls.
+  // Destroying the Readable emits 'close', which the gateway already turns
+  // into an AbortController abort (telegram-stream-readable.ts).
+  ctx.response.on('close', () => {
+    if (!ctx.response.writableEnded) stream.destroy()
+  })
+
+  if (isTelegram && upstreamStatus !== null) {
     // Forward upstream byte-range headers (Content-Range, range Content-Length,
     // Accept-Ranges). The streaming service is the source of truth for these.
     for (const [name, value] of Object.entries(upstreamHeaders)) {
       ctx.response.setHeader(name, value)
     }
+    // A non-2xx upstream body is the JSON error envelope, not media — don't
+    // serve it under the file's video mime type.
+    if (upstreamStatus >= 300) ctx.response.setHeader('Content-Type', 'application/json')
     // 9Drive-owned headers stay set above.
     ctx.setCode(upstreamStatus)
   } else if (range) {

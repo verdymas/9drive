@@ -61,6 +61,21 @@ def test_active_streams_counters() -> None:
     assert obs.TOTAL_STREAMS == 2
 
 
+def test_ready_reflects_live_counters() -> None:
+    """/ready must read the counters at request time, not at import time."""
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    obs.ACTIVE_STREAMS = 0
+    obs.TOTAL_STREAMS = 0
+    with TestClient(create_app()) as client:
+        obs.inc_active()
+        body = client.get("/ready").json()
+    assert body["active_streams"] == 1
+    assert body["total_streams"] == 1
+
+
 def test_stream_metrics_finish() -> None:
     m = obs.StreamMetrics(
         request_id="r1",
