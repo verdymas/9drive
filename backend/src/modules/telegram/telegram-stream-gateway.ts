@@ -18,7 +18,7 @@ import { env } from '../../config/env.js'
 import type { Response } from 'express'
 
 import { signStreamRequest, isTelegramStreamConfigured } from './telegram-stream-auth.js'
-import { parseTelegramRemoteId } from './telegram.service.js'
+import { markTelegramReauthRequired, parseTelegramRemoteId } from './telegram.service.js'
 
 export interface TelegramStreamGatewayFile {
   providerFileId: string
@@ -39,6 +39,20 @@ interface UpstreamResponse {
   status: number
   headers: Headers
   body: ReadableStream<Uint8Array> | null
+}
+
+/**
+ * Mirror a `TELEGRAM_REAUTH_REQUIRED` 503 into the account state.
+ *
+ * A revoked Telegram session is only discoverable by talking to Telegram,
+ * which now happens inside telegram-stream — so without this the DB reads
+ * `connected` forever while every playback fails. Best-effort and
+ * code-specific: other 503s (service down, control plane unreachable) must
+ * not flag the account.
+ */
+export async function mirrorReauthRequired(providerId: string, upstreamBody: string): Promise<void> {
+  if (!upstreamBody.includes('TELEGRAM_REAUTH_REQUIRED')) return
+  await markTelegramReauthRequired(providerId, 'telegram-stream: session no longer valid').catch(() => {})
 }
 
 export class TelegramStreamGateway {
@@ -105,6 +119,13 @@ export class TelegramStreamGateway {
     }
 
     res.status(upstream.status)
+    if (upstream.status === 503) {
+      const body = upstream.body ? await new Response(upstream.body).text() : ''
+      await mirrorReauthRequired(providerId, body)
+      res.setHeader('Content-Type', 'application/json')
+      res.end(body || JSON.stringify({ code: 'STREAM_UNAVAILABLE', message: 'telegram-stream returned 503.' }))
+      return
+    }
     // Byte-range mechanics come from upstream; logical metadata from here.
     for (const h of ['content-range', 'accept-ranges']) {
       const v = upstream.headers.get(h)

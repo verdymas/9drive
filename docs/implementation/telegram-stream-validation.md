@@ -18,42 +18,40 @@ storage channel. **There are no live credentials in this repo.**
 2. A Telegram storage account is connected (account status
    `connected`, not `reauth_required`).
 
-3. The `telegram-stream` service has a PyroFork session provisioned.
-   This is the **first-time** column write. After a real PyroFork login
-   in the streaming service, the control plane
-   (`PUT /telegram/stream/session`) is hit and the column is populated.
-   For the very first run, this happens lazily: the first stream
-   request triggers a 404 from the control plane, the streaming service
-   surfaces a `STREAM_SESSION_UNAVAILABLE` to the gateway, and the
-   gateway returns 503. **That is expected** for the first run.
+3. No session provisioning step exists. `telegram-stream` fetches
+   `{apiId, apiHash, session}` from the backend on first use
+   (`GET /telegram/stream/credentials/:connectedAccountId`, HMAC-signed,
+   internal network only) and keeps them in memory. A connected 9Drive
+   Telegram account is a streamable one.
 
-   To seed a session out-of-band (operator flow):
+   If playback returns `503 TELEGRAM_REAUTH_REQUIRED`, the stored session
+   has been revoked by Telegram — reconnect the account in the 9Drive UI.
+   The account is flipped to `reauth_required` automatically on the first
+   such failure, so the UI prompts for it. To confirm independently:
 
    ```bash
-   # 1) Export the PyroFork session string from your local Python:
-   python - <<'PY'
-   from pyrogram import Client
-   # Replace with your api_id/api_hash from my.telegram.org.
-   api_id, api_hash = 12345, "0123456789abcdef0123456789abcdef"
-   with Client("session", api_id=api_id, api_hash=api_hash) as app:
-       print(app.export_session_string())
+   # Prints only booleans; never echo a session string.
+   docker compose exec -T telegram-stream python - <<'PY'
+   import asyncio, hashlib, hmac, json, os, time, urllib.request
+   from telethon import TelegramClient
+   from telethon.sessions import StringSession
+   acct = os.environ["ACCT"]           # connected account id
+   secret = os.environ["TELEGRAM_STREAM_INTERNAL_SECRET"]
+   path = f"/telegram/stream/credentials/{acct}"
+   ts = int(time.time())
+   sig = hmac.new(secret.encode(), f"{ts}\nGET\n{path}\n".encode(), hashlib.sha256).hexdigest()
+   req = urllib.request.Request(
+       os.environ["TELEGRAM_STREAM_BACKEND_URL"].rstrip("/") + path,
+       headers={"X-Stream-Timestamp": str(ts), "X-Stream-Signature": sig})
+   c = json.loads(urllib.request.urlopen(req, timeout=15).read())
+   async def main():
+       client = TelegramClient(StringSession(c["session"]), c["apiId"], c["apiHash"])
+       await client.connect()
+       print("authorized =", await client.is_user_authorized())
+       await client.disconnect()
+   asyncio.run(main())
    PY
-
-   # 2) Push it to the control plane (signed):
-   SECRET=$TELEGRAM_STREAM_INTERNAL_SECRET
-   TS=$(date +%s)
-   SIG=$(printf '%s\n%s\n%s\n%s' \
-     "$TS" "PUT" "/telegram/stream/session" "$QUERY" \
-     | openssl dgst -sha256 -hmac "$SECRET" -hex | awk '{print $2}')
-
-   curl -X PUT http://localhost:4000/telegram/stream/session \
-     -H "X-Stream-Timestamp: $TS" \
-     -H "X-Stream-Signature: $SIG" \
-     -H 'Content-Type: application/json' \
-     -d '{"connectedAccountId":"<acct-id>","session":"<pyrofork-session>"}'
    ```
-
-   The control plane responds `{"connectedAccountId":"...","stored":true}`.
 
 ## WebDAV contract (read this if anything else is unclear)
 
@@ -79,8 +77,8 @@ credentials — **no secrets appear in the doc**.
    - Cause no full-file re-download.
 5. **Resume** after pause. Same as seek; new range, no re-login.
 6. **Larger file** (a multi-GB Telegram video). Verify the playback
-   remains stable for 5+ minutes. Watch the queue depth and parallel
-   chunks in `/ready` on the streaming service.
+   remains stable for 5+ minutes. Watch `active_streams` in `/ready` —
+   it must return to 0 after the last seek, not climb.
 7. **Google regression**: play a Google Drive-backed file in the same
    Jellyfin instance. The WebDAV Google path must still work.
 
@@ -109,34 +107,32 @@ credentials — **no secrets appear in the doc**.
 
 ## Metrics to capture
 
-Pull these into `docs/audits/telegram-stream-benchmark.md` (Phase 10
-deliverable) once you have numbers.
+Pull these into `docs/audits/telegram-stream-benchmark.md` (§10) once you
+have numbers.
 
-- TTFB (first byte after seek) — measured by the streaming service's
-  `ttfb_ms` in the `stream_end` JSON line.
-- First chunk latency (Telegram-side).
-- Average Mbps.
-- Peak Mbps.
-- FloodWait count.
-- FILE_REFERENCE refresh count.
-- Cancellation count (after seeks, after pause).
-- Memory peak (RSS of the `telegram-stream` container, via
-  `docker stats telegram-stream`).
+- TTFB (first byte after seek) — from `ttfb_ms` in the `stream_end` JSON line.
+- Average Mbps — from `avg_mbps` in the same line.
+- FloodWait count — `total_flood_waits` in `/ready`.
+- FILE_REFERENCE refresh count — `total_file_reference_refreshes` in `/ready`.
+- Cancellation count — `total_cancellations` in `/ready`.
+- Memory peak — RSS of the `telegram-stream` container, via
+  `docker stats telegram-stream`.
 
 ## If buffering remains
 
-**Do not blindly increase parallelism.** Use the metrics to classify
-the bottleneck:
+**Do not blindly add parallelism.** Reads are sequential by design (one
+512 KiB Telethon request in flight); adding concurrency is an upgrade to
+justify with numbers, not a first response. Classify first:
 
 | Metric that points to… | Symptom |
 |---|---|
-| Slow Telegram | High `first_chunk_latency` AND low `bytes/sec` after the first chunk |
-| Slow internal proxy | High `ttfb_ms` but Telegram-side metrics look fine |
+| Slow Telegram | `ttfb_ms` fine but `avg_mbps` low across the whole stream |
+| Slow internal proxy | High `ttfb_ms` while `avg_mbps` is healthy once flowing |
 | Wrong range | Many `416` responses, or `Content-Range` mismatches in logs |
-| Low throughput | Mbps far below the configured `TELEGRAM_STREAM_PARALLELISM × chunk_size` |
-| Reconnect per seek | `login_count` or `reconnect_count` increases per range; client manager is not being reused |
-| Client abort issues | `cancelled=true` count spikes during normal playback; old range not stopped |
-| Rate limits | `total_flood_waits > 0`; consider lowering parallelism |
+| Sequential ceiling | `avg_mbps` ≈ 512 KiB / round-trip time — this is when prefetch is worth adding |
+| Reconnect per seek | A `TELEGRAM_REAUTH_REQUIRED` or a new client build per range; the client cache is not being reused |
+| Client abort issues | `cancelled=true` on ranges that were not seeked away from |
+| Rate limits | `total_flood_waits > 0`; lower the chunk size before anything else |
 
 ## Deliverable
 

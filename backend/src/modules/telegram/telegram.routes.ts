@@ -12,11 +12,9 @@ import { ingestTelegramAccount } from './telegram-ingest.service.js'
 import { updateTelegramDocumentCaption } from './telegram-caption.service.js'
 import { logicalPathForFileId } from '../files/file-logical-path.js'
 import { env } from '../../config/env.js'
+import { decryptText } from '../../utils/crypto.js'
 import { requireInternalStreamSecret } from './telegram-stream-auth.middleware.js'
-import {
-  readStreamSessionCiphertext,
-  writeStreamSession,
-} from './telegram-stream-session.service.js'
+import { gramjsToTelethonSession } from './telethon-session.js'
 
 export const telegramRouter = Router()
 
@@ -195,40 +193,31 @@ telegramRouter.post('/files/:fileId/sync-caption', requireAuth, async (req: Auth
 
 // ── Telegram stream control plane (internal) ──────────────────────────────
 //
-// The streaming service hits these from the internal Docker network only.
+// The streaming service hits this from the internal Docker network only.
 // Auth is a shared HMAC secret (TELEGRAM_STREAM_INTERNAL_SECRET) via the
-// `requireInternalStreamSecret` middleware. The service is single-tenant
-// per account: it asks for the streaming session ciphertext, decrypts it
-// locally, and re-uploads a fresh PyroFork session if it had to re-login.
+// `requireInternalStreamSecret` middleware. The service holds no database
+// access and no secrets at rest: it asks for one account's credentials and
+// keeps them in memory for the lifetime of its Telegram connection.
 
-const streamSessionSchema = z.object({
-  connectedAccountId: z.string().trim().min(1),
-  session: z.string().trim().min(1),
-})
-
-telegramRouter.get('/stream/session/:connectedAccountId', requireInternalStreamSecret, async (req, res, next) => {
+// The ONLY endpoint that emits Telegram credentials. Internal network only,
+// never logged, never cached to disk. The session is repacked into Telethon's
+// StringSession format — the same four fields, so no second login exists.
+telegramRouter.get('/stream/credentials/:connectedAccountId', requireInternalStreamSecret, async (req, res, next) => {
   try {
     const connectedAccountId = String(req.params.connectedAccountId)
-    const ciphertext = await readStreamSessionCiphertext(prisma, connectedAccountId)
-    if (!ciphertext) {
-      return res.status(404).json({ code: 'STREAM_SESSION_UNAVAILABLE', message: 'No PyroFork session provisioned for this account.' })
+    const config = await prisma.telegramStorageConfig.findFirst({
+      where: { connectedAccountId },
+      select: { apiIdEncrypted: true, apiHashEncrypted: true, sessionEncrypted: true },
+    })
+    if (!config) {
+      return res.status(404).json({ code: 'TELEGRAM_NOT_CONFIGURED', message: 'No Telegram account for this provider.' })
     }
-    return res.json({ connectedAccountId, ciphertext })
+    return res.json({
+      apiId: Number(decryptText(config.apiIdEncrypted)),
+      apiHash: decryptText(config.apiHashEncrypted),
+      session: gramjsToTelethonSession(decryptText(config.sessionEncrypted)),
+    })
   } catch (error) {
-    return next(error)
-  }
-})
-
-telegramRouter.put('/stream/session', requireInternalStreamSecret, async (req, res, next) => {
-  try {
-    const body = streamSessionSchema.parse(req.body)
-    await writeStreamSession(prisma, body.connectedAccountId, body.session)
-    return res.json({ connectedAccountId: body.connectedAccountId, stored: true })
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return res.status(400).json({ code: 'BAD_REQUEST', message: 'Invalid streaming session payload.', details: error.flatten() })
-    }
-    if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
     return next(error)
   }
 })

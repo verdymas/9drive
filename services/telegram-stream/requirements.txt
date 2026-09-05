@@ -2,3 +2,7 @@ fastapi==0.118.0
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
 pydantic-settings==2.7.1
+# Telethon, not PyroFork: its StringSession carries the same four fields as the
+# GramJS session 9Drive already stores, so no second login is needed.
+telethon==1.36.0
+cryptg==0.4.0

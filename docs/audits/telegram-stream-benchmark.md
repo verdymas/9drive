@@ -1,60 +1,34 @@
 # Telegram Stream — Byte Correctness and Throughput Benchmark
 
-Phase 10 deliverable. This document records measured numbers from the
-deterministic fake-client fixtures in `services/telegram-stream/tests/`.
-**No live Telegram account is contacted.** The fixtures reproduce the
-exact shape of `upload.GetFile` responses (chunk-aligned, EOF-handled,
-overrun-trimmed) and the benchmark is a sanity check that the engine
-preserves bytes and stays bounded under load. Live measurements will be
-captured in Phase 11.
+Phase 10 deliverable. This document records what the deterministic
+test suite in `services/telegram-stream/tests/` proves. **No live
+Telegram account is contacted.** Live measurements are Phase 11 and
+require an operator run.
 
-## 1. Byte correctness (Phase 04 fixtures)
+## 1. Byte correctness
 
-All assertions live in `tests/test_byte_streamer.py` and
-`tests/test_prefetched_streamer.py`. They are deterministic and rerun
-on every CI build.
+The range math that silently corrupts playback when it is wrong lives in
+`engine.iter_bytes`. `tests/test_engine.py` pins it against a fake
+Telethon download iterator:
 
-| Case | Range | Engine path | Result |
-|---|---|---|---|
-| Full read | `[0, 10_000)` | 10 × 1024-byte chunks, ordered | bytes match input |
-| First 4 bytes | `[0, 4)` | single 4-byte chunk | exact |
-| Mid-file 4 bytes | `[4_000, 4_004)` | single 4-byte chunk, no chunk alignment | exact |
-| Last 2 bytes | `[9_998, 10_000)` | one short chunk at EOF | exact |
-| Open-ended | `[9_900, 10_000)` | one short chunk at EOF | exact |
-| Overrun | `[0, 4)`, server returns 54 bytes | first 4 emitted | exact |
-| Short read | server returns `""` | hard error | `RangeNotSatisfiable` raised |
-| Truncation | server returns 1 byte for a 16-byte request, not at EOF | hard error | `RangeNotSatisfiable` raised |
+| Case | Assertion |
+|---|---|
+| Trim + early stop | chunks `[AAAA, BBBB, CCCC]`, `length=6` → exactly `AAAABB`, and the iterator is closed (sender released, not leaked) |
+| Short read | fewer bytes than the recorded size → `SHORT_READ` / `502`, **never** a truncated body under a 200/206 |
+| Offset is bytes | `start=17` reaches Telethon as `offset=17`, not a chunk index |
+| request_size clamp | a 4 MiB configured chunk reaches Telethon as `512 * 1024` (its own cap) |
+| Peer marker | `_peer("4458806678") == -1004458806678`, idempotent on the already-marked form |
 
-**A 206 status alone is not success.** Every test verifies the byte
-sequence explicitly. No whole-file download is performed: the largest
-range tested is 10_000 bytes.
+`tests/test_stream_contract.py` covers the HTTP layer with the same
+determinism: a conftest fixture replaces `resolve_document` and
+`iter_bytes` with a generator where `byte i == i % 256`, so the handler's
+real range math, real pre-commit resolution and real header/status logic
+are all under test while MTProto is stubbed.
 
-## 2. Ordered output under parallelism (Phase 05)
+**A 206 status alone is not success.** Every contract test asserts the
+exact byte sequence.
 
-`test_ordered_output_under_parallelism` in `tests/test_prefetched_streamer.py`:
-
-- Data: 2 MiB deterministic.
-- chunk_size: 64 KiB → 32 chunks.
-- prefetch: 3, parallelism: 2.
-- Per-chunk artificial latency: 2 ms.
-- Result: received bytes == source bytes; the fetcher saw calls in
-  sequential offset order (the engine enforces ordered emission via the
-  per-chunk sequence index, even though the producer launches
-  concurrently).
-
-## 3. Cancellation
-
-`test_cancellation_stops_downloads`:
-
-- Data: 1 MiB.
-- chunk_size: 16 KiB, prefetch: 3, parallelism: 2.
-- Per-chunk artificial latency: 5 ms.
-- Consumer reads 2 chunks, then sets the stop event.
-- Result: the producer's `inflight` dict drains, no new `fetcher` calls
-  are made after `stop.set()`. Bound asserted: `len(fetcher.calls) < 60`
-  (we observed single-digit call counts in practice).
-
-## 4. HTTP semantics (Phase 01 contract tests)
+## 2. HTTP semantics
 
 `tests/test_stream_contract.py`:
 
@@ -72,37 +46,47 @@ range tested is 10_000 bytes.
 
 No `206` is ever returned for a non-satisfiable range.
 
-## 5. Memory
+## 3. Cancellation
 
-`stream_range` and `stream_range_prefetched` never hold more than
-`prefetch × chunk_size` bytes in memory at a time:
+Cancellation is structural rather than flag-driven, so it is asserted by
+construction rather than by a timing test: Starlette throws
+`CancelledError` into the streaming generator on client disconnect, the
+generator's `except` marks `cancelled` and increments the counter, and
+its `finally` closes the Telethon download iterator — which releases the
+sender and stops the in-flight request.
 
-- `stream_range` yields one chunk at a time.
-- `stream_range_prefetched` has a bounded `asyncio.Queue(maxsize=prefetch)`
-  and an in-process results buffer keyed by sequence index. The
-  consumer drains in order; the producer blocks on `queue.put` when the
-  consumer is slow — that is the backpressure signal.
+The bookkeeping deliberately does **not** live in a Starlette background
+task: those are skipped on client disconnect, which is the common case
+here (every Jellyfin seek abandons the previous range), and the
+active-stream gauge would climb forever with no `stream_end` line for the
+abandoned range. `test_engine.py::test_trims_to_exact_length_and_stops_early`
+asserts the close in the normal-completion path.
 
-The Python heap therefore does not grow with the file size. This is
-asserted indirectly by the test that runs the prefetched streamer over
-2 MiB and emits 2 MiB exactly (no concatenation, no growth).
+## 4. Memory
 
-## 6. Session reuse
+`iter_bytes` yields one Telethon chunk at a time and never concatenates,
+so the Python heap does not grow with the file size — at most one
+`request_size` (≤ 512 KiB) buffer per active stream. There is no queue
+and no prefetch buffer to bound: reads are sequential.
+
+## 5. Session reuse
 
 `tests/test_client_manager.py` asserts:
 
 - First `get_client(provider_id)` builds + starts the underlying client
   once.
 - Subsequent calls return the same object (no factory call, no
-  `start`).
+  `start`) — **no login per range, so a seek does not re-authenticate**.
 - A stopped client triggers one reconnect; `reconnect_count` is bumped.
 - `invalidate` stops the client and removes the entry; a subsequent
-  `get_client` is a fresh build.
+  `get_client` is a fresh build. `engine.resolve_document` calls this on
+  a `TELEGRAM_REAUTH_REQUIRED` classification so a rejected auth key is
+  not reused.
 - `shutdown` stops all clients; calling it twice is a no-op.
 
-## 7. Google regression
+## 6. Google regression
 
-Full backend vitest suite: **1017 tests pass** (80 files). Includes:
+Full backend vitest suite: **1018 tests pass** (81 files). Includes:
 
 - `src/modules/files/stream-google-file.test.ts` (Google path).
 - `src/modules/s3/*.test.ts` (S3 path).
@@ -110,7 +94,7 @@ Full backend vitest suite: **1017 tests pass** (80 files). Includes:
   regression: WebDAV read path never loads the metadata crypto module,
   regardless of whether the streaming service is configured).
 
-## 8. Session-format security contract
+## 7. Session-format security contract
 
 `tests/test_cross_side_contract.py` (Python) and
 `src/modules/telegram/telegram-stream-auth.test.ts` (Node) pin the
@@ -119,11 +103,15 @@ recompute the same 64-char hex digest for the same inputs. If either
 side changes the canonical string, both tests fail in lockstep —
 intentional: the contract is bilateral.
 
-## 9. Limitations of this benchmark
+`src/modules/telegram/telethon-session.test.ts` pins the GramJS →
+Telethon session repack field by field, including the 352-byte payload
+length that Telethon's parser uses to decide IPv4 vs IPv6.
 
-These numbers are measured against a deterministic fake client, not
-against a real Telegram DC. Live measurements (TTFB, peak Mbps, real
-FloodWait) require:
+## 8. Limitations of this benchmark
+
+Every number here comes from a deterministic fake, not a real Telegram
+DC. There are **no measured throughput numbers in this document.** Live
+measurement requires:
 
 - A real Telegram user session + storage channel.
 - A real Telegram-backed file of known size.
@@ -131,27 +119,31 @@ FloodWait) require:
   (e.g. a residential connection, not a corporate firewall that resets
   long-poll sockets).
 
-Phase 11 captures the live numbers. The Python service exposes
-`/ready` and emits a `stream_end` JSON line per request with
-`ttfb_ms`, `avg_mbps`, `bytes`, `chunks`, `cancelled`, `status`, and
-`error` so live numbers can be aggregated from logs.
+Phase 11 captures the live numbers. The service exposes `/ready` and
+emits a `stream_end` JSON line per request with `ttfb_ms`, `avg_mbps`,
+`bytes`, `chunks`, `cancelled`, `status` and `error` so live numbers can
+be aggregated from logs.
 
-## 10. Summary
+## 9. Summary
 
 | Area | Status | Where to verify |
 |---|---|---|
-| Byte correctness (200/206/416) | PASS | `test_byte_streamer.py`, `test_stream_contract.py` |
-| Ordered output under parallelism | PASS | `test_ordered_output_under_parallelism` |
-| Cancellation | PASS | `test_cancellation_stops_downloads` |
-| HTTP semantics | PASS | `test_stream_contract.py` (9 cases) |
-| Memory bounded | PASS | design (no concat) + test bytes in == bytes out |
-| Session reuse | PASS | `test_client_manager.py` (6 cases) |
-| Secret redaction | PASS | `test_observability.py` (5 cases) |
+| Byte correctness (trim, offset, clamp) | PASS | `test_engine.py` (4 cases) |
+| Short read is an error, not a truncated body | PASS | `test_engine.py` |
+| HTTP semantics (200/206/416) | PASS | `test_stream_contract.py` (9 cases) |
+| Cancellation releases the sender | PASS | structural (generator `finally`) + `test_engine.py` |
+| Memory bounded | PASS | design: one chunk at a time, no concat |
+| Session reuse, no login per range | PASS | `test_client_manager.py` (6 cases) |
+| Secret redaction | PASS | `test_observability.py` (7 cases) |
 | Google/S3/WebDAV regression | PASS | full vitest suite (1017 tests) |
-| Cross-side contract | PASS | `test_cross_side_contract.py` + Node auth test |
-| Live throughput | DEFERRED to Phase 11 | requires real Telegram credentials |
+| Cross-side HMAC contract | PASS | `test_cross_side_contract.py` + Node auth test |
+| Session repack | PASS | `telethon-session.test.ts` |
+| Reauth mirrored into the account | PASS | live WebDAV probe (§12) + `telegram-stream-gateway.test.ts` |
+| Live throughput | NOT MEASURED | requires real Telegram credentials (Phase 11) |
 
-## 11. Live validation (Phase 11)
+Service suite total: **41 pytest tests**. Backend: **1018 vitest tests**.
+
+## 10. Live validation (Phase 11)
 
 Live Jellyfin + rclone validation requires a real Telegram user
 account, a real storage channel, and a real WebDAV deployment with
@@ -163,9 +155,7 @@ metrics, and appends the results here.
 Capture fields:
 
 - TTFB (ms) — from `ttfb_ms` in `stream_end` JSON.
-- First chunk latency (ms) — from the first chunk in a new range.
 - Average Mbps — from `avg_mbps` in `stream_end` JSON.
-- Peak Mbps — from `/ready` output (sum of bytes over short windows).
 - FloodWait count — from `total_flood_waits` in `/ready`.
 - FILE_REFERENCE refresh count — from `total_file_reference_refreshes` in `/ready`.
 - Cancellation count — from `total_cancellations` in `/ready`.
@@ -173,26 +163,47 @@ Capture fields:
 
 If a real run produces numbers, replace this section with a table:
 
-| Scenario | TTFB | First chunk | Avg Mbps | Peak Mbps | FloodWaits | Cancellations |
-|---|---|---|---|---|---|---|
-| (filled by operator) | | | | | | |
+| Scenario | TTFB | Avg Mbps | FloodWaits | Cancellations | RSS peak |
+|---|---|---|---|---|---|
+| (filled by operator) | | | | | |
 
-## 12. Final summary (Phase 12)
+## 11. Final summary (Phase 12)
 
 ```
-telegram-stream:        PASS (skeleton, auth, range, prefetch, observability, compose)
+telegram-stream:        PASS (skeleton, auth, range, observability, compose)
 Internal Auth:          PASS (HMAC, constant-time, Range-in-canonical, ±30s skew)
 Telegram Client Reuse:  PASS (one client per providerId, no login per range)
 Range Streaming:        PASS (200/206/416, exact bytes, no whole-file download)
-Prefetch:               PASS (bounded queue, ordered output, 1 MiB / prefetch=3 / parallelism=2)
-Backpressure:           PASS (queue.put blocks when consumer is slow)
-Cancellation:           PASS (stop_event cancels producer, no post-abort download)
+Prefetch:               N/A  (sequential reads; prototype deleted unused — see §4)
+Backpressure:           PASS (one chunk at a time; the generator yields at consumer pace)
+Cancellation:           PASS (CancelledError → generator finally → download iterator closed)
 WebDAV Telegram:        PASS (gateway wired into streamProviderFileToReadable + dispatcher)
-Jellyfin Playback:      DEFERRED (live validation in Phase 11, requires real Telegram)
-Jellyfin Seek:          DEFERRED (same)
-rclone:                 DEFERRED (same)
-Google Regression:      PASS (1017 backend tests; webdav-no-decrypt invariant holds)
+Jellyfin Playback:      NOT VERIFIED (needs a live, non-revoked Telegram session)
+Jellyfin Seek:          NOT VERIFIED (same)
+rclone:                 NOT VERIFIED (same)
+Google Regression:      PASS (1018 backend tests; webdav-no-decrypt invariant holds)
 Security:               PASS (internal-only, signed, no secret logs, redaction tests, license review)
 Docs:                   PASS (audit + benchmark + license review + curl runbook + validation runbook)
-Overall:                HEALTHY for the deterministic in-process scope; live numbers require Phase 11.
+Overall:                Deterministic scope is HEALTHY. Real playback is unproven: the local
+                        session is revoked (503 TELEGRAM_REAUTH_REQUIRED), so an operator must
+                        reconnect the account or run Phase 11 against production.
 ```
+
+## 12. Live end-to-end probe (this repo, revoked session)
+
+The full WebDAV→gateway→telegram-stream→Telegram path was exercised against
+the real deployment, so everything up to the MTProto call is proven live
+rather than by fake. File: `/webdav/NS/id/<name>.mkv`, 321050482 bytes,
+`telegram://4458806678/41`, account `fbc151a0-…`.
+
+| Request | Result | What it proves |
+|---|---|---|
+| `HEAD` | `200`, `Content-Length: 321050482`, `Content-Type: video/matroska` | PROPFIND/HEAD stay DB-only; no Telegram call, no crypto load |
+| `GET Range: bytes=0-1023` | `503 TELEGRAM_REAUTH_REQUIRED`, JSON body, no bytes | routing reaches Telegram; a dead session is a real status, **not** a 206 with junk |
+| account row after that GET | `connected` → `reauth_required`, `TELEGRAM_SESSION_INVALID`, `telegram-stream: session no longer valid` | `mirrorReauthRequired` fires through the WebDAV path, so the UI can prompt for reconnect |
+
+**Not proven by this probe:** actual Matroska bytes (`0x1A45DFA3` at offset
+0), 206/416 status selection end-to-end, TTFB, throughput, Jellyfin seek.
+All of those need a non-revoked session — the 416 cases also return 503
+here because resolution happens before the range is committed, which is
+the intended order. Re-run this table after reconnecting the account.

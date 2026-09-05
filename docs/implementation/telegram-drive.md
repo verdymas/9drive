@@ -29,24 +29,30 @@ database stays the source of truth for the virtual file tree — Telegram is
 - `backend/src/modules/telegram/telegram-stream-auth.ts` +
   `telegram-stream-auth.middleware.ts` — HMAC-SHA256 signer for backend
   requests and the symmetric control-plane verifier.
-- `backend/src/modules/telegram/telegram-stream-session.service.ts` —
-  storage for the PyroFork streaming session ciphertext (column
-  `stream_session_encrypted`). The streaming service is the single
-  writer; the backend is the single reader. Invalidation runs from
-  `markTelegramReauthRequired` so a revoked teleproto session cannot
-  persist for telegram-stream.
+- `backend/src/modules/telegram/telethon-session.ts` — repacks the stored
+  teleproto/GramJS `StringSession` into Telethon's format. Both carry the
+  same four fields (`dc_id | ip | port | auth_key`), so the streaming
+  service needs no separate login and no second stored session. The
+  repack is served by `GET /telegram/stream/credentials/:id`, the only
+  endpoint that ever emits Telegram credentials — internal network only,
+  HMAC-signed, never logged.
 - `services/telegram-stream/` — internal FastAPI byte-range service.
   See `docs/implementation/telegram-stream.md` and
   `docs/audits/telegram-stream-architecture-audit.md` for the full
   architecture. Key entry points: `app/main.py` (FastAPI app),
   `app/api/stream.py` (GET /v1/stream), `app/api/health.py` (liveness
   + readiness), `app/security/internal_auth.py` (HMAC verification),
-  `app/telegram/client_manager.py` (reusable PyroFork client, no login
+  `app/telegram/credentials.py` (control-plane fetch, in memory only),
+  `app/telegram/client_manager.py` (reusable Telethon client, no login
   per range), `app/telegram/file_resolver.py` (channel+message →
-  document with stale-FILE_REFERENCE refresh), `app/telegram/byte_streamer.py`
-  (range → exact bytes via `upload.GetFile`), `app/telegram/prefetched_streamer.py`
-  (bounded prefetch, ordered output, cancellation), `app/observability.py`
+  document with stale-FILE_REFERENCE refresh), `app/telegram/engine.py`
+  (range → exact bytes via Telethon `iter_download`, byte offsets, stops at
+  the requested end; resolves before committing a status so a revoked
+  session is a 503 and not an empty 206), `app/observability.py`
   (structured JSON logs, secret redaction, per-stream metrics).
+  Reads are sequential — one 512 KiB Telethon request in flight per
+  stream. If a measured run shows throughput below the playback bitrate,
+  the upgrade is a bounded-parallel prefetch in front of `iter_bytes`.
 - `backend/src/modules/telegram/telegram-channel.service.ts` — explicit storage
   channel setup: list candidate private channels, create a new private channel,
   or select an existing one. Every selection is capability-probed (read/write/

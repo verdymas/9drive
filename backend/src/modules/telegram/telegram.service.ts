@@ -641,14 +641,6 @@ export async function markTelegramReauthRequired(accountId: string, reason?: str
   if (affected.count > 0) {
     console.info('[telegram-auth] reauth_required', JSON.stringify({ event: 'telegram.auth.reauth_required', connectedAccountId: accountId, provider: 'telegram', authStateTransition: 'connected->reauth_required' }))
   }
-  // Best-effort: drop the streaming session so a revoked teleproto session
-  // cannot be used by telegram-stream after a reauth.
-  try {
-    const { invalidateStreamSession } = await import('./telegram-stream-session.service.js')
-    await invalidateStreamSession(prisma, accountId)
-  } catch {
-    // ignore — invalidation is allowed to be lazy.
-  }
 }
 
 /**

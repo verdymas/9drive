@@ -222,9 +222,11 @@ model TelegramStorageConfig {
   apiIdEncrypted     String           @map("api_id_encrypted") @db.Text
   apiHashEncrypted   String           @map("api_hash_encrypted") @db.Text
   sessionEncrypted   String           @map("session_encrypted") @db.Text
-  // PyroFork (Python) byte-streaming session, encrypted with the same TOKEN_ENCRYPTION_KEY.
-  // Provisioned at auth-finalize time; absent = streaming is degraded (Telegram reads via the
-  // legacy full-GET path until the next reconnect). Never logged. Never exposed via API.
+  // DEPRECATED, always NULL, no reader and no writer. It existed for a second
+  // (PyroFork) session, which turned out to be unnecessary: Telethon's
+  // StringSession carries the same four fields as the stored teleproto one, so
+  // `sessionEncrypted` is repacked on the fly (telethon-session.ts). Kept only
+  // because dropping a column needs its own migration; safe to remove.
   streamSessionEncrypted String?      @map("stream_session_encrypted") @db.Text
   // Login phone, encrypted like every other Telegram credential. Held ONLY to
   // label the account in the UI (masked to prefix + last 4); never serialized.

@@ -16,6 +16,7 @@ import type { File as FileRecord, ConnectedAccount } from '@prisma/client'
 
 import { env } from '../../config/env.js'
 import { parseTelegramRemoteId } from './telegram.service.js'
+import { mirrorReauthRequired } from './telegram-stream-gateway.js'
 import { signStreamRequest } from './telegram-stream-auth.js'
 
 type FileWithAccount = FileRecord & { connectedAccount: ConnectedAccount }
@@ -65,6 +66,14 @@ export async function fetchTelegramStreamAsReadable(
 
   const abort = new AbortController()
   const r = await fetch(url, { method: 'GET', headers: upstreamHeaders, signal: abort.signal })
+
+  // Same reauth mirroring as the REST gateway — one implementation, two
+  // callers. `headers: {}` because a 503 body is JSON, not a byte range.
+  if (r.status === 503) {
+    const body = await r.text()
+    await mirrorReauthRequired(providerId, body)
+    return { status: r.status, headers: {}, body: Readable.from([body]) }
+  }
 
   // Translate the upstream Headers into a plain dict. Lowercased keys.
   const headers: Record<string, string> = {}

@@ -1,13 +1,15 @@
 """Stream endpoint.
 
-Contract (this phase; the engine is a deterministic byte stub for now):
+Contract:
 - GET /v1/stream?providerId=...&channelId=...&messageId=...&knownSize=N
 - Reads the Range header (single byte-range only; multipart is out of scope per phase spec).
 - 200 full read, 206 valid range, 416 invalid range.
 - Never a fake 206.
-- Requires the signed internal auth (Phase 02). At Phase 01 the auth is wired but
-  TELEGRAM_STREAM_INTERNAL_SECRET may be empty in tests; the dependency allows that
-  only in non-prod (see core/config.py).
+- Requires the signed internal auth.
+
+The document is resolved (and the Telegram session proven live) *before* the
+response is committed, so a dead session or a deleted message becomes a real
+status code instead of a well-formed 206 carrying nothing.
 
 Observability (Phase 08):
   - Each request gets a `request_id` (carried via `X-Request-Id` if the
@@ -17,21 +19,30 @@ Observability (Phase 08):
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, Depends, Query, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 from app.core.errors import AppError
-from app.observability import StreamMetrics, dec_active, emit, emit_error, inc_active
+from app.observability import (
+    StreamMetrics,
+    dec_active,
+    emit,
+    emit_error,
+    inc_active,
+    inc_cancellation,
+)
 from app.security.internal_auth import require_internal_signature
+from app.telegram.engine import TelethonAdapter, iter_bytes, resolve_document
+from app.telegram.file_resolver import ResolvedLocation
 
 router = APIRouter()
 
 _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
-_BODY_CHUNK = 64 * 1024  # 64 KiB wire chunks; engine chunk size is configurable in core/config.py
 
 
 def _resolve_range(range_header: str | None, total: int) -> tuple[int, int] | None:
@@ -72,18 +83,47 @@ def _resolve_range(range_header: str | None, total: int) -> tuple[int, int] | No
     return start, end
 
 
-async def _stub_bytes(total: int, start: int, length: int, metrics: StreamMetrics) -> AsyncGenerator[bytes, None]:
-    """Deterministic byte fixture: byte i = i % 256. Phase 01 only; replaced by the engine in Phase 04."""
-    i = start
-    remaining = length
-    while remaining > 0:
-        n = min(_BODY_CHUNK, remaining)
-        chunk = bytes((b + i) & 0xFF for b in range(n))  # type: ignore[arg-type]
-        metrics.mark_first_byte()
-        metrics.add_chunk(n)
-        yield chunk
-        i += n
-        remaining -= n
+async def _body(
+    client: TelethonAdapter,
+    location: ResolvedLocation,
+    *,
+    start: int,
+    length: int,
+    status: int,
+    metrics: StreamMetrics,
+) -> AsyncGenerator[bytes, None]:
+    """Stream the range and own the stream's bookkeeping.
+
+    Finalization lives in `finally` rather than a Starlette background task:
+    a background task is skipped when the client disconnects, which is the
+    common case here (every Jellyfin seek abandons the previous range), and
+    the active-stream gauge would drift up forever.
+
+    Cancellation needs no stop flag either — Starlette throws CancelledError
+    into this generator, which unwinds `iter_bytes` and closes the download
+    iterator, releasing the Telegram sender.
+    """
+    inc_active()
+    try:
+        async for chunk in iter_bytes(client, location, start=start, length=length, metrics=metrics):
+            yield chunk
+    except asyncio.CancelledError:
+        metrics.cancelled = True
+        inc_cancellation()
+        raise
+    except AppError as exc:
+        metrics.error = exc.code
+        emit_error("stream_failed", request_id=metrics.request_id, code=exc.code, status=exc.status)
+        raise
+    except Exception as exc:
+        # Headers are already sent, so the status cannot change — but an
+        # undiagnosable torn connection is worse than a logged one.
+        metrics.error = type(exc).__name__
+        emit_error("stream_failed", request_id=metrics.request_id, code=type(exc).__name__)
+        raise
+    finally:
+        dec_active()
+        metrics.finish(status, cancelled=metrics.cancelled, error=metrics.error)
 
 
 @router.get("/v1/stream")
@@ -115,7 +155,6 @@ async def stream(
         range_start=rng[0] if rng else 0,
         range_end=rng[1] if rng else knownSize - 1,
     )
-    inc_active()
     emit(
         "stream_start",
         request_id=request_id,
@@ -126,48 +165,32 @@ async def stream(
         range=range_header,
     )
 
-    if rng is None:
-        body = _stub_bytes(knownSize, 0, knownSize, metrics)
-        headers = {
-            "Accept-Ranges": "bytes",
-            "Content-Length": str(knownSize),
-            "X-Request-Id": request_id,
-        }
+    # Resolve BEFORE committing a status: a revoked session or a deleted
+    # message must become 503/404, never a well-formed 206 carrying nothing.
+    try:
+        client, location = await resolve_document(
+            provider_id=providerId, channel_id=channelId, message_id=int(messageId or 0)
+        )
+    except AppError as exc:
+        emit_error("stream_resolve_failed", request_id=request_id, code=exc.code, status=exc.status)
+        raise
+    except ValueError as exc:
+        raise AppError("INVALID_MESSAGE_ID", "messageId must be an integer.", 400) from exc
 
-        async def finalize() -> None:
-            dec_active()
-            metrics.finish(200)
-
-        response = StreamingResponse(body, status_code=200, headers=headers, media_type="application/octet-stream")
-        response.background = finalize  # type: ignore[attr-defined]
-        return response
-
-    start, end = rng
+    start, end = rng if rng is not None else (0, knownSize - 1)
     length = end - start + 1
-    body = _stub_bytes(knownSize, start, length, metrics)
+    status = 206 if rng is not None else 200
     headers = {
         "Accept-Ranges": "bytes",
-        "Content-Range": f"bytes {start}-{end}/{knownSize}",
         "Content-Length": str(length),
         "X-Request-Id": request_id,
     }
+    if rng is not None:
+        headers["Content-Range"] = f"bytes {start}-{end}/{knownSize}"
 
-    async def finalize() -> None:
-        dec_active()
-        metrics.finish(206)
-
-    response = StreamingResponse(body, status_code=206, headers=headers, media_type="application/octet-stream")
-    response.background = finalize  # type: ignore[attr-defined]
-    return response
-
-
-# Exposed for the global error handler; 416 must include Content-Range per RFC 7233.
-async def _range_not_satisfiable_handler(_: Request, exc: AppError) -> JSONResponse:
-    if exc.code == "RANGE_NOT_SATISFIABLE":
-        total = int(exc.details.get("total", 0)) if isinstance(exc.details, dict) else 0
-        return JSONResponse(
-            status_code=416,
-            content={"error": {"code": exc.code, "message": exc.message}},
-            headers={"Content-Range": f"bytes */{total}"},
-        )
-    return JSONResponse(status_code=exc.status, content={"error": {"code": exc.code, "message": exc.message}})
+    return StreamingResponse(
+        _body(client, location, start=start, length=length, status=status, metrics=metrics),
+        status_code=status,
+        headers=headers,
+        media_type="application/octet-stream",
+    )

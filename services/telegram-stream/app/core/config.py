@@ -18,10 +18,13 @@ class Settings(BaseSettings):
     # HMAC shared secret with the 9Drive backend. Required in production.
     internal_secret: str = ""
 
-    # Tuning. Conservative defaults; tune only after Phase 10/11 measurements.
-    chunk_size_bytes: int = 1 * 1024 * 1024  # 1 MiB
-    prefetch: int = 3
-    parallelism: int = 2
+    # 9Drive backend base URL, for the credentials control plane
+    # (e.g. http://backend:4000). Required in production.
+    backend_url: str = ""
+
+    # Tuning. Telethon floors a download request to 4 KiB and caps it at
+    # 512 KiB, so 512 KiB is both the default and the ceiling that matters.
+    chunk_size_bytes: int = 512 * 1024
     log_level: str = "info"
 
     # HMAC clock-skew window in seconds.

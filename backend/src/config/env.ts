@@ -162,10 +162,6 @@ const envSchema = z.object({
   TELEGRAM_STREAM_INTERNAL_SECRET: z.string().default(''),
   // HMAC clock-skew window. Must match telegram-stream's setting.
   TELEGRAM_STREAM_SIGNATURE_MAX_SKEW_SECONDS: z.coerce.number().int().min(5).max(300).default(30),
-  // Streaming tunables. Conservative defaults; tune after Phase 10 measurement.
-  TELEGRAM_STREAM_CHUNK_SIZE_BYTES: z.coerce.number().int().min(16 * 1024).max(16 * 1024 * 1024).default(1 * 1024 * 1024),
-  TELEGRAM_STREAM_PREFETCH: z.coerce.number().int().min(1).max(16).default(3),
-  TELEGRAM_STREAM_PARALLELISM: z.coerce.number().int().min(1).max(8).default(2),
 })
 
 export const env = envSchema.parse(process.env)

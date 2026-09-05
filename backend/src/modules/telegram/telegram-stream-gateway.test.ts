@@ -14,6 +14,7 @@ vi.mock('../../config/env.js', () => ({
 }))
 
 vi.mock('./telegram.service.js', () => ({
+  markTelegramReauthRequired: vi.fn(async () => {}),
   parseTelegramRemoteId: (id: string) => {
     // telegram://<channel>/<message>
     const [, channelId, messageId] = id.match(/^telegram:\/\/([^/]+)\/(\d+)$/) ?? []
@@ -209,5 +210,40 @@ describe('telegramStreamGateway.streamFile', () => {
 
   it('isTelegramStreamConfigured returns true when both env vars are set', () => {
     expect(isTelegramStreamConfigured()).toBe(true)
+  })
+
+  // The reauth mirroring is the only thing on the read path that writes to the
+  // DB, so its guard has to be exact: a revoked session must flag the account,
+  // and any other 503 (service down, control plane unreachable) must not.
+  it('flags the account only on a TELEGRAM_REAUTH_REQUIRED 503', async () => {
+    const { markTelegramReauthRequired } = await import('./telegram.service.js')
+    const mock = vi.mocked(markTelegramReauthRequired)
+
+    for (const [body, shouldFlag] of [
+      [JSON.stringify({ error: { code: 'TELEGRAM_REAUTH_REQUIRED' } }), true],
+      [JSON.stringify({ error: { code: 'STREAM_NOT_CONFIGURED' } }), false],
+    ] as const) {
+      mock.mockClear()
+      fetchMock.mockResolvedValueOnce(
+        makeFetchResponse({
+          status: 503,
+          body: new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(new TextEncoder().encode(body))
+              c.close()
+            },
+          }),
+        }),
+      )
+      const res = new FakeResponse()
+      await telegramStreamGateway.streamFile(
+        { providerFileId: 'telegram://-1001/42', connectedAccountId: 'acct-1', sizeBytes: 5 },
+        undefined,
+        res as unknown as import('express').Response,
+      )
+      expect(res.statusCode).toBe(503)
+      expect(mock).toHaveBeenCalledTimes(shouldFlag ? 1 : 0)
+      if (shouldFlag) expect(mock.mock.calls[0][0]).toBe('acct-1')
+    }
   })
 })

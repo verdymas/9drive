@@ -19,7 +19,6 @@ from typing import Any
 REDACT_KEYS = {
     "session",
     "session_string",
-    "pyrofork_session",
     "stream_session",
     "api_id",
     "api_hash",
@@ -37,7 +36,6 @@ REDACT_KEYS = {
 # Substrings (case-insensitive) that mark a value as needing redaction
 # even if the field name is not in REDACT_KEYS.
 REDACT_VALUE_NEEDLES = (
-    "pyrofork",
     "telegram-stream-internal",
     "session_string",
     "otp",
@@ -103,10 +101,6 @@ class StreamMetrics:
     last_byte_at: float | None = None
     bytes_emitted: int = 0
     chunks: int = 0
-    parallel_chunks: int = 0
-    queue_depth: int = 0
-    file_reference_refreshes: int = 0
-    flood_waits: int = 0
     cancelled: bool = False
     error: str | None = None
     status: int | None = None
@@ -139,7 +133,6 @@ class StreamMetrics:
             range=[self.range_start, self.range_end],
             bytes=self.bytes_emitted,
             chunks=self.chunks,
-            parallel_chunks=self.parallel_chunks,
             duration_ms=int(duration * 1000),
             ttfb_ms=int(ttfb * 1000) if ttfb is not None else None,
             avg_mbps=round(avg_mbps, 3),

@@ -136,13 +136,32 @@ return base64.urlsafe_b64encode(packed).decode().rstrip("=")
 256-byte auth key. A GramJS session has none of those and cannot be fabricated into one; PyroFork's
 `MemoryStorage` rejects an empty session and forces a re-login.
 
-**Approved strategy (Phase 02): provision a PyroFork session at auth-finalize time.** The backend owns
-Telegram auth + encryption; at `finalizeTelegramAuth` (telegram-auth.service.ts:248) it will also obtain a
-PyroFork-importable session string (`Client.export_session_string()` after a successful connect/login) and
-store it encrypted in a new `TelegramStorageConfig.streamSessionEncrypted` column. `telegram-stream` holds
-the session in memory only and never reads MySQL itself. The 9Drive DB remains the single source of truth.
-Failure to provision does not break the connect path — it only degrades streaming, surfaced as a clear
-error to the user.
+### Superseded during implementation: Telethon removes the whole problem
+
+The conclusion above holds for PyroFork and only for PyroFork. **Telethon's `StringSession` carries exactly
+the four fields the GramJS one carries**, so the credential 9Drive already stores converts losslessly and no
+second session, no second login and no new column are needed:
+
+```python
+# telethon/sessions/string.py
+CURRENT_VERSION = '1'
+_STRUCT_PREFORMAT = '>B{}sH256s'      # dc_id | ip (4 or 16 bytes) | port | auth_key
+ip_len = 4 if len(string) == 352 else 16
+```
+
+Verified end to end: the stored session decodes to `dcId=5, addr=91.108.56.161, port=443, authKey=256B`,
+repacks (`backend/src/modules/telegram/telethon-session.ts`) to a 353-char string, and Telethon's own parser
+reads back `dc_id=5 / server_address / port=443 / auth_key=256B` with `save() == input`.
+
+**Implemented strategy: no provisioning at all.** The service asks the backend for
+`{apiId, apiHash, session}` over the existing signed control plane
+(`GET /telegram/stream/credentials/:connectedAccountId`), repacked at request time from
+`sessionEncrypted`, held in memory for the lifetime of the Telegram connection, never persisted and never
+logged. This deletes the Phase-02 provisioning subsystem (`telegram-stream-session.service.ts`, the
+`PUT /stream/session` writer, the `finalizeTelegramAuth` hook) and leaves
+`TelegramStorageConfig.streamSessionEncrypted` unused. Two PyroFork traps also disappear:
+`stream_media`/`get_file` addressing by chunk *index* rather than byte offset, and
+`MAX_CONCURRENT_TRANSMISSIONS = 1` serializing parallel fetches.
 
 ## 8. Security boundary
 
@@ -163,8 +182,8 @@ The internal API surface between 9Drive backend and `telegram-stream` is intenti
   only signs for `File` rows it just resolved from the DB (i.e. files owned by the requesting user).
 
 `webdav-no-decrypt.test.ts` (passing at HEAD) asserts that the WebDAV read path loads **no** crypto module
-— this guarantee is preserved. The new encryption (PyroFork session at rest) lives in the auth path, not the
-read path.
+— this guarantee is preserved. Session decryption happens in the control-plane route
+(`GET /telegram/stream/credentials/:id`), which is not on the read path.
 
 ## 9. Target architecture
 
@@ -180,13 +199,13 @@ StorageReadRouter (existing files/stream-file.ts:10 dispatcher)
                       ↓
             signed internal HTTP (HMAC)
                       ↓
-                telegram-stream (NEW, FastAPI/PyroFork)
+                telegram-stream (NEW, FastAPI/Telethon)
                       ↓
             ClientManager (per-providerId, reuse; no login/range)
                       ↓
             file/media session cache
                       ↓
-            range byte streamer (raw upload.GetFile, ordered, bounded)
+            range byte streamer (Telethon iter_download, byte offsets, stops at the requested end)
                       ↓
                 Telegram MTProto
 ```
@@ -213,20 +232,18 @@ New:
 - `services/telegram-stream/app/api/{health.py,stream.py}`
 - `services/telegram-stream/app/core/{config.py,errors.py}`
 - `services/telegram-stream/app/security/internal_auth.py`
-- `services/telegram-stream/app/telegram/{client_manager.py,file_resolver.py,byte_streamer.py}`
+- `services/telegram-stream/app/telegram/{client_manager.py,file_resolver.py,engine.py,credentials.py}`
 - `services/telegram-stream/tests/...`
 - `services/telegram-stream/Dockerfile`, `pyproject.toml`, `requirements.txt`
 - `docs/audits/telegram-stream-benchmark.md` (Phase 10)
 - `backend/src/modules/telegram/telegram-stream-gateway.ts` (+ `.test.ts`)
-- `backend/src/modules/telegram/telegram-stream-session.service.ts` (+ `.test.ts`)
-- `backend/prisma/migrations/<ts>_telegram_stream_session/migration.sql`
+- `backend/src/modules/telegram/telethon-session.ts` (+ `.test.ts`)
 
 Modified:
 
-- `backend/prisma/schema.prisma` (new `streamSessionEncrypted` column)
 - `backend/src/config/env.ts` (new env vars)
-- `backend/src/modules/telegram/telegram-auth.service.ts` (provision hook at finalizeTelegramAuth)
-- `backend/src/modules/telegram/telegram.service.ts` (invalidate on reauth_required)
+- `backend/src/modules/telegram/telegram.routes.ts` (credentials control plane)
+- `backend/src/modules/telegram/telegram-stream-readable.ts` (WebDAV upstream + reauth mirroring)
 - `backend/src/modules/files/stream-file.ts` (route Telegram through gateway)
 - `backend/src/modules/webdav/webdav-virtual-fs.ts` (add Telegram branch to streamProviderFileToReadable)
 - `docker-compose.yml` (new `telegram-stream` service, internal-only)
@@ -246,11 +263,11 @@ Reuse, not reinvent:
 
 | Risk | Mitigation | Rollback |
 |---|---|---|
-| PyroFork session provisioning fails (network/OTP) | Don't break the existing connect path; surface a clear "stream session unavailable" error, file still uploads via the existing flow. | Phase 02 ships behind a feature flag if needed; existing REST full-GET (no range) still works for those files. |
+| PyroFork session provisioning fails (network/OTP) | Superseded: there is no provisioning. The Telethon session is repacked from the credential the backend already holds, so a working 9Drive Telegram connection is a working stream. A *revoked* session surfaces as `503 TELEGRAM_REAUTH_REQUIRED` and flags the account `reauth_required`, so the UI asks for a reconnect instead of failing silently. | Existing REST full-GET (no range) still works for those files. |
 | `FILE_REFERENCE` stale | Refresh-on-error in Phase 03; one extra `getMessages` per cold start. | Reverted by stopping gateway use; falls back to current broken-in-WebDAV behavior. |
-| FloodWait from concurrent prefetch | Conservative defaults (chunk 1 MiB, prefetch 3, parallelism 2); bounded retries; no auto-retry forever. | Reduce defaults in env; re-tune after Phase 10 measurement. |
+| FloodWait from Telegram | Sequential reads (one 512 KiB request in flight per stream); a `FloodWaitError` is mapped to `429` with the wait time, never retried in a loop. | Lower `TELEGRAM_STREAM_CHUNK_SIZE_BYTES`; re-tune only from measured numbers. |
 | WebDAV regression for Google | Routing is additive: only the new Telegram branch is added; S3 and Google paths untouched. Existing `webdav-no-decrypt.test.ts` and storage-routing tests must keep passing. | Revert the gateway wiring; Google/S3 stay live. |
-| Large `Content-Range` overhead from chatty clients (Jellyfin) | Prefetch + cancellation in Phase 05; old range cancels as soon as client disconnects. | Phase 05 isolates the fix; can be temporarily disabled if it regresses. |
+| Large `Content-Range` overhead from chatty clients (Jellyfin) | Cancellation is structural: a client disconnect throws `CancelledError` into the streaming generator, whose `finally` closes the Telethon download iterator, so a superseded range stops consuming Telegram bandwidth immediately. | No flag to disable; reverting the gateway wiring is the rollback. |
 | `telegram-stream` down in production | Internal-only service; healthcheck wired into compose; backend receives a fast 502 from the gateway, returns a clear 502/503 to WebDAV; Google WebDAV unaffected. | Compose-down. |
 
 ## 12. Final summary
@@ -263,8 +280,10 @@ Primary Bottleneck:       (1) no Telegram branch in WebDAV, (2) Range ignored �
                           (3) fresh Telegram client per request → connect+auth cost on every range
 Google Baseline:          200/206/416 + headers via fetch+Readable.fromWeb, OAuth auth, Range forwarded
 Session Compatibility:    teleproto StringSession (GramJS) ≠ PyroFork StringSession (Pyrogram family);
-                          incompatible; provisioned at auth-finalize, stored encrypted (Phase 02)
-Recommended Architecture: NEW internal telegram-stream (FastAPI + PyroFork) behind a thin
+                          BUT == Telethon StringSession (same dc_id|ip|port|auth_key). Implemented with
+                          Telethon: repacked on the fly from sessionEncrypted, in memory only, no
+                          second login and no new column (see §7).
+Recommended Architecture: NEW internal telegram-stream (FastAPI + Telethon) behind a thin
                           TelegramStreamGateway in the existing backend; WebDAV unchanged; no second
                           DB; provider detection from File.provider (never filename); session in
                           memory only; HMAC-signed internal API; header ownership split documented.

@@ -1,31 +1,22 @@
 """Telegram client manager (Phase 03).
 
 The streaming service must NOT log in once per range request. The
-ClientManager holds a connected PyroFork `Client` per `providerId` (one
-account == one client in normal use), reuses it across requests, and
-recreates it on reconnect or invalidation. Media sessions per DC are
-reused via `client.media_sessions[dc]` (PyroFork does this for us; we
-just keep the reference).
+ClientManager holds a connected client per `providerId` (one account ==
+one client in normal use), reuses it across requests, and recreates it on
+reconnect or invalidation. Per-DC media sessions are Telethon's own
+concern — `iter_download` exports/imports and caches senders internally,
+so there is no second cache here.
 
-We keep this module small and free of HTTP concerns — it is owned by the
-streaming service. It is **not** used directly from the FastAPI handler;
-the handler will:
-  1) call `manager.get_client(provider_id, ...)` to obtain a connected
-     client,
-  2) call `file_resolver.resolve(client, channel_id, message_id)` to
-     get an `InputDocumentFileLocation`,
-  3) feed those to the byte streamer (Phase 04).
+It is **not** used directly from the FastAPI handler; `engine.py` wires it:
+  1) `clients.get_client(provider_id)` for a connected client,
+  2) `resolver.resolve(client, ...)` for the document location,
+  3) `iter_bytes(...)` for the range.
 
 Design choices (per the audit doc, §6/§7):
-  - A `TelegramClient` is a thin Protocol so the engine can be tested
-    without PyroFork. The production implementation wraps a PyroFork
-    `Client`. There is exactly one production implementation, no abstract
-    base class needed.
+  - `TelegramClient` is a thin Protocol so the engine can be tested
+    without Telethon installed. `engine.TelethonAdapter` is the only
+    production implementation — no abstract base class needed.
   - Invalidation is an explicit method. We do not silently re-create.
-  - Bounded per-DC media session cache: PyroFork's own cache is bounded
-    by `MAX_CONCURRENT_TRANSMISSIONS`; we do not add a second cache.
-  - PyroFork import is lazy (`_load_pyrofork`) so unit tests run without
-    the dependency installed.
 """
 from __future__ import annotations
 
@@ -39,17 +30,14 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Thin protocol that abstracts PyroFork's Client. The production factory
-# returns a wrapper that satisfies this; tests pass a deterministic stub.
+# Thin protocol over the Telegram client. `engine.TelethonAdapter`
+# satisfies it; tests pass a deterministic stub.
 # ─────────────────────────────────────────────────────────────────────────
 class TelegramClient(Protocol):
     async def get_input_entity(self, peer: Any) -> Any: ...
     async def get_messages(self, peer: Any, *, ids: list[int]) -> list[Any]: ...
-    async def invoke(self, request: Any) -> Any: ...
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
-    @property
-    def media_sessions(self) -> dict[int, Any]: ...
     @property
     def is_connected(self) -> bool: ...
 
@@ -85,11 +73,10 @@ ClientFactory = Callable[[str], Awaitable[TelegramClient]]
 class ClientManager:
     """Per-providerId connected client cache. No login per range."""
 
-    def __init__(self, factory: ClientFactory, *, idle_ttl_seconds: float = 600.0) -> None:
+    def __init__(self, factory: ClientFactory) -> None:
         self._factory = factory
         self._entries: dict[str, _ClientEntry] = {}
         self._lock = asyncio.Lock()
-        self._idle_ttl = idle_ttl_seconds
 
     async def get_client(self, provider_id: str) -> TelegramClient:
         """Return the connected client for the provider, creating it on first use."""
@@ -155,19 +142,3 @@ class ClientManager:
                 await entry.client.stop()
             except Exception:  # noqa: BLE001 — shutdown is best-effort
                 logger.warning("telegram-stream: client stop failed during shutdown provider=%s", entry.provider_id)
-
-    async def reclaim_idle(self) -> int:
-        """Stop clients that have not been used for `idle_ttl` seconds. Returns the count."""
-        now = time.time()
-        to_stop: list[_ClientEntry] = []
-        async with self._lock:
-            for provider_id, entry in list(self._entries.items()):
-                if now - entry.last_used_at > self._idle_ttl:
-                    del self._entries[provider_id]
-                    to_stop.append(entry)
-        for entry in to_stop:
-            try:
-                await entry.client.stop()
-            except Exception:  # noqa: BLE001
-                logger.warning("telegram-stream: idle reclaim stop failed provider=%s", entry.provider_id)
-        return len(to_stop)

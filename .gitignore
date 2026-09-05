@@ -3,6 +3,14 @@ dist/
 *.log
 .DS_Store
 
+# Python bytecode (services/telegram-stream)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Test scratch (ffmpeg/HLS integration fixtures write here)
+backend/data/
+
 # Secrets
 .env
 backend/.env

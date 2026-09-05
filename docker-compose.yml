@@ -121,9 +121,6 @@ services:
       # ── Telegram Stream (internal byte-range service) ──────────────────
       TELEGRAM_STREAM_NODE_URL: ${TELEGRAM_STREAM_NODE_URL:-http://telegram-stream:8081}
       TELEGRAM_STREAM_INTERNAL_SECRET: ${TELEGRAM_STREAM_INTERNAL_SECRET:-Uxw7qgqZ7j6IqFIy5TT6knce2SY0_nTuZz_pcqbW2hk}
-      TELEGRAM_STREAM_CHUNK_SIZE_BYTES: ${TELEGRAM_STREAM_CHUNK_SIZE_BYTES:-1048576}
-      TELEGRAM_STREAM_PREFETCH: ${TELEGRAM_STREAM_PREFETCH:-3}
-      TELEGRAM_STREAM_PARALLELISM: ${TELEGRAM_STREAM_PARALLELISM:-2}
     volumes:
       - remote_import_tmp:/data/remote-import-tmp
       - upload_tmp:/data/upload-tmp
@@ -142,10 +139,10 @@ services:
     environment:
       TELEGRAM_STREAM_HOST: "0.0.0.0"
       TELEGRAM_STREAM_PORT: "8081"
+      # Credentials control plane on the backend. Internal network only.
+      TELEGRAM_STREAM_BACKEND_URL: ${TELEGRAM_STREAM_BACKEND_URL:-http://backend:4000}
       TELEGRAM_STREAM_INTERNAL_SECRET: ${TELEGRAM_STREAM_INTERNAL_SECRET:-Uxw7qgqZ7j6IqFIy5TT6knce2SY0_nTuZz_pcqbW2hk}
-      TELEGRAM_STREAM_CHUNK_SIZE_BYTES: ${TELEGRAM_STREAM_CHUNK_SIZE_BYTES:-1048576}
-      TELEGRAM_STREAM_PREFETCH: ${TELEGRAM_STREAM_PREFETCH:-3}
-      TELEGRAM_STREAM_PARALLELISM: ${TELEGRAM_STREAM_PARALLELISM:-2}
+      TELEGRAM_STREAM_CHUNK_SIZE_BYTES: ${TELEGRAM_STREAM_CHUNK_SIZE_BYTES:-524288}
       TELEGRAM_STREAM_LOG_LEVEL: ${TELEGRAM_STREAM_LOG_LEVEL:-info}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8081/health',timeout=3); sys.exit(0 if r.status==200 else 1)"]

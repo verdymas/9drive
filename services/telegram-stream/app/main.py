@@ -9,12 +9,13 @@ from fastapi.responses import JSONResponse
 from app.api import health, stream
 from app.core.errors import AppError, register_error_handlers
 from app.core.config import settings
+from app.telegram.engine import clients
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # No clients at Phase 01; the manager arrives in Phase 03.
     yield
+    await clients.shutdown()
 
 
 def create_app() -> FastAPI:

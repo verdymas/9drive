@@ -1,5 +1,14 @@
 # 9Drive Telegram Stream — Phase-by-Phase `/goal` Prompts
 
+> **Implementation deviation from this spec:** the shipped service uses
+> **Telethon**, not PyroFork, and there is **no session provisioning
+> subsystem** (Phase 02's second half). Telethon's `StringSession` carries
+> the same four fields as the GramJS/teleproto session 9Drive already
+> stores (`dc_id | ip | port | auth_key`), so the stored credential is
+> repacked on the fly and no second login exists. This spec is kept
+> verbatim as the original requirement; the reasoning and the verification
+> are in `docs/audits/telegram-stream-architecture-audit.md` §7.
+
 Target service name: `telegram-stream`.
 
 Architecture:
@@ -17,7 +26,7 @@ Storage read routing
                         ↓
                   FastAPI / Python
                         ↓
-                     PyroFork
+                     Telethon
                         ↓
                Telegram MTProto
 ```
