@@ -52,7 +52,7 @@ fileRouter.get('/', async (req: AuthRequest, res, next) => {
 
     const typeFilters: Record<string, string[]> = {
       image: ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml'],
-      video: ['video/mp4', 'video/mpeg', 'video/ogg', 'video/quicktime', 'video/webm'],
+      video: ['video/mp4', 'video/mpeg', 'video/ogg', 'video/quicktime', 'video/webm', 'video/x-matroska', 'video/matroska'],
       pdf: ['application/pdf'],
       doc: ['application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'text/plain'],
       archive: ['application/zip', 'application/x-rar-compressed', 'application/x-tar', 'application/x-7z-compressed']
@@ -94,6 +94,15 @@ fileRouter.get('/', async (req: AuthRequest, res, next) => {
 })
 
 const batchFileSchema = z.object({ fileIds: z.array(z.string().min(1)).min(1).max(100) })
+
+// Trust boundary: the value lands verbatim in a `Content-Type` response
+// header. A single slash plus token chars only; CR/LF and any character
+// outside the RFC 7231 token alphabet are rejected at the door.
+const mimeTypeInputSchema = z
+  .string()
+  .min(1)
+  .max(191)
+  .regex(/^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/, 'Invalid MIME type.')
 
 fileRouter.patch('/batch', async (req: AuthRequest, res, next) => {
   try {
@@ -164,6 +173,37 @@ fileRouter.patch('/batch', async (req: AuthRequest, res, next) => {
     }
 
     return res.json({ status: 'ok', moved, providerMoved, providerFailed })
+  } catch (error) {
+    return next(error)
+  }
+})
+
+// A separate batch route for mime-type, not a body field on PATCH /batch:
+// that handler always writes `folderId` (destFolderId = body.folderId ?? null),
+// so reusing it for mime-only updates would silently move every file to the
+// root. `mimeType` is user-owned once written: the three reconcilers
+// (sync/file-reconciler.ts, telegram/telegram-ingest.service.ts,
+// telegram/telegram-sync.service.ts) no longer overwrite it after this
+// route is in place.
+fileRouter.patch('/batch/mime-type', async (req: AuthRequest, res, next) => {
+  try {
+    const body = batchFileSchema.extend({ mimeType: mimeTypeInputSchema }).parse(req.body)
+    const { count } = await prisma.file.updateMany({
+      where: { id: { in: body.fileIds }, userId: req.user!.id, status: 'active' },
+      data: { mimeType: body.mimeType },
+    })
+    await createAuditLog(req.user!.id, 'UPDATE_FILE_MIME_TYPE', 'file', undefined, { count, mimeType: body.mimeType })
+    if (count > 0) {
+      // mimeType is part of the encrypted recovery metadata fingerprint for
+      // Telegram; rewriting the caption keeps it coherent. Best-effort,
+      // identical to the rename path — failure does not block the response.
+      for (const fileId of body.fileIds) {
+        void refreshTelegramCaption(req.user!.id, fileId).catch((error) => {
+          console.error('[telegram-caption] failed to refresh caption after PATCH /files/batch/mime-type', error?.message || error)
+        })
+      }
+    }
+    return res.json({ status: 'ok', updated: count, mimeType: body.mimeType })
   } catch (error) {
     return next(error)
   }

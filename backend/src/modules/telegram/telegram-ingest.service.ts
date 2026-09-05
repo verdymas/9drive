@@ -291,8 +291,8 @@ async function updateFromParsed(
     }
   }
 
-  const nextMime = document.mimeType ?? 'application/octet-stream'
-  if (current.mimeType !== nextMime) updates.mimeType = nextMime
+  // mimeType is user-owned: the user-edit route writes it, sync only sets
+  // it once on create (below).
   const nextSize = BigInt(document.size)
   if (current.sizeBytes !== nextSize) updates.sizeBytes = nextSize
 
@@ -306,8 +306,7 @@ async function syncPhysicalFieldsOnly(userId: string, fileId: string, document: 
   if (!current) return
   const updates: Record<string, unknown> = {}
   if (current.providerFileId !== document.remoteId) updates.providerFileId = document.remoteId
-  const nextMime = document.mimeType ?? 'application/octet-stream'
-  if (current.mimeType !== nextMime) updates.mimeType = nextMime
+  // mimeType is user-owned — see updateFromParsed above.
   const nextSize = BigInt(document.size)
   if (current.sizeBytes !== nextSize) updates.sizeBytes = nextSize
   if (Object.keys(updates).length > 0) {

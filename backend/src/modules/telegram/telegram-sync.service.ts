@@ -555,11 +555,10 @@ async function classifyOne(input: {
     // a 9drive:path override; that's handled by the ingest path, NOT
     // flagged as a sync conflict (it's an intentional rename).
     const sizeMatches = existing.sizeBytes === BigInt(document.size)
-    // The DB column is never null (ingest defaults it), so normalize the
-    // Telegram side the same way — otherwise a document Telegram reports
-    // without a mime type conflicts on every single run.
-    const mimeMatches = existing.mimeType === (document.mimeType ?? 'application/octet-stream')
-    if (sizeMatches && mimeMatches) {
+    // mimeType is user-owned after PATCH /files/batch/mime-type; sync
+    // no longer raises a conflict for a mime difference, and the ingest
+    // path stops writing it on update.
+    if (sizeMatches) {
       // Encrypted caption metadata whose ciphertext differs from the cached
       // copy is reconciled by the ingest path. Reaching here with an
       // unreadable payload means the key is wrong or the caption was
@@ -574,7 +573,7 @@ async function classifyOne(input: {
     return {
       kind: 'conflict',
       telegramFileId: document.remoteId,
-      reason: sizeMatches ? 'mimeType mismatch' : 'size mismatch',
+      reason: 'size mismatch',
       file: { id: existing.id, name: existing.name },
     }
   }

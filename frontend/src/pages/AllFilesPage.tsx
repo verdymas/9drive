@@ -15,6 +15,7 @@ import { FolderGrid, type FolderSizeScale } from '@/components/drive/FolderGrid'
 import { defaultFolderColor, defaultFolderIconUrl, folderColorOptions, folderIconOptions, normalizeFolderColor } from '@/components/drive/FolderVisual'
 import { PageHeader } from '@/components/drive/PageHeader'
 import { Input } from '@/components/ui/input'
+import { Select } from '@/components/ui/select'
 import { API_URL, apiFetch, formatBytes, formatDate } from '@/lib/api'
 import { getAccessToken } from '@/lib/auth'
 import { createPlyr, ensurePlyr } from '@/lib/plyr'
@@ -42,6 +43,22 @@ function getStoredFileViewMode(): FileViewMode {
   const stored = localStorage.getItem(fileViewStorageKey)
   return stored === 'grid' || stored === 'list' ? stored : 'list'
 }
+
+// Dropdown options for the "Change Type" action. Label is what the user
+// reads; value is the exact token written to the DB. Picked from the most
+// common file types the system currently misclassifies.
+const MIME_TYPE_CHOICES: { value: string; label: string }[] = [
+  { value: 'video/x-matroska', label: 'MKV video (video/x-matroska)' },
+  { value: 'video/mp4', label: 'MP4 video (video/mp4)' },
+  { value: 'video/webm', label: 'WebM video (video/webm)' },
+  { value: 'video/quicktime', label: 'QuickTime (video/quicktime)' },
+  { value: 'audio/mpeg', label: 'MP3 audio (audio/mpeg)' },
+  { value: 'audio/mp4', label: 'M4A audio (audio/mp4)' },
+  { value: 'image/jpeg', label: 'JPEG image (image/jpeg)' },
+  { value: 'image/png', label: 'PNG image (image/png)' },
+  { value: 'application/pdf', label: 'PDF (application/pdf)' },
+  { value: 'application/octet-stream', label: 'Generic blob (application/octet-stream)' },
+]
 
 function mimeToKind(mimeType: string): FileItem['kind'] {
   if (mimeType.startsWith('image/')) return 'image'
@@ -84,6 +101,8 @@ export function AllFilesPage() {
   const [uploadOpen, setUploadOpen] = useState(false)
   const [folderOpen, setFolderOpen] = useState(false)
   const [renameOpen, setRenameOpen] = useState(false)
+  const [mimeOpen, setMimeOpen] = useState(false)
+  const [mimeValue, setMimeValue] = useState('application/octet-stream')
   const [folderRenameOpen, setFolderRenameOpen] = useState(false)
   const [folderDeleteOpen, setFolderDeleteOpen] = useState(false)
   const [moveOpen, setMoveOpen] = useState(false)
@@ -505,6 +524,20 @@ export function AllFilesPage() {
     await loadFiles()
   }
 
+  async function changeMimeType(event: FormEvent) {
+    event.preventDefault()
+    const ids = selectedFileIds.size > 0 ? [...selectedFileIds] : activeFile?.id ? [activeFile.id] : []
+    if (ids.length === 0) return
+    try {
+      await apiFetch('/files/batch/mime-type', { method: 'PATCH', body: JSON.stringify({ fileIds: ids, mimeType: mimeValue }) })
+      setMimeOpen(false)
+      clearSelection()
+      await loadFiles()
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Failed to change type.')
+    }
+  }
+
   async function moveFile(event: FormEvent) {
     event.preventDefault()
     const selectedIds = [...selectedFileIds]
@@ -770,7 +803,7 @@ export function AllFilesPage() {
       )}
       </div>
       <EmptyAreaContextMenu x={emptyContextMenu.x} y={emptyContextMenu.y} open={emptyContextMenu.open} canPasteFolder={Boolean(cutFolder)} onClose={() => setEmptyContextMenu({ x: 0, y: 0, open: false })} onUpload={() => { setUploadOpen(true); setEmptyContextMenu({ x: 0, y: 0, open: false }) }} onCreateFolder={() => { setFolderOpen(true); setEmptyContextMenu({ x: 0, y: 0, open: false }) }} onPasteFolder={() => { pasteFolder().catch((error) => setMessage(error instanceof Error ? error.message : 'Failed to paste folder')); setEmptyContextMenu({ x: 0, y: 0, open: false }) }} />
-      <FileContextMenu x={contextMenu.x} y={contextMenu.y} file={contextMenu.file} onClose={() => setContextMenu({ x: 0, y: 0, file: null })} onView={viewFile} onDownload={downloadFile} onRename={() => { setRenameValue(activeFile?.name ?? ''); setRenameOpen(true); setContextMenu({ x: 0, y: 0, file: null }) }} onMove={() => { setMoveOpen(true); setContextMenu({ x: 0, y: 0, file: null }) }} onDetails={() => { setDetailOpen(true); setContextMenu({ x: 0, y: 0, file: null }) }} onShare={shareFile} onCopyLink={copyShareLinkDirect} onInvite={inviteToFile} onDelete={() => { setDeleteOpen(true); setContextMenu({ x: 0, y: 0, file: null }) }} />
+      <FileContextMenu x={contextMenu.x} y={contextMenu.y} file={contextMenu.file} onClose={() => setContextMenu({ x: 0, y: 0, file: null })} onView={viewFile} onDownload={downloadFile} onRename={() => { setRenameValue(activeFile?.name ?? ''); setRenameOpen(true); setContextMenu({ x: 0, y: 0, file: null }) }} onChangeType={() => { setMimeValue(activeFile?.mimeType ?? 'application/octet-stream'); setMimeOpen(true); setContextMenu({ x: 0, y: 0, file: null }) }} onMove={() => { setMoveOpen(true); setContextMenu({ x: 0, y: 0, file: null }) }} onDetails={() => { setDetailOpen(true); setContextMenu({ x: 0, y: 0, file: null }) }} onShare={shareFile} onCopyLink={copyShareLinkDirect} onInvite={inviteToFile} onDelete={() => { setDeleteOpen(true); setContextMenu({ x: 0, y: 0, file: null }) }} />
       <FolderContextMenu x={folderContextMenu.x} y={folderContextMenu.y} folder={folderContextMenu.folder} onClose={() => setFolderContextMenu({ x: 0, y: 0, folder: null })} onCut={() => cutSelectedFolder(activeFolderForMenu)} onRename={() => { setFolderRenameValue(activeFolderForMenu?.name ?? ''); setFolderRenameColor(normalizeFolderColor(activeFolderForMenu?.color)); setFolderRenameIconUrl(activeFolderForMenu?.iconUrl ?? defaultFolderIconUrl); setFolderRenameOpen(true); setFolderContextMenu({ x: 0, y: 0, folder: null }) }} onInvite={inviteToFolder} onCopyLink={copyFolderLink} onDelete={() => { setFolderDeleteOpen(true); setFolderContextMenu({ x: 0, y: 0, folder: null }) }} />
       <FileDetailsDrawer open={detailOpen} file={activeFile} onClose={() => setDetailOpen(false)} />
 
@@ -827,6 +860,7 @@ export function AllFilesPage() {
         workers={[]}
       />
       <DummyModal open={renameOpen} title="Rename File" description={activeFile?.name ?? ''} onClose={() => setRenameOpen(false)}><form onSubmit={renameFile} className="grid gap-4"><Input value={renameValue} onChange={(event) => setRenameValue(event.target.value)} required /><div className="flex justify-end gap-3"><Button type="button" variant="outline" onClick={() => setRenameOpen(false)}>Cancel</Button><Button>Rename</Button></div></form></DummyModal>
+      <DummyModal open={mimeOpen} title="Change Type" description={activeFile?.name ?? ''} onClose={() => setMimeOpen(false)}><form onSubmit={changeMimeType} className="grid gap-4"><Select value={mimeValue} onChange={(event) => setMimeValue(event.target.value)}>{MIME_TYPE_CHOICES.map((choice) => (<option key={choice.value} value={choice.value}>{choice.label}</option>))}</Select><p className="text-xs text-slate-500">Applies to {selectedFileIds.size > 0 ? `${selectedFileIds.size} selected file${selectedFileIds.size === 1 ? '' : 's'}` : 'this file'}. The change stays across syncs.</p><div className="flex justify-end gap-3"><Button type="button" variant="outline" onClick={() => setMimeOpen(false)}>Cancel</Button><Button>Change Type</Button></div></form></DummyModal>
       <DummyModal open={moveOpen} title="Move to Folder" description={selectedFileIds.size > 0 ? `Move ${selectedFileIds.size} files` : activeFile?.name ?? ''} onClose={() => setMoveOpen(false)}><form onSubmit={moveFile} className="grid gap-4"><select className="h-11 rounded-xl border border-slate-200 px-3 text-sm" value={selectedFolderId} onChange={(event) => setSelectedFolderId(event.target.value)}><option value="">No folder</option>{allFolders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}</select><div className="flex justify-end gap-3"><Button type="button" variant="outline" onClick={() => setMoveOpen(false)}>Cancel</Button><Button>Move</Button></div></form></DummyModal>
       <DummyModal open={deleteOpen} title={selectedFileIds.size > 0 ? 'Delete Files' : 'Delete File'} description={selectedFileIds.size > 0 ? `Delete ${selectedFileIds.size} files from storage?` : `Delete ${activeFile?.name ?? 'file'} from storage?`} onClose={() => setDeleteOpen(false)}><div className="flex justify-end gap-3"><Button variant="outline" onClick={() => setDeleteOpen(false)}>Cancel</Button><Button variant="danger" onClick={deleteFile}>Delete</Button></div></DummyModal>
       <DummyModal open={shareOpen} title="Share Link" description={activeFile?.name ?? ''} onClose={() => setShareOpen(false)}>

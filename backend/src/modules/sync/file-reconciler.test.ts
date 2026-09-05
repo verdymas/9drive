@@ -195,4 +195,17 @@ describe('§67 file reconciler', () => {
     expect(h.files.filter((f) => f.providerFileId === 'up1')).toHaveLength(1)
     expect(c.stats.filesCreated).toBe(0)
   })
+
+  it('14. mimeType is user-owned: a row whose mimeType was edited is not rewritten by sync', async () => {
+    // The user set this row to application/octet-stream through
+    // PATCH /files/batch/mime-type. The provider still reports
+    // video/x-matroska, but sync must not touch the row's mimeType.
+    h.files.push({ id: 'edited-1', userId: 'user-1', connectedAccountId: 'A', provider: 'google_drive', providerFileId: 'ed1', name: 'clip.mkv', mimeType: 'application/octet-stream', sizeBytes: 100n, status: 'active', folderId: 'virtual-mov', deletedAt: null, lastSeenSyncRunId: null })
+    const c = ctx('A')
+    await reconcileFilePage(c, 'virtual-mov', [file('ed1', 'clip.mkv', 100n, 'video/x-matroska')])
+    const row = h.files.find((f) => f.providerFileId === 'ed1')
+    expect(row.mimeType).toBe('application/octet-stream')
+    expect(c.stats.filesUpdated).toBe(0)
+    expect(c.stats.filesCreated).toBe(0)
+  })
 })

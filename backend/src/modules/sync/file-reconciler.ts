@@ -96,9 +96,10 @@ export async function reconcileFilePage(
     }
 
     const moved = row.folderId !== resolvedVirtualParentId
+    // mimeType is user-owned after PATCH /files/batch/mime-type; sync only
+    // sets it once, on create. name + sizeBytes stay provider-owned.
     const metaChanged =
       row.name !== physical.name ||
-      row.mimeType !== physical.mimeType ||
       row.sizeBytes !== physical.sizeBytes ||
       row.status !== 'active' ||
       row.deletedAt !== null
@@ -108,7 +109,6 @@ export async function reconcileFilePage(
         where: { id: row.id },
         data: {
           name: physical.name,
-          mimeType: physical.mimeType,
           sizeBytes: physical.sizeBytes,
           status: 'active',
           deletedAt: null,
