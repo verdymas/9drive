@@ -26,3 +26,20 @@ flowchart LR
 
 ## Failure Boundary
 Do not create an active `File` database row before the provider upload succeeds. If an upload session fails, preserve observable/retryable status and error state without creating a phantom file.
+
+## Multipart Compatibility Boundary
+
+The compatibility multipart route resolves metadata and response aggregation
+separately from provider execution. It supports either one metadata field set
+or `filesMeta` batch metadata, preserves the single-file `{ file }` response,
+and reports batches as `{ files, failed }`. Declared sizes are required before
+the corresponding file part, constrained by `MAX_UPLOAD_BYTES`, and checked
+against bytes received. Provider routing still uses the same placement service
+as resumable uploads; this workflow does not change the dashboard's resumable
+path.
+
+Multipart bytes are staged through a bounded, session-scoped spool under
+`UPLOAD_TEMP_DIR` before provider transfer. Google and S3 receive a read stream
+from that spool, while Telegram uses its required file path. Client aborts
+cancel the spool and supported Google/S3 transfers, then mark the upload
+session failed and remove the staged file.

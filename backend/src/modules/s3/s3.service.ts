@@ -72,6 +72,8 @@ export type UploadS3ObjectOptions = {
    * bytes (plus parts already sent) — close enough for a live progress bar.
    */
   onProgress?: (uploadedBytes: bigint) => void
+  /** Abort the managed multipart transfer when the originating request ends. */
+  signal?: AbortSignal
 }
 
 export async function uploadS3Object(
@@ -91,13 +93,28 @@ export async function uploadS3Object(
       if (event.loaded != null) opts.onProgress!(BigInt(event.loaded))
     })
   }
-  await upload.done()
+  const abort = () => {
+    void upload.abort().catch(() => undefined)
+  }
+  if (opts?.signal?.aborted) abort()
+  opts?.signal?.addEventListener('abort', abort, { once: true })
+  try {
+    await upload.done()
+  } finally {
+    opts?.signal?.removeEventListener('abort', abort)
+  }
 }
 
 export async function deleteS3Object(file: FileWithAccount) {
   const config = await getS3ConfigForAccount(file.connectedAccountId)
   const client = createS3Client(config)
   await client.send(new DeleteObjectCommand({ Bucket: config.bucket, Key: file.providerFileId }))
+}
+
+/** Delete a just-created object before a File row can be safely retained. */
+export async function deleteS3ObjectByKey(config: S3Config, key: string) {
+  const client = createS3Client(config)
+  await client.send(new DeleteObjectCommand({ Bucket: config.bucket, Key: key }))
 }
 
 export async function syncS3Quota(accountId: string) {

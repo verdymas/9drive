@@ -45,6 +45,10 @@ Routes are mounted in `backend/src/app.ts`. Almost all private routes use bearer
 | PUT | `/uploads/resumable/chunk/:id` |
 | POST | `/api/v1/uploads` (API key `files:upload`) |
 
+`POST /uploads` is the multipart compatibility route: a single success returns
+`{ file }`, a batch/partial success returns `{ files, failed }`, and an
+all-failed request returns `400 { code, message, failed }`.
+
 ## Files
 
 `GET /files/preview/:token` is public-by-token. Other routes under `/files` use bearer authentication.
