@@ -51,13 +51,13 @@ describe('refreshTelegramCaption — protected metadata', () => {
 
     expect(h.update).toHaveBeenCalledTimes(1)
     const written = h.update.mock.calls[0][0].data
-    expect(written.encryptedMetadata).toMatch(/^9drive:meta=v1:/)
+    expect(written.encryptedMetadata).toMatch(/^v1:/)
     expect(written.metadataFingerprint).toMatch(/^[a-f0-9]{64}$/)
     expect(written.cryptoVersion).toBe('v1')
     // Renaming in 9Drive must NOT rename the Telegram document.
     expect(written).not.toHaveProperty('physicalFilename')
 
-    // The freshly-minted ciphertext is what goes into the caption.
+    // The freshly-minted raw value is what goes into the caption service.
     const metaArg = h.updateCaption.mock.calls[0][4]
     expect(metaArg).toBe(written.encryptedMetadata)
   })
@@ -71,8 +71,8 @@ describe('refreshTelegramCaption — protected metadata', () => {
     await refreshTelegramCaption('user-1', 'file-1')
 
     expect(h.update).not.toHaveBeenCalled()
-    // The cached line is still sent so the edit never strips the meta line.
-    expect(h.updateCaption.mock.calls[0][4]).toBe('9drive:meta=v1:cached')
+    // A legacy full-line cache is normalized before the edit boundary.
+    expect(h.updateCaption.mock.calls[0][4]).toBe('v1:cached')
   })
 
   it('does no crypto work at all when encryption is disabled', async () => {

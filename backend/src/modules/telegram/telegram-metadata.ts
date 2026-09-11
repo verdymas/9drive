@@ -27,6 +27,32 @@ export const NINE_DRIVE_ID_KEY = '9drive:id'
 export const NINE_DRIVE_PATH_KEY = '9drive:path'
 export const NINE_DRIVE_META_KEY = '9drive:meta'
 
+const NINE_DRIVE_META_PREFIX = `${NINE_DRIVE_META_KEY}=`
+
+/**
+ * Normalize an encrypted metadata value to its raw `v1:...` representation.
+ *
+ * The database/cache and caption parser use this value representation. The
+ * anchored prefix loop accepts the known legacy double-prefix form without
+ * removing arbitrary text that happens to contain `9drive:meta=` later in a
+ * payload.
+ */
+export function normalizeTelegramMetaValue(input: string | null | undefined): string | null {
+  if (input === null || input === undefined) return null
+  let value = input.trim()
+  if (value === '') return null
+  while (value.startsWith(NINE_DRIVE_META_PREFIX)) {
+    value = value.slice(NINE_DRIVE_META_PREFIX.length).trim()
+  }
+  return value === '' ? null : value
+}
+
+/** Convert a raw encrypted metadata value into exactly one caption line. */
+export function toTelegramMetaLine(input: string | null | undefined): string | null {
+  const value = normalizeTelegramMetaValue(input)
+  return value === null ? null : `${NINE_DRIVE_META_PREFIX}${value}`
+}
+
 /** Stable-id format: ASCII letters/digits/`-`/`_`/`.`, 1..36 chars. UUIDs fit. */
 const STABLE_ID_RE = /^[A-Za-z0-9._-]{1,36}$/
 
@@ -170,10 +196,11 @@ export function encodeCaption(input: {
   // callers don't have to remember — the plaintext line is the fallback
   // only when the encrypted line is dropped (empty / oversized ciphertext).
   let metaEmitted = false
-  if (input.encryptedMeta) {
-    const clean = input.encryptedMeta.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '').trim()
-    if (clean !== '' && clean.length <= TELEGRAM_CAPTION_MAX - `${NINE_DRIVE_META_KEY}=`.length) {
-      lines.push(`${NINE_DRIVE_META_KEY}=${clean}`)
+  if (input.encryptedMeta !== null && input.encryptedMeta !== undefined) {
+    const cleanMeta = input.encryptedMeta.replace(/[\u0000-\u001F]/g, '').trim()
+    const metaLine = toTelegramMetaLine(cleanMeta)
+    if (metaLine && metaLine.length <= TELEGRAM_CAPTION_MAX) {
+      lines.push(metaLine)
       metaEmitted = true
     }
   }
@@ -250,12 +277,12 @@ export function parseCaption(caption: string | null | undefined): ParsedMetadata
     }
     if (line.startsWith(`${NINE_DRIVE_META_KEY}=`)) {
       diagnostics.metaSeen += 1
-      const value = line.slice(NINE_DRIVE_META_KEY.length + 1)
+      const value = normalizeTelegramMetaValue(line.slice(NINE_DRIVE_META_KEY.length + 1))
       if (encryptedMeta !== null) {
         diagnostics.metaReason = 'duplicate'
         continue
       }
-      if (value === '') {
+      if (value === null) {
         diagnostics.metaReason = 'malformed'
       } else {
         encryptedMeta = value

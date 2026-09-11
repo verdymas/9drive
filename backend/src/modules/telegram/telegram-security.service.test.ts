@@ -92,7 +92,7 @@ describe('telegram-security.service', () => {
 
     expect(result).toMatchObject({ changed: true, channelId: 'channel-1', messageId: 100 })
     const metaArg = h.updateCaption.mock.calls[0][4]
-    expect(metaArg).toMatch(/^9drive:meta=v1:/)
+    expect(metaArg).toMatch(/^v1:/)
 
     const written = h.update.mock.calls[0][0].data
     expect(written.encryptedMetadata).toBe(metaArg)

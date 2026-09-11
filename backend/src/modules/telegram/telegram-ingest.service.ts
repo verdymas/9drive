@@ -132,10 +132,14 @@ export async function ingestTelegramDocument(
     if (!file) {
       // No matching logical file — the id was new to us; create the row
       // keyed by `providerFileId` and stamp the stable id.
-      return createOrInboxFromParsed(userId, accountId, document, mergeMeta(rawParsed, null).parsed)
+      const merged = mergeMeta(rawParsed, null)
+      if (merged.failure) throwMetadataFailure(merged.failure)
+      return createOrInboxFromParsed(userId, accountId, document, merged.parsed)
     }
     // Fast path (spec §35): identical ciphertext → nothing is decrypted.
-    const { parsed, refreshed } = mergeMeta(rawParsed, file.encryptedMetadata)
+    const merged = mergeMeta(rawParsed, file.encryptedMetadata)
+    if (merged.failure) throwMetadataFailure(merged.failure)
+    const { parsed, refreshed } = merged
     const outcome = await updateFromParsed(userId, file.id, document, parsed)
     if (refreshed && rawParsed.encryptedMeta) {
       await storeCaptionCiphertext(userId, file.id, rawParsed.encryptedMeta, {
@@ -149,7 +153,9 @@ export async function ingestTelegramDocument(
     return outcome
   }
 
-  const parsed = mergeMeta(rawParsed, null).parsed
+  const merged = mergeMeta(rawParsed, null)
+  if (merged.failure) throwMetadataFailure(merged.failure)
+  const parsed = merged.parsed
   // Case 2: 9Drive path only → match by physical providerFileId.
   if (parsed.logicalPath) {
     const file = await prisma.file.findFirst({
@@ -202,6 +208,10 @@ function mergeMeta(
     return { parsed, refreshed: false, failure: { code: resolution.code, message: resolution.message } }
   }
   return { parsed, refreshed: false, failure: null }
+}
+
+function throwMetadataFailure(failure: { code: string; message: string }): never {
+  throw new AppError(failure.code, failure.message, 400)
 }
 
 /** Last path segment of a logical path (the filename), or null. */

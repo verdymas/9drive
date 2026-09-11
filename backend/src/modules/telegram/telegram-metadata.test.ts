@@ -6,10 +6,12 @@ import {
   NINE_DRIVE_ID_KEY,
   NINE_DRIVE_META_KEY,
   NINE_DRIVE_PATH_KEY,
+  normalizeTelegramMetaValue,
   normalizeLogicalPath,
   parseCaption,
   splitLogicalPath,
   TELEGRAM_CAPTION_MAX,
+  toTelegramMetaLine,
 } from './telegram-metadata.js'
 
 describe('telegram-metadata — parser', () => {
@@ -147,6 +149,10 @@ describe('telegram-metadata — parser', () => {
     expect(empty.diagnostics.metaReason).toBe('malformed')
   })
 
+  it('normalizes a legacy double-prefixed metadata line to its raw value', () => {
+    expect(parseCaption(`${NINE_DRIVE_META_KEY}=${NINE_DRIVE_META_KEY}=v1:xyz`).encryptedMeta).toBe('v1:xyz')
+  })
+
   it('first meta wins, later duplicates are flagged', () => {
     const parsed = parseCaption(`${NINE_DRIVE_META_KEY}=v1:first\n${NINE_DRIVE_META_KEY}=v1:second`)
     expect(parsed.encryptedMeta).toBe('v1:first')
@@ -168,6 +174,29 @@ describe('telegram-metadata — parser', () => {
 })
 
 describe('telegram-metadata — encoder', () => {
+  it.each([
+    'v1:ABC',
+    '9drive:meta=v1:ABC',
+    '9drive:meta=9drive:meta=v1:ABC',
+  ])('emits exactly one metadata prefix for %s', (encryptedMeta) => {
+    const caption = encodeCaption({ stableId: 'file-1', encryptedMeta })
+    expect(caption).toBe('9drive:id=file-1\n9drive:meta=v1:ABC')
+    expect(caption!.match(/9drive:meta=/g)).toHaveLength(1)
+  })
+
+  it('normalizes only anchored metadata prefixes', () => {
+    expect(normalizeTelegramMetaValue('v1:ABC')).toBe('v1:ABC')
+    expect(normalizeTelegramMetaValue('9drive:meta=v1:ABC')).toBe('v1:ABC')
+    expect(normalizeTelegramMetaValue('9drive:meta=9drive:meta=v1:ABC')).toBe('v1:ABC')
+    expect(normalizeTelegramMetaValue('v1:9drive:meta=ABC')).toBe('v1:9drive:meta=ABC')
+    expect(toTelegramMetaLine('9drive:meta=9drive:meta=v1:ABC')).toBe('9drive:meta=v1:ABC')
+  })
+
+  it('strips control characters before emitting a metadata line', () => {
+    const caption = encodeCaption({ stableId: 'file-1', encryptedMeta: 'v1:AB\nC\u0000' })
+    expect(caption).toBe('9drive:id=file-1\n9drive:meta=v1:ABC')
+  })
+
   it('emits a deterministic, parser-compatible caption', () => {
     const caption = encodeCaption({ stableId: 'abc-123', logicalPath: 'Projects/APP-V/docs/architecture.md' })
     expect(caption).not.toBeNull()

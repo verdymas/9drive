@@ -80,6 +80,17 @@ export async function classifyTelegramDocument(input: ClassifyTelegramDocumentIn
     }
     return { outcome: { kind: 'matched' }, fileIdToStamp }
   } catch (error) {
+    if (isUnreadableMetadataError(error)) {
+      return {
+        outcome: {
+          kind: 'unreadableMeta',
+          telegramFileId: document.remoteId,
+          errorCode: error.code,
+          errorMessage: error.message.slice(0, 200),
+        },
+        fileIdToStamp: null,
+      }
+    }
     return {
       outcome: {
         kind: 'error',
@@ -90,6 +101,13 @@ export async function classifyTelegramDocument(input: ClassifyTelegramDocumentIn
       fileIdToStamp: null,
     }
   }
+}
+
+function isUnreadableMetadataError(error: unknown): error is AppError {
+  if (!(error instanceof AppError)) return false
+  return error.code === 'TELEGRAM_CRYPTO_KEY_NOT_CONFIGURED'
+    || error.code === 'TELEGRAM_CRYPTO_KEY_INVALID'
+    || error.code.startsWith('TELEGRAM_METADATA_')
 }
 
 export function applyOutcomeStats(stats: TelegramSyncRunStats, outcome: DocumentOutcome): void {

@@ -13,6 +13,13 @@ flowchart TD
   Issue --> State
 ```
 
+When a caption contains encrypted metadata, sync normalizes raw, full-line,
+and known double-prefixed values before comparison or decryption. A valid
+legacy value continues through stable-id reconciliation; a payload that fails
+authentication or format validation is recorded as
+`TELEGRAM_METADATA_UNREADABLE` instead of being silently placed in the
+recovery inbox.
+
 ## Initial/Incremental
 `TelegramSyncState.lastMessageId` acts as the pagination/incremental cursor. The scheduler enqueues accounts when they are due based on the last scan time and configured interval.
 

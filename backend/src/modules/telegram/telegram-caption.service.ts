@@ -42,16 +42,17 @@ export type CaptionUpdateResult = {
  * from `Folder` ancestry + filename). No-op when the existing caption
  * already matches.
  *
- * `encryptedMeta` (a full `9drive:meta=v1:...` line) is included in the
- * caption when protected metadata is enabled. The physical document — bytes
- * and filename alike — is never touched.
+ * `encryptedMetaValue` (the raw `v1:...` value) is included in the caption
+ * when protected metadata is enabled. The encoder also accepts legacy
+ * full-line values so old cache rows remain safe. The physical document —
+ * bytes and filename alike — is never touched.
  */
 export async function updateTelegramDocumentCaption(
   userId: string,
   file: FileWithStableId,
   config: TelegramConfig,
   logicalPath: string | null,
-  encryptedMeta?: string | null,
+  encryptedMetaValue?: string | null,
 ): Promise<CaptionUpdateResult> {
   if (file.telegramStableId === null || file.telegramStableId === undefined) {
     // A file without a stable id has no 9Drive metadata to refresh — the
@@ -64,7 +65,7 @@ export async function updateTelegramDocumentCaption(
   const nextCaption = encodeCaption({
     stableId,
     logicalPath: normalizedPath,
-    ...(encryptedMeta ? { encryptedMeta } : {}),
+    ...(encryptedMetaValue !== null && encryptedMetaValue !== undefined ? { encryptedMeta: encryptedMetaValue } : {}),
   })
   if (!nextCaption) {
     throw new AppError('TELEGRAM_METADATA_INVALID', 'Could not encode the 9Drive metadata caption for this file.', 400)

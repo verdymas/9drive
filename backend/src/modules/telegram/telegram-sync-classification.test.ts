@@ -1,7 +1,9 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { AppError } from '../../utils/app-error.js'
 
+const inspectCaptionMetaMock = vi.hoisted(() => vi.fn(() => null))
 vi.mock('./telegram-metadata-cache.js', () => ({
-  inspectCaptionMeta: vi.fn(() => null),
+  inspectCaptionMeta: inspectCaptionMetaMock,
 }))
 
 import { applyOutcomeStats, classifyTelegramDocument } from './telegram-sync-classification.js'
@@ -42,6 +44,10 @@ const stats = (): TelegramSyncRunStats => ({
   matchedByPathCount: 0,
   recoveredCount: 0,
   trashedCount: 0,
+})
+
+beforeEach(() => {
+  inspectCaptionMetaMock.mockClear()
 })
 
 describe('Telegram sync classification boundary', () => {
@@ -101,6 +107,34 @@ describe('Telegram sync classification boundary', () => {
       ingest,
       findPlacedFile,
     })).resolves.toMatchObject({ outcome: { kind: 'imported', strategy: 'recovered', action: 'inboxed' } })
+  })
+
+  it('reports unreadable encrypted metadata for an orphan instead of inboxing it', async () => {
+    const ingest = vi.fn().mockRejectedValue(new AppError(
+      'TELEGRAM_METADATA_DECRYPT_FAILED',
+      'Telegram metadata decryption failed.',
+      400,
+    ))
+
+    const result = await classifyTelegramDocument({
+      document,
+      existing: null,
+      fetchedCaption: '9drive:id=stable-1\n9drive:meta=v1:not-a-payload',
+      ingest,
+      findPlacedFile: vi.fn(),
+    })
+
+    expect(result).toEqual({
+      outcome: {
+        kind: 'unreadableMeta',
+        telegramFileId: document.remoteId,
+        errorCode: 'TELEGRAM_METADATA_DECRYPT_FAILED',
+        errorMessage: 'Telegram metadata decryption failed.',
+      },
+      fileIdToStamp: null,
+    })
+    expect(ingest).toHaveBeenCalledOnce()
+    expect(inspectCaptionMetaMock).not.toHaveBeenCalled()
   })
 
   it('keeps outcome statistics as a pure operation', () => {

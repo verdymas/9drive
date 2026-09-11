@@ -32,12 +32,32 @@ describe('buildTelegramMetadataCache', () => {
 
     expect(cache.cryptoVersion).toBe('v1')
     expect(cache.metadataFingerprint).toMatch(/^[a-f0-9]{64}$/)
-    expect(cache.encryptedMetadata).toMatch(/^9drive:meta=v1:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$/)
+    expect(cache.encryptedMetadata).toMatch(/^v1:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$/)
+    expect(cache.encryptedMetadata).not.toContain('9drive:meta=')
     // The cached ciphertext must not leak the logical name or path.
     expect(cache.encryptedMetadata).not.toContain('movie.mkv')
     expect(cache.encryptedMetadata).not.toContain('Movies')
     expect(cache.physicalFilename).toMatch(/^tg_[a-f0-9]{32}\.bin$/)
     expect(cache.physicalFilename).not.toContain('movie')
+  })
+
+  it('normalizes raw, full-line, and double-prefixed values before fast-path comparison', async () => {
+    setEnv({ encryption: true, obfuscate: true })
+    const { resolveCaptionMeta } = await import('./telegram-metadata-cache.js')
+
+    expect(resolveCaptionMeta('v1:ABC', '9drive:meta=v1:ABC')).toEqual({ status: 'cached' })
+    expect(resolveCaptionMeta('9drive:meta=9drive:meta=v1:ABC', 'v1:ABC')).toEqual({ status: 'cached' })
+  })
+
+  it('persists a raw encrypted metadata value when given a legacy caption line', async () => {
+    setEnv({ encryption: true, obfuscate: true })
+    const { storeCaptionCiphertext } = await import('./telegram-metadata-cache.js')
+
+    await storeCaptionCiphertext('user-1', 'file-1', '9drive:meta=9drive:meta=v1:ABC', INPUT)
+
+    expect(updateMock).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ encryptedMetadata: 'v1:ABC' }),
+    }))
   })
 
   it('writes nothing when encryption and obfuscation are both disabled (legacy plaintext preserved)', async () => {

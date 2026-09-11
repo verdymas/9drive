@@ -7,20 +7,21 @@ import {
   serializeTelegramMetaLine,
   telegramCryptoEnabled,
   telegramObfuscateFilenameEnabled,
-  NINE_DRIVE_META_PREFIX,
   TELEGRAM_CRYPTO_ERROR_CODES,
   TELEGRAM_CRYPTO_VERSION,
   type RecoveryMetadata,
 } from './telegram-crypto.service.js'
+import { normalizeTelegramMetaValue, parseCaption } from './telegram-metadata.js'
 
 /**
  * Telegram metadata cache persistence (Phase 2).
  *
  * One helper for writing the protected-metadata cache block on a `File` row:
- * `physicalFilename`, `encryptedMetadata`, `metadataFingerprint`,
- * `cryptoVersion`. Canonical logical state lives in the normal File columns;
- * these are the cached recovery representation, refreshed only when the
- * canonical recovery metadata changes (rename/move/upload).
+ * `physicalFilename`, raw `encryptedMetadata` (`v1:...`),
+ * `metadataFingerprint`, and `cryptoVersion`. Canonical logical state lives
+ * in the normal File columns; these are the cached recovery representation,
+ * refreshed only when the canonical recovery metadata changes
+ * (rename/move/upload).
  *
  * Behavior matrix:
  *   - Encryption disabled → NO cached ciphertext; columns left untouched
@@ -48,8 +49,9 @@ export function buildTelegramMetadataCache(input: RecoveryMetadata & { fileId: s
   if (telegramCryptoEnabled()) {
     const fingerprint = calculateMetadataFingerprint(input)
     const metaLine = serializeTelegramMetaLine(input)
+    const metaValue = normalizeTelegramMetaValue(metaLine)
     data.metadataFingerprint = fingerprint
-    data.encryptedMetadata = metaLine
+    data.encryptedMetadata = metaValue
     data.cryptoVersion = 'v1'
   }
 
@@ -109,14 +111,19 @@ export type CaptionMetaResolution =
 
 export function resolveCaptionMeta(captionMeta: string | null, cached: string | null): CaptionMetaResolution {
   if (!captionMeta) return { status: 'none' }
+  const normalizedCaptionMeta = normalizeTelegramMetaValue(captionMeta)
+  if (normalizedCaptionMeta === null) {
+    return { status: 'failed', code: TELEGRAM_CRYPTO_ERROR_CODES.MALFORMED, message: 'The encrypted Telegram metadata payload is malformed.' }
+  }
+  const normalizedCached = normalizeTelegramMetaValue(cached)
   // Fast path: identical ciphertext means the canonical metadata behind it is
   // unchanged, so there is nothing to reconcile and no reason to decrypt.
-  if (cached !== null && cached === captionMeta) return { status: 'cached' }
+  if (normalizedCached !== null && normalizedCached === normalizedCaptionMeta) return { status: 'cached' }
   if (!telegramCryptoEnabled()) {
     return { status: 'failed', code: TELEGRAM_CRYPTO_ERROR_CODES.KEY_NOT_CONFIGURED, message: 'Encrypted Telegram metadata was found but encryption is not enabled.' }
   }
   try {
-    return { status: 'changed', meta: decryptRecoveryMetadata(captionMeta) }
+    return { status: 'changed', meta: decryptRecoveryMetadata(normalizedCaptionMeta) }
   } catch (error) {
     return {
       status: 'failed',
@@ -132,16 +139,17 @@ export function resolveCaptionMeta(captionMeta: string | null, cached: string | 
  * malformed, unsupported version), else `null`. Pure — no DB I/O.
  */
 export function inspectCaptionMeta(caption: string | null, cached: string | null): { code: string; message: string } | null {
-  const line = caption?.split('\n').find((l) => l.startsWith(NINE_DRIVE_META_PREFIX))?.trim()
-  if (!line) return null
-  const resolution = resolveCaptionMeta(line, cached)
+  const parsed = parseCaption(caption)
+  if (!parsed.encryptedMeta) return null
+  const resolution = resolveCaptionMeta(parsed.encryptedMeta, cached)
   return resolution.status === 'failed' ? { code: resolution.code, message: resolution.message } : null
 }
 
 /**
- * Cache the caption's OWN ciphertext verbatim after it has been reconciled
- * into the DB, so the next sync hits the `cached` fast path. Re-encrypting
- * here would mint a fresh IV and force a decrypt on every run.
+ * Cache the caption's own ciphertext after it has been reconciled into the
+ * DB, normalized to the raw value so the next sync hits the `cached` fast
+ * path. Re-encrypting here would mint a fresh IV and force a decrypt on every
+ * run.
  */
 export async function storeCaptionCiphertext(
   userId: string,
@@ -149,10 +157,12 @@ export async function storeCaptionCiphertext(
   metaLine: string,
   fingerprintInput: RecoveryMetadata & { fileId: string },
 ): Promise<void> {
+  const metaValue = normalizeTelegramMetaValue(metaLine)
+  if (metaValue === null) return
   await prisma.file.update({
     where: { id: fileId, userId },
     data: {
-      encryptedMetadata: metaLine,
+      encryptedMetadata: metaValue,
       metadataFingerprint: calculateMetadataFingerprint(fingerprintInput),
       cryptoVersion: TELEGRAM_CRYPTO_VERSION,
     },

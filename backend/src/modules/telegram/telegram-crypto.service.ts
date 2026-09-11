@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import { env } from '../../config/env.js'
 import { AppError } from '../../utils/app-error.js'
+import { normalizeTelegramMetaValue, toTelegramMetaLine } from './telegram-metadata.js'
 
 /**
  * Telegram metadata protection — opaque physical filenames + recoverable
@@ -209,7 +210,10 @@ export function detectMetadataVersion(payload: string): string | null {
  *  raw payload (`v1:<encrypted>`) or the full caption line
  *  (`9drive:meta=v1:<encrypted>`). Throws typed errors. */
 export function decryptRecoveryMetadata(payload: string): RecoveryMetadata {
-  const stripped = stripMetaKeyPrefix(payload)
+  const stripped = normalizeTelegramMetaValue(payload)
+  if (stripped === null) {
+    throw new AppError(TELEGRAM_CRYPTO_ERROR_CODES.MALFORMED, 'The encrypted Telegram metadata payload is malformed.', 400)
+  }
   const version = detectMetadataVersion(stripped)
   if (version !== TELEGRAM_CRYPTO_VERSION) {
     throw new AppError(TELEGRAM_CRYPTO_ERROR_CODES.UNSUPPORTED_VERSION, `Unsupported Telegram metadata version "${version ?? 'unknown'}".`, 400)
@@ -236,10 +240,10 @@ export function decryptRecoveryMetadata(payload: string): RecoveryMetadata {
 
 /** Build a full `9drive:meta=v1:<payload>` line from canonical recovery metadata. */
 export function serializeTelegramMetaLine(meta: RecoveryMetadata): string {
-  return `${NINE_DRIVE_META_PREFIX}${TELEGRAM_CRYPTO_VERSION}:${encryptMetadata(buildRecoveryMetadata(meta))}`
+  return toTelegramMetaLine(`${TELEGRAM_CRYPTO_VERSION}:${encryptMetadata(buildRecoveryMetadata(meta))}`)!
 }
 
 /** Extract the raw encrypted payload from a `9drive:meta=...` caption line (or raw payload). */
 export function stripMetaKeyPrefix(line: string): string {
-  return line.startsWith(NINE_DRIVE_META_PREFIX) ? line.slice(NINE_DRIVE_META_PREFIX.length) : line
+  return normalizeTelegramMetaValue(line) ?? ''
 }

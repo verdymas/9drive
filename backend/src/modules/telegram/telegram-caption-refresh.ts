@@ -4,6 +4,7 @@ import { getTelegramConfig } from './telegram.service.js'
 import { updateTelegramDocumentCaption } from './telegram-caption.service.js'
 import { buildTelegramMetadataCache, telegramCryptoEnabled } from './telegram-metadata-cache.js'
 import { calculateMetadataFingerprint } from './telegram-crypto.service.js'
+import { normalizeTelegramMetaValue } from './telegram-metadata.js'
 
 /**
  * Best-effort refresh of the Telegram document caption for a 9Drive file.
@@ -37,7 +38,7 @@ export async function refreshTelegramCaption(userId: string, fileId: string): Pr
 
   // Default to the cached ciphertext so an unrelated caption edit never
   // STRIPS the meta line off the Telegram message.
-  let encryptedMeta: string | null = file.encryptedMetadata
+  let encryptedMeta: string | null = normalizeTelegramMetaValue(file.encryptedMetadata)
   if (telegramCryptoEnabled()) {
     const recovery = { fileId: file.telegramStableId, name: file.name, path: logicalPath, mimeType: file.mimeType, size: file.sizeBytes }
     // Unchanged canonical metadata → no re-encryption, reuse the cache.

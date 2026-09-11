@@ -49,5 +49,13 @@ account-local FloodWait behavior.
 ## Data/Metadata
 Use `telegramStableId` plus caption metadata. Never bind logical identity to a Telegram message ID.
 
+Encrypted recovery metadata has two representations: the raw value is
+`v1:<payload>` and the Telegram caption line is
+`9drive:meta=v1:<payload>`. New `File.encryptedMetadata` cache writes use the
+raw value; existing full-line cache values and legacy double-prefixed caption
+lines remain readable through normalization. Full sync scans do not rewrite
+all Telegram captions; caption repair remains bounded to existing metadata
+refresh actions.
+
 ## Existing Deep Reference
 `docs/implementation/telegram-drive.md` in the repository contains longer historical implementation details.

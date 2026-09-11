@@ -44,6 +44,17 @@ describe('resolveCaptionMeta — sync fast path', () => {
     expect(result.status === 'changed' && result.meta).toMatchObject({ name: 'new.mkv', path: 'Movies/new.mkv' })
   })
 
+  it('decrypts a valid legacy double-prefixed caption value', async () => {
+    const { crypto, cache } = await load()
+    const canonical = crypto.serializeTelegramMetaLine({ name: 'movie.mkv', path: 'Movies/movie.mkv' })
+    const legacy = canonical.replace('9drive:meta=', '9drive:meta=9drive:meta=')
+
+    const result = cache.resolveCaptionMeta(legacy, null)
+
+    expect(result.status).toBe('changed')
+    expect(result.status === 'changed' && result.meta).toMatchObject({ name: 'movie.mkv', path: 'Movies/movie.mkv' })
+  })
+
   it('reports a failure (never throws) when the payload is tampered with', async () => {
     const { crypto, cache } = await load()
     const line = crypto.serializeTelegramMetaLine({ name: 'movie.mkv', path: 'Movies/movie.mkv' })

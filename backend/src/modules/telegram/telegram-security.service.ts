@@ -12,7 +12,7 @@ import {
   type RecoveryMetadata,
   type TelegramCryptoStatus,
 } from './telegram-crypto.service.js'
-import { encodeCaption } from './telegram-metadata.js'
+import { encodeCaption, toTelegramMetaLine } from './telegram-metadata.js'
 
 /**
  * Telegram metadata security utilities (spec §43-§46).
@@ -77,8 +77,10 @@ export async function buildEncryptedCaptionForFile(userId: string, fileId: strin
   const file = await getOwnedTelegramFile(userId, fileId)
   const recovery = await recoveryFor(userId, file)
   const cache = buildTelegramMetadataCache(recovery)
-  const metaLine = String(cache.encryptedMetadata)
-  const caption = encodeCaption({ stableId: recovery.fileId, logicalPath: recovery.path, encryptedMeta: metaLine })
+  const metaValue = typeof cache.encryptedMetadata === 'string' ? cache.encryptedMetadata : null
+  const metaLine = toTelegramMetaLine(metaValue)
+  if (!metaLine) throw new AppError('TELEGRAM_METADATA_INVALID', 'Could not encode the encrypted metadata line for this file.', 400)
+  const caption = encodeCaption({ stableId: recovery.fileId, logicalPath: recovery.path, encryptedMeta: metaValue })
   if (!caption) throw new AppError('TELEGRAM_METADATA_INVALID', 'Could not encode the caption for this file.', 400)
   await createAuditLog(userId, 'telegram.security.encrypt', 'file', file.id, { fileId: file.id })
   return {
@@ -117,14 +119,15 @@ export async function convertFileToEncryptedCaption(userId: string, fileId: stri
   const config = await getTelegramConfig(file.connectedAccountId, userId)
   const recovery = await recoveryFor(userId, file)
   const cache = buildTelegramMetadataCache(recovery)
-  const metaLine = String(cache.encryptedMetadata)
+  const metaValue = typeof cache.encryptedMetadata === 'string' ? cache.encryptedMetadata : null
+  if (!metaValue) throw new AppError('TELEGRAM_METADATA_INVALID', 'Could not encode the encrypted metadata line for this file.', 400)
 
   const result = await updateTelegramDocumentCaption(
     userId,
     { id: file.id, name: file.name, telegramStableId: file.telegramStableId },
     config,
     recovery.path,
-    metaLine,
+    metaValue,
   )
   // Cache only after Telegram accepted the edit, so a failed edit never
   // leaves the DB claiming a ciphertext the message doesn't carry.
