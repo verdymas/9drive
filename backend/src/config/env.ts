@@ -152,8 +152,15 @@ const envSchema = z.object({
   // Page size for `client.iterMessages`. Telegram returns ≤100/page; we keep
   // this configurable for tests / smaller channels.
   TELEGRAM_SYNC_PAGE_SIZE: z.coerce.number().int().min(10).max(200).default(100),
-  // Maximum pages processed in parallel. Spec §21 — bounded concurrency.
+  // BullMQ worker concurrency — the number of independent Telegram account
+  // jobs that may run in parallel inside one worker process. Per-account
+  // serialization is still enforced by the durable `TelegramSyncState`
+  // lock, so this only controls how many distinct accounts share the
+  // worker pool simultaneously. Spec §21 — bounded concurrency.
   TELEGRAM_SYNC_CONCURRENCY: z.coerce.number().int().min(1).max(8).default(2),
+  // Concurrency cap for caption-resolving operations within each Telegram sync
+  // page scan. Bounded range 1 to 16.
+  TELEGRAM_SYNC_CAPTION_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(4),
   // Maximum retries per page on FloodWait. FloodWait itself waits the
   // requested seconds; this caps how many times we re-enter on a row.
   TELEGRAM_SYNC_FLOOD_WAIT_RETRIES: z.coerce.number().int().min(0).max(5).default(3),

@@ -35,9 +35,14 @@ Outbound Telegram documents can carry captions containing:
 ## Safety Invariant
 Synchronization is non-destructive. Issues are resolved through `resolvedAt`; never automatically delete or re-upload files merely to make both sides appear identical.
 
-## Related Files
+## Page-Scoped Reconciliation and Memory Limits
+- Sync memory scales with `TELEGRAM_SYNC_PAGE_SIZE` rather than total channel message count.
+- The database is queried page-locally via `providerFileId IN (...)` for each Telegram page.
+- Observed rows are stamped with `lastSeenSyncRunId = <runId>`.
+- Missing-file detection runs generation-based queries (`lastSeenSyncRunId != runId` or `null`) during complete full scans instead of maintaining full account snapshots in RAM.
 
-- `backend/src/modules/telegram/telegram-sync.service.ts`
-- `backend/src/modules/telegram/telegram-sync.scheduler.ts`
-- `backend/src/modules/telegram/telegram-sync.worker.ts`
-- `backend/src/modules/telegram/telegram-metadata.ts`
+## Concurrency and Single Flight
+- BullMQ worker concurrency is configured by `TELEGRAM_SYNC_CONCURRENCY` (default `2`, allowed range `1`–`8`).
+- Independent connected accounts execute concurrently across available worker slots.
+- Per-account single-flight safety is enforced by the database-backed `TelegramSyncState.status` transition (`status='syncing'`).
+- Lock release occurs in all completion, error, cancellation, and exception paths. FloodWait delays stay local to the affected account job.

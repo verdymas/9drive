@@ -152,7 +152,8 @@ Sources of truth: `backend/src/config/env.ts`, `docker-compose.yml`, and fronten
 - `TELEGRAM_SYNC_AUTO_ENABLED`
 - `TELEGRAM_SYNC_INTERVAL_MINUTES`
 - `TELEGRAM_SYNC_PAGE_SIZE`
-- `TELEGRAM_SYNC_CONCURRENCY`
+- `TELEGRAM_SYNC_CONCURRENCY` — BullMQ worker job concurrency (default `2`, allowed range `1`–`8`). Sets the number of independent Telegram connected accounts processed concurrently per worker process while per-account single-flight safety remains guarded by `TelegramSyncState`.
+- `TELEGRAM_SYNC_CAPTION_CONCURRENCY` — Concurrency cap for caption-resolving operations within each Telegram sync page scan (default `4`, allowed range `1`–`16`).
 - Additional Telegram Sync retry/rate environment parameters: check `env.ts` before changing scheduler behavior.
 
 ## Frontend Build

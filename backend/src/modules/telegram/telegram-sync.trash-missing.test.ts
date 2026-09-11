@@ -51,6 +51,7 @@ const h = vi.hoisted(() => {
         state.issues.push(row); return row
       }),
       count: vi.fn(async () => 0),
+      findFirst: vi.fn(async () => null),
       findMany: vi.fn(async (args: any) => {
         if (args?.where?.kind === 'REMOTE_FILE_MISSING' && args?.where?.resolvedAt === null) {
           return state.priorMissingFlags.filter((f) => f.fileId)
@@ -70,6 +71,16 @@ const h = vi.hoisted(() => {
         if (row) Object.assign(row, data)
         return {}
       }),
+      updateMany: vi.fn(async ({ where, data }: any) => {
+        let count = 0
+        if (where?.id?.in && Array.isArray(where.id.in)) {
+          for (const id of where.id.in) {
+            const row = state.fileRows.find((r) => r.id === id)
+            if (row) { Object.assign(row, data); count += 1 }
+          }
+        }
+        return { count }
+      }),
       upsert: vi.fn(async () => ({})),
     },
     folder: { findFirst: vi.fn(async () => null), create: vi.fn(async () => ({})) },
@@ -81,6 +92,9 @@ const h = vi.hoisted(() => {
 vi.mock('../../config/env.js', () => ({
   env: {
     TELEGRAM_SYNC_TRASH_MISSING: true,
+    TELEGRAM_SYNC_PAGE_SIZE: 100,
+    TELEGRAM_SYNC_FLOOD_WAIT_RETRIES: 0,
+    TELEGRAM_SYNC_CAPTION_CONCURRENCY: 4,
     TELEGRAM_METADATA_ENCRYPTION_ENABLED: false,
     TELEGRAM_OBFUSCATE_FILENAME_ENABLED: false,
     TELEGRAM_OBFUSCATE_FILE_EXTENSION: false,

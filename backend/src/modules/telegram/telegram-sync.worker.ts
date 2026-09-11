@@ -13,9 +13,17 @@ const QUEUE_NAME = 'telegram-sync'
  * (atomic UPDATE on `TelegramSyncState.status`); the worker simply
  * forwards the AppError so BullMQ can retry on transient failures.
  *
+ * Worker concurrency is config-driven via `TELEGRAM_SYNC_CONCURRENCY`
+ * (default 2, bounded 1–8): independent accounts can occupy separate
+ * worker slots, while the durable per-account lock still serializes the
+ * same account. FloodWait waits happen inside the affected job, so other
+ * accounts remain schedulable.
+ *
  * The worker is registered in the API process alongside the queue;
  * Telegram sync is metadata-only (no file downloads) and runs at a
- * low cadence, so a dedicated worker process would be overkill.
+ * low cadence, so a dedicated worker process would be overkill. When
+ * the worker is scaled out across processes, the durable DB lock is
+ * still authoritative.
  */
 
 let workerInstance: Worker<TelegramSyncJobData> | null = null
@@ -39,7 +47,10 @@ export function startTelegramSyncWorker() {
   workerInstance = new Worker<TelegramSyncJobData>(
     QUEUE_NAME,
     async (job) => processTelegramSyncJob(job),
-    { connection: { url: env.REDIS_URL }, concurrency: 1 },
+    {
+      connection: { url: env.REDIS_URL },
+      concurrency: env.TELEGRAM_SYNC_CONCURRENCY,
+    },
   )
   workerInstance.on('failed', (job, error) => {
     console.error('[telegram-sync-worker]', JSON.stringify({

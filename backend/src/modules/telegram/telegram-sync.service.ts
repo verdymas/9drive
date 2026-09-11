@@ -197,7 +197,9 @@ export async function runTelegramSync(
   }
 
   // Atomic lock: refuse to overwrite a `syncing` state row. Spec §20.
-  const state = await acquireSyncLock(accountId, userId)
+  const state = options.skipLock
+    ? { previousStatus: 'never_synced', lastMessageId: null, skipRelease: true }
+    : await acquireSyncLock(accountId, userId)
   if (!state) {
     throw new AppError('SYNC_ALREADY_RUNNING', 'A Telegram synchronization is already running for this account.', 409)
   }
@@ -342,7 +344,7 @@ export async function runTelegramSync(
     // Always release the single-flight guard, even on throw. Only
     // release if WE acquired it — the throw may have originated from
     // the lock acquisition itself (state === null).
-    if (state) {
+    if (state && !('skipRelease' in state)) {
       await prisma.telegramSyncState.updateMany({
         where: { connectedAccountId: accountId, status: 'syncing' },
         data: { status: state.previousStatus },
@@ -380,6 +382,26 @@ async function acquireSyncLock(accountId: string, userId: string) {
 
 type ScanResult = TelegramSyncRunStats & { maxSeenMessageId: bigint | null }
 
+/** Subset of `File` the sync path needs for classification. */
+type TelegramFileRow = {
+  id: string
+  providerFileId: string
+  name: string
+  mimeType: string
+  sizeBytes: bigint
+  folderId: string | null
+  telegramStableId: string | null
+  status: string
+  encryptedMetadata: string | null
+}
+
+type FileByProviderFileId = Map<string, TelegramFileRow>
+
+type ClassifyResult = {
+  outcome: DocumentOutcome
+  fileIdToStamp: string | null
+}
+
 async function scanChannel(input: {
   userId: string
   accountId: string
@@ -402,24 +424,6 @@ async function scanChannel(input: {
     }
     const channelId = normalizeChannelId((channel as { id?: unknown }).id ?? config.channelId)
 
-    const seenFileIds = new Set<string>()
-    const existingRows = await prisma.file.findMany({
-      where: {
-        userId,
-        connectedAccountId: accountId,
-        provider: 'telegram',
-        // Both active and soft-deleted rows participate in reconciliation:
-        // soft-deleted rows are still expected to map to a Telegram message,
-        // so a `REMOTE_FILE_MISSING` issue on them is meaningful.
-        status: { in: ['active', 'deleted'] },
-      },
-      select: { id: true, providerFileId: true, name: true, folderId: true, telegramStableId: true, mimeType: true, sizeBytes: true, status: true, encryptedMetadata: true },
-    })
-    const fileByProviderFileId = new Map<string, { id: string; name: string; mimeType: string; sizeBytes: bigint; folderId: string | null; telegramStableId: string | null; status: string; encryptedMetadata: string | null }>()
-    for (const row of existingRows) {
-      fileByProviderFileId.set(row.providerFileId, row)
-    }
-
     // Paginate by message id (Telegram exposes monotonically increasing
     // message ids per channel). Spec §22 — large channel support.
     let minId = resumeFromMessageId ? Number(resumeFromMessageId) : 0
@@ -431,31 +435,69 @@ async function scanChannel(input: {
       if (page.length === 0) break
       pageCount += 1
 
-      for (const rawDocument of page) {
-        const document: TelegramDocument = {
-          remoteId: buildTelegramRemoteId(channelId, rawDocument.messageId),
-          channelId,
-          messageId: rawDocument.messageId,
-          name: rawDocument.name,
-          size: rawDocument.size,
-          mimeType: rawDocument.mimeType,
-          caption: rawDocument.caption,
-        }
-        seenFileIds.add(document.remoteId)
+      const documents: TelegramDocument[] = page.map((rawDocument) => ({
+        remoteId: buildTelegramRemoteId(channelId, rawDocument.messageId),
+        channelId,
+        messageId: rawDocument.messageId,
+        name: rawDocument.name,
+        size: rawDocument.size,
+        mimeType: rawDocument.mimeType,
+        caption: rawDocument.caption,
+      }))
 
+      // Page-scoped DB lookup: only the identifiers in THIS page are queried,
+      // so peak retained state scales with page size rather than total
+      // indexed files. Both active and soft-deleted rows participate in
+      // reconciliation: a soft-deleted row whose Telegram message is still
+      // there must not be re-imported. Pass 2 (missing detection) only flags
+      // active rows, matching the pre-optimization diff.
+      const pageRemoteIds = documents.map((d) => d.remoteId)
+      const pageRows = await prisma.file.findMany({
+        where: {
+          userId,
+          connectedAccountId: accountId,
+          provider: 'telegram',
+          status: { in: ['active', 'deleted'] },
+          providerFileId: { in: pageRemoteIds },
+        },
+        select: { id: true, providerFileId: true, name: true, folderId: true, telegramStableId: true, mimeType: true, sizeBytes: true, status: true, encryptedMetadata: true },
+      })
+      const fileByProviderFileId: FileByProviderFileId = new Map()
+      for (const row of pageRows) {
+        fileByProviderFileId.set(row.providerFileId, row)
+      }
+
+      // Phase 3: Bounded caption fetching for orphan documents whose caption
+      // was not included in the page metadata. Uses TELEGRAM_SYNC_CAPTION_CONCURRENCY.
+      const fetchedCaptions = await fetchMissingPageCaptions(
+        client,
+        channel,
+        documents,
+        fileByProviderFileId,
+      )
+
+      const pageSeenFileIds: string[] = []
+
+      for (const document of documents) {
         try {
-          const outcome = await classifyOne({
+          const { outcome, fileIdToStamp } = await classifyOne({
             userId,
             accountId,
             document,
             fileByProviderFileId,
-            getCaption: (remoteId) => fetchCaptionForRemoteId(client, channel, remoteId),
+            fetchedCaption: fetchedCaptions.get(document.remoteId) ?? null,
+            runId: input.runId,
           })
+
+          if (fileIdToStamp) {
+            pageSeenFileIds.push(fileIdToStamp)
+          }
+
           applyOutcomeStats(stats, outcome)
           await recordOutcome({ outcome, runId: input.runId, userId, accountId, document })
           logSyncDocument({ runId: input.runId, accountId, outcome })
-          if (rawDocument.messageId > (maxSeen ? Number(maxSeen) : 0)) {
-            maxSeen = BigInt(rawDocument.messageId)
+          if (document.messageId > (maxSeen ? Number(maxSeen) : 0)) {
+            maxSeen = BigInt(document.messageId)
           }
         } catch (error) {
           stats.errorCount += 1
@@ -474,6 +516,15 @@ async function scanChannel(input: {
         }
       }
 
+      // Phase 3: Batch update lastSeenSyncRunId for all observed files in this page
+      const uniquePageSeenIds = Array.from(new Set(pageSeenFileIds))
+      if (uniquePageSeenIds.length > 0) {
+        await prisma.file.updateMany({
+          where: { id: { in: uniquePageSeenIds }, userId },
+          data: { lastSeenSyncRunId: input.runId },
+        })
+      }
+
       // Pages arrive in ascending id order (`reverse: true`), so the last
       // item carries the highest id in the page — advance the cursor to it.
       const lastMessageId = page[page.length - 1].messageId
@@ -482,42 +533,55 @@ async function scanChannel(input: {
       if (page.length < pageSize) stop = true // short page = end of channel
     }
 
-    // ── Pass 2: detect DB rows whose Telegram message disappeared ────
-    // Existing rows not seen in this scan are flagged as
-    // `REMOTE_FILE_MISSING`. Soft-deleted rows also participate: a
-    // missing message on a trashed row is still a reconciliation
-    // signal that the user can resolve.
+    // ── Pass 2: generation-based missing detection ─────────────────────
+    // Active rows NOT stamped with the current run's id (or never stamped —
+    // legacy rows are flagged too, matching the previous account-wide diff)
+    // have no live Telegram message and are flagged `REMOTE_FILE_MISSING`.
+    // The durable `lastSeenSyncRunId` stamp makes this an account-scoped,
+    // index-backed query (`@@index([connectedAccountId, status,
+    // lastSeenSyncRunId])`) instead of loading every row into RAM.
     //
-    // FULL SCANS ONLY. `existingRows` is an account-wide snapshot while
-    // `seenFileIds` holds just this run's pages, so on an incremental run
-    // every row below the cursor is "unseen" and would be falsely flagged.
-    // Missing-detection needs a complete scan to be meaningful.
+    // FULL SCANS ONLY: on an incremental run every row below the cursor is
+    // legitimately "unseen" and would be falsely flagged. Missing-detection
+    // needs a complete scan to be meaningful.
     if (resumeFromMessageId === null) {
       // Trashing is destructive, so it requires a CLEAN scan. Pass 1
-      // swallows per-document errors and continues (see classifyOne catch
-      // at ~:457-471), which can leave `seenFileIds` incomplete — a row
-      // absent only because its page errored must not be mistaken for a
-      // deleted message. Flagging still happens either way; only the
-      // soft-delete is withheld when any per-document error occurred.
-      // Whole-page fetch failures already abort the run before Pass 2.
+      // swallows per-document errors and continues, which can leave a row
+      // unstamped — a row absent only because its page errored must not be
+      // mistaken for a deleted message. Flagging still happens either way;
+      // only the soft-delete is withheld when any per-document error
+      // occurred. Whole-page fetch failures already abort the run before
+      // Pass 2.
       const trashMissing = env.TELEGRAM_SYNC_TRASH_MISSING && stats.errorCount === 0
-      for (const row of existingRows) {
-        if (seenFileIds.has(row.providerFileId)) continue
-        // Soft-deleted rows that were manually removed in 9Drive should
-        // NOT generate a missing-remote issue — the user explicitly
-        // deleted them. We only flag active rows.
-        if (row.status === 'deleted') continue
+      const unseenRows = await prisma.file.findMany({
+        where: {
+          userId,
+          connectedAccountId: accountId,
+          provider: 'telegram',
+          status: 'active',
+          OR: [
+            { lastSeenSyncRunId: null },
+            { lastSeenSyncRunId: { not: input.runId } },
+          ],
+        },
+        select: { id: true, name: true, status: true, lastSeenSyncRunId: true },
+      })
+      for (const row of unseenRows) {
+        // Soft-deleted rows should never generate a missing-remote issue.
+        // Also defends against mocks/edge cases where where.status was ignored.
+        if (row.status && row.status !== 'active') continue
+        // Defensive in-memory filter (covers mocks and rows stamped between
+        // the query and this loop): never flag a row observed this run.
+        if (row.lastSeenSyncRunId === input.runId) continue
         stats.missingCount += 1
         stats.scannedCount += 1
-        await prisma.telegramSyncIssue.create({
-          data: {
-            userId,
-            runId: input.runId,
-            connectedAccountId: accountId,
-            kind: 'REMOTE_FILE_MISSING',
-            fileId: row.id,
-            metadata: { name: row.name },
-          },
+        await createIssueIfOpenNotExists({
+          userId,
+          runId: input.runId,
+          connectedAccountId: accountId,
+          kind: 'REMOTE_FILE_MISSING',
+          fileId: row.id,
+          metadata: { name: row.name },
         })
         // Opt-in auto-trash. Soft-delete only (recoverable from Trash),
         // never hard-delete, never touches the Telegram message itself
@@ -541,11 +605,13 @@ async function classifyOne(input: {
   userId: string
   accountId: string
   document: TelegramDocument
-  fileByProviderFileId: Map<string, { id: string; name: string; mimeType: string; sizeBytes: bigint; folderId: string | null; telegramStableId: string | null; status: string; encryptedMetadata: string | null }>
-  /** Fetches the caption for a remote id; `null` when the fetch fails. */
-  getCaption: (remoteId: string) => Promise<string | null>
-}): Promise<DocumentOutcome> {
-  const { document, fileByProviderFileId, getCaption } = input
+  fileByProviderFileId: FileByProviderFileId
+  /** Pre-fetched caption when document.caption was null on the page fetch. */
+  fetchedCaption: string | null
+  /** Current sync run ID — stamped on every row observed this run. */
+  runId: string
+}): Promise<ClassifyResult> {
+  const { document, fileByProviderFileId, fetchedCaption } = input
 
   // Physical identity match by `providerFileId`.
   const existing = fileByProviderFileId.get(document.remoteId)
@@ -566,30 +632,30 @@ async function classifyOne(input: {
       // from the page fetch, so this costs no extra Telegram round-trip.
       const failure = inspectCaptionMeta(document.caption ?? null, existing.encryptedMetadata)
       if (failure) {
-        return { kind: 'unreadableMeta', telegramFileId: document.remoteId, errorCode: failure.code, errorMessage: failure.message }
+        return {
+          outcome: { kind: 'unreadableMeta', telegramFileId: document.remoteId, errorCode: failure.code, errorMessage: failure.message },
+          fileIdToStamp: existing.id,
+        }
       }
-      return { kind: 'matched' }
+      return {
+        outcome: { kind: 'matched' },
+        fileIdToStamp: existing.id,
+      }
     }
     return {
-      kind: 'conflict',
-      telegramFileId: document.remoteId,
-      reason: 'size mismatch',
-      file: { id: existing.id, name: existing.name },
+      outcome: {
+        kind: 'conflict',
+        telegramFileId: document.remoteId,
+        reason: 'size mismatch',
+        file: { id: existing.id, name: existing.name },
+      },
+      fileIdToStamp: existing.id,
     }
   }
 
-  // Orphan: Telegram-only document. Fetch the caption and delegate to
-  // the ingest path so a valid 9drive:id / 9drive:path caption routes
-  // the file to its logical location instead of the recovery inbox.
-  // The fetch is best-effort — a transient caption read failure falls
-  // back to the legacy "no caption" behaviour (which still lands the
-  // file in the recovery folder rather than dropping it).
-  let caption: string | null = null
-  try {
-    caption = await getCaption(document.remoteId)
-  } catch {
-    caption = null
-  }
+  // Orphan: Telegram-only document. Fast path uses page caption if present;
+  // falls back to pre-fetched caption or null.
+  const caption = document.caption ?? fetchedCaption ?? null
   const parsed = parseCaption(caption)
   // The strategy is decided by what the caption carries. The ingest
   // service itself picks the resolution branch in the same order
@@ -616,6 +682,8 @@ async function classifyOne(input: {
       select: { id: true, folderId: true },
     })
 
+    const fileIdToStamp = placed?.id ?? null
+
     // Inbox routing is always a "recovered" outcome, regardless of
     // whether the caption had partial metadata (e.g. a `9drive:id` that
     // didn't match any row, or a `9drive:path` that was rejected as
@@ -627,24 +695,62 @@ async function classifyOne(input: {
 
     if (outcome === 'created' || outcome === 'inboxed') {
       return {
-        kind: 'imported',
-        telegramFileId: document.remoteId,
-        strategy: finalStrategy,
-        virtualPath: parsed.logicalPath,
-        fileId: placed?.id ?? null,
-        parentFolderId: placed?.folderId ?? null,
-        action: outcome,
+        outcome: {
+          kind: 'imported',
+          telegramFileId: document.remoteId,
+          strategy: finalStrategy,
+          virtualPath: parsed.logicalPath,
+          fileId: placed?.id ?? null,
+          parentFolderId: placed?.folderId ?? null,
+          action: outcome,
+        },
+        fileIdToStamp,
       }
     }
-    return { kind: 'matched' }
+    return {
+      outcome: { kind: 'matched' },
+      fileIdToStamp,
+    }
   } catch (error) {
     return {
-      kind: 'error',
-      telegramFileId: document.remoteId,
-      errorCode: error instanceof AppError ? error.code : 'TELEGRAM_UNKNOWN_ERROR',
-      errorMessage: error instanceof Error ? error.message.slice(0, 200) : 'unknown',
+      outcome: {
+        kind: 'error',
+        telegramFileId: document.remoteId,
+        errorCode: error instanceof AppError ? error.code : 'TELEGRAM_UNKNOWN_ERROR',
+        errorMessage: error instanceof Error ? error.message.slice(0, 200) : 'unknown',
+      },
+      fileIdToStamp: null,
     }
   }
+}
+
+/**
+ * Pre-fetches captions in bounded chunks (`TELEGRAM_SYNC_CAPTION_CONCURRENCY`)
+ * for orphan documents whose page metadata lacked caption text.
+ */
+async function fetchMissingPageCaptions(
+  client: TelegramClient,
+  channel: unknown,
+  documents: TelegramDocument[],
+  fileByProviderFileId: FileByProviderFileId,
+): Promise<Map<string, string | null>> {
+  const captions = new Map<string, string | null>()
+  const needingFetch = documents.filter(
+    (d) => !fileByProviderFileId.has(d.remoteId) && (d.caption === null || d.caption === undefined),
+  )
+  if (needingFetch.length === 0) return captions
+
+  const concurrency = env.TELEGRAM_SYNC_CAPTION_CONCURRENCY
+  for (let i = 0; i < needingFetch.length; i += concurrency) {
+    const chunk = needingFetch.slice(i, i + concurrency)
+    await Promise.all(
+      chunk.map(async (doc) => {
+        const cap = await fetchCaptionForRemoteId(client, channel, doc.remoteId)
+        captions.set(doc.remoteId, cap)
+      }),
+    )
+  }
+  return captions
 }
 
 /**
@@ -745,16 +851,14 @@ async function recordOutcome(input: {
 }): Promise<void> {
   const { outcome, runId, userId, accountId, document } = input
   if (outcome.kind === 'conflict') {
-    await prisma.telegramSyncIssue.create({
-      data: {
-        userId,
-        runId,
-        connectedAccountId: accountId,
-        kind: 'TELEGRAM_METADATA_MISMATCH',
-        telegramFileId: outcome.telegramFileId,
-        fileId: outcome.file.id,
-        metadata: { reason: outcome.reason, telegramName: document.name, dbName: outcome.file.name, size: document.size, mimeType: document.mimeType },
-      },
+    await createIssueIfOpenNotExists({
+      userId,
+      runId,
+      connectedAccountId: accountId,
+      kind: 'TELEGRAM_METADATA_MISMATCH',
+      telegramFileId: outcome.telegramFileId,
+      fileId: outcome.file.id,
+      metadata: { reason: outcome.reason, telegramName: document.name, dbName: outcome.file.name, size: document.size, mimeType: document.mimeType },
     })
     return
   }
@@ -762,15 +866,13 @@ async function recordOutcome(input: {
     // The payload itself is never stored (it is unreadable, possibly
     // attacker-controlled) and neither is any key material — only the code
     // and a truncated message the user can act on.
-    await prisma.telegramSyncIssue.create({
-      data: {
-        userId,
-        runId,
-        connectedAccountId: accountId,
-        kind: 'TELEGRAM_METADATA_UNREADABLE',
-        telegramFileId: outcome.telegramFileId,
-        metadata: { errorCode: outcome.errorCode, reason: outcome.errorMessage.slice(0, 200) },
-      },
+    await createIssueIfOpenNotExists({
+      userId,
+      runId,
+      connectedAccountId: accountId,
+      kind: 'TELEGRAM_METADATA_UNREADABLE',
+      telegramFileId: outcome.telegramFileId,
+      metadata: { errorCode: outcome.errorCode, reason: outcome.errorMessage.slice(0, 200) },
     })
     return
   }
@@ -782,6 +884,54 @@ async function recordOutcome(input: {
     return
   }
   // matched, imported, missing → no extra DB row (counted in stats only).
+}
+
+/**
+ * Create a sync issue only when no identical unresolved issue exists for
+ * this (connectedAccountId, kind, fileId/telegramFileId). When an open issue
+ * already exists, update its runId/metadata to reflect the latest scan
+ * instead of duplicating — keeps the reconciliation log deterministic.
+ */
+async function createIssueIfOpenNotExists(input: {
+  userId: string
+  runId: string
+  connectedAccountId: string
+  kind: 'REMOTE_FILE_MISSING' | 'TELEGRAM_METADATA_MISMATCH' | 'TELEGRAM_METADATA_UNREADABLE'
+  fileId?: string | null
+  telegramFileId?: string | null
+  metadata?: unknown
+}): Promise<void> {
+  const { userId, runId, connectedAccountId, kind, fileId, telegramFileId, metadata } = input
+  const existing = await prisma.telegramSyncIssue.findFirst({
+    where: {
+      connectedAccountId,
+      kind,
+      ...(fileId ? { fileId } : {}),
+      ...(telegramFileId ? { telegramFileId } : {}),
+      resolvedAt: null,
+    },
+    select: { id: true },
+  })
+
+  if (existing) {
+    await prisma.telegramSyncIssue.update({
+      where: { id: existing.id },
+      data: { runId, metadata: metadata ?? undefined },
+    })
+    return
+  }
+
+  await prisma.telegramSyncIssue.create({
+    data: {
+      userId,
+      runId,
+      connectedAccountId,
+      kind,
+      fileId: fileId ?? null,
+      telegramFileId: telegramFileId ?? null,
+      metadata: metadata ?? undefined,
+    },
+  })
 }
 
 /**

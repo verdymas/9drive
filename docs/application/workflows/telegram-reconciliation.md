@@ -19,5 +19,7 @@ flowchart TD
 ## Conflict Handling
 Orphan, missing, and metadata-mismatch conditions are recorded as `TelegramSyncIssue`. Resolution sets `resolvedAt`; do not physically delete issue history as the default behavior.
 
-## Concurrency
-`status='syncing'` acts as a single-flight guard. Rate-limit/FloodWait handling must remain bounded and retry-aware.
+## Concurrency and Scaling
+- `TELEGRAM_SYNC_CONCURRENCY` (default `2`) determines BullMQ worker slot count, letting different accounts scan concurrently.
+- `status='syncing'` acts as the durable database single-flight guard. Simultaneous auto/manual queues for the same account deduplicate safely.
+- Lock release is fully guaranteed on completion, error, cancellation, and worker exceptions. FloodWait waits remain account-local.

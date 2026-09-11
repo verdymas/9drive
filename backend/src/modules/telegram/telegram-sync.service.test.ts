@@ -34,8 +34,8 @@ const h = vi.hoisted(() => {
       findMany: vi.fn(async () => []),
       findFirst: vi.fn(async () => null),
     },
-    telegramSyncIssue: { create: vi.fn(async ({ data }: any) => { state.issues.push(data); return data }), count: vi.fn(async () => 0), findMany: vi.fn(async () => []), update: vi.fn(async () => ({})), updateMany: vi.fn(async () => ({ count: 0 })) },
-    file: { findFirst: vi.fn(async () => null), findMany: vi.fn(async () => state.fileRows), create: vi.fn(async () => ({})), update: vi.fn(async () => ({})), upsert: vi.fn(async () => ({})) },
+    telegramSyncIssue: { create: vi.fn(async ({ data }: any) => { state.issues.push(data); return data }), count: vi.fn(async () => 0), findMany: vi.fn(async () => []), findFirst: vi.fn(async () => null), update: vi.fn(async () => ({})), updateMany: vi.fn(async () => ({ count: 0 })) },
+    file: { findFirst: vi.fn(async () => null), findMany: vi.fn(async () => state.fileRows), create: vi.fn(async () => ({})), update: vi.fn(async () => ({})), updateMany: vi.fn(async () => ({ count: 0 })), upsert: vi.fn(async () => ({})) },
     folder: { findFirst: vi.fn(async () => null), create: vi.fn(async () => ({})) },
     $transaction: vi.fn(async (ops: any) => Array.isArray(ops) ? Promise.all(ops) : ops),
   }
@@ -55,6 +55,7 @@ vi.mock('./telegram-ingest.service.js', () => ({
 }))
 
 import { runTelegramSync } from './telegram-sync.service.js'
+import { ingestTelegramDocument } from './telegram-ingest.service.js'
 
 function fakeChannel() {
   return { id: 4458806678, title: 'storage', megagroup: false, broadcast: true } as never
@@ -148,13 +149,31 @@ beforeEach(() => {
   h.prismaMock.telegramSyncIssue.create.mockImplementation(async ({ data }: any) => { h.state.issues.push(data); return data })
   h.prismaMock.telegramSyncIssue.count.mockResolvedValue(0)
   h.prismaMock.telegramSyncIssue.findMany.mockResolvedValue([])
+  h.prismaMock.telegramSyncIssue.findFirst.mockResolvedValue(null)
   h.prismaMock.telegramSyncIssue.update.mockResolvedValue({} as any)
   h.prismaMock.telegramSyncIssue.updateMany.mockResolvedValue({ count: 0 })
 
   h.prismaMock.file.findFirst.mockResolvedValue(null)
   h.prismaMock.file.findMany.mockImplementation(async () => h.state.fileRows)
   h.prismaMock.file.create.mockResolvedValue({} as any)
-  h.prismaMock.file.update.mockResolvedValue({} as any)
+  h.prismaMock.file.update.mockImplementation(async ({ where, data }: any) => {
+    const row = h.state.fileRows.find((r) => r.id === where.id)
+    if (row) Object.assign(row, data)
+    return {}
+  })
+  h.prismaMock.file.updateMany.mockImplementation(async ({ where, data }: any) => {
+    let count = 0
+    if (where?.id?.in && Array.isArray(where.id.in)) {
+      for (const id of where.id.in) {
+        const row = h.state.fileRows.find((r) => r.id === id)
+        if (row) {
+          Object.assign(row, data)
+          count += 1
+        }
+      }
+    }
+    return { count }
+  })
   h.prismaMock.file.upsert.mockResolvedValue({} as any)
 
   h.prismaMock.folder.findFirst.mockResolvedValue(null)
@@ -416,5 +435,101 @@ describe('runTelegramSync — caption-driven resolution for orphans', () => {
     expect(result.scannedCount).toBe(1)
     expect(result.importedCount).toBe(1)
     expect(result.recoveredCount).toBe(1)
+  })
+})
+
+describe('runTelegramSync — page-scoped reconciliation and generation stamping', () => {
+  it('queries DB rows page-locally with providerFileId IN filter', async () => {
+    const docs = Array.from({ length: 250 }, (_, i) => ({
+      messageId: i + 1, name: `f${i + 1}.txt`, size: 100, mimeType: 'text/plain',
+    }))
+    const seen: Array<{ minId?: number; limit?: number; reverse?: boolean }> = []
+    h.withTelegramClientMock.mockImplementation(async (_cfg: unknown, fn: (client: TelegramClient) => Promise<unknown>) =>
+      fn(paginatingClient(docs, seen)),
+    )
+
+    await runTelegramSync('user-1', 'acc-1')
+
+    const findManyCalls = h.prismaMock.file.findMany.mock.calls
+    const pageLookups = findManyCalls.filter(([args]: any) => args?.where?.providerFileId?.in)
+    expect(pageLookups.length).toBe(3) // 3 pages for 250 docs (100, 100, 50)
+    for (const [args] of pageLookups) {
+      expect(args.where.userId).toBe('user-1')
+      expect(args.where.connectedAccountId).toBe('acc-1')
+      expect(args.where.provider).toBe('telegram')
+      expect(args.where.providerFileId.in.length).toBeLessThanOrEqual(100)
+    }
+  })
+
+  it('stamps observed rows with lastSeenSyncRunId during sync', async () => {
+    const docs = [{ messageId: 1, name: 'a.txt', size: 100, mimeType: 'text/plain' }]
+    h.state.fileRows = [
+      { id: 'f1', providerFileId: 'telegram://4458806678/1', name: 'a.txt', mimeType: 'text/plain', sizeBytes: 100n, folderId: null, telegramStableId: null, status: 'active', deletedAt: null } as any,
+    ]
+    h.withTelegramClientMock.mockImplementation(async (_cfg: unknown, fn: (client: TelegramClient) => Promise<unknown>) =>
+      fn(fakeClient({ documents: docs })),
+    )
+
+    await runTelegramSync('user-1', 'acc-1')
+
+    // Phase 3 batches the generation stamp: one updateMany per page.
+    const stampCall = h.prismaMock.file.updateMany.mock.calls.find(([args]: any) => args?.data?.lastSeenSyncRunId === 'run-1')
+    expect(stampCall).toBeDefined()
+    expect(stampCall[0].where.id.in).toContain('f1')
+    expect(stampCall[0].where.userId).toBe('user-1')
+    expect(h.state.issues.length).toBe(0)
+  })
+})
+
+describe('runTelegramSync — Phase 3 optimizations (captions, batching, issue dedup)', () => {
+  it('uses caption from page payload directly without calling getMessages', async () => {
+    const docs = [{ messageId: 1, name: 'direct.mkv', size: 100, mimeType: 'video/x-matroska' }]
+    const getMessagesSpy = vi.fn()
+    h.withTelegramClientMock.mockImplementation(async (_cfg: unknown, fn: (client: TelegramClient) => Promise<unknown>) => {
+      return fn({
+        async connect() {}, async disconnect() {},
+        async getInputEntity() { return {} as never },
+        async getEntity() { return fakeChannel() },
+        iterMessages() {
+          return (async function* () {
+            yield { id: 1, message: '9drive:id=stable-direct\n9drive:path=Movies/direct.mkv', document: { size: 100, mimeType: 'video/x-matroska', attributes: [{ fileName: 'direct.mkv' }] } }
+          })()
+        },
+        getMessages: getMessagesSpy,
+      } as unknown as TelegramClient)
+    })
+
+    await runTelegramSync('user-1', 'acc-1')
+
+    // Since caption came on page yield, getMessages was never called.
+    expect(getMessagesSpy).not.toHaveBeenCalled()
+    expect(ingestTelegramDocument).toHaveBeenCalledWith(
+      'user-1',
+      'acc-1',
+      expect.objectContaining({ remoteId: 'telegram://4458806678/1' }),
+      '9drive:id=stable-direct\n9drive:path=Movies/direct.mkv',
+    )
+  })
+
+  it('updates existing unresolved issue instead of creating duplicate on re-scan', async () => {
+    const docs = [{ messageId: 1, name: 'mismatch.txt', size: 200, mimeType: 'text/plain' }]
+    h.state.fileRows = [
+      { id: 'f1', providerFileId: 'telegram://4458806678/1', name: 'mismatch.txt', mimeType: 'text/plain', sizeBytes: 100n, folderId: null, telegramStableId: null, status: 'active' },
+    ]
+    h.withTelegramClientMock.mockImplementation(async (_cfg: unknown, fn: (client: TelegramClient) => Promise<unknown>) =>
+      fn(fakeClient({ documents: docs })),
+    )
+
+    // Simulate an existing open issue
+    h.prismaMock.telegramSyncIssue.findFirst.mockResolvedValueOnce({ id: 'issue-100', resolvedAt: null } as any)
+
+    await runTelegramSync('user-1', 'acc-1')
+
+    expect(h.prismaMock.telegramSyncIssue.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'issue-100' },
+        data: expect.objectContaining({ runId: 'run-1' }),
+      }),
+    )
   })
 })

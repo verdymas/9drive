@@ -26,7 +26,7 @@ Base `/telegram`:
 - `POST /telegram/sync-issues/bulk-resolve`
 
 ## Runtime
-The Telegram Sync BullMQ worker and periodic scheduler run inside the API process (`server.ts`). This differs from the Remote Import worker, which has its own process/container.
+The Telegram Sync BullMQ worker and periodic scheduler run inside the API process (`server.ts`). Worker concurrency is config-driven via `TELEGRAM_SYNC_CONCURRENCY` (default `2`, allowed range `1`–`8`), enabling multiple accounts to sync concurrently. Same-account serialization is guaranteed by the atomic database state transition. This differs from the Remote Import worker, which has its own process/container.
 
 ## Data/Metadata
 Use `telegramStableId` plus caption metadata. Never bind logical identity to a Telegram message ID.
