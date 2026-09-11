@@ -45,9 +45,9 @@ worker process. It never starts work that would consume the configured free
 space reserve. A capacity shortage remains a recoverable `queued` import at
 the `waiting` stage with `RESOURCE_WAITING`; it is re-delayed rather than
 reported as a provider or download failure. The safe diagnostic stored for the
-operator contains only free, reserved, and required byte counts plus stage and
-import ID. Reservations are released when work completes, fails, cancels, or
-is deferred.
+operator contains only free, reserved, and required byte counts, stage, import
+ID, and a snapshot of the process-wide HLS segment/FFmpeg permit counters.
+Reservations are released when work completes, fails, cancels, or is deferred.
 
 ## Worker budgets
 

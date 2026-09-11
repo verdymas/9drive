@@ -10,6 +10,20 @@ export type TempStorageDiagnostics = {
   reservedBytes: bigint
   requiredBytes: bigint
   reason: 'free_space_reserve'
+  resourceControls: HlsResourceDiagnostics
+}
+
+/** Snapshot included with capacity deferrals so operators can correlate a
+ * constrained temp volume with concurrent HLS network/conversion activity. */
+export type HlsResourceDiagnostics = {
+  hlsSegmentPermits: PermitDiagnostics
+  ffmpegPermits: PermitDiagnostics
+}
+
+export type PermitDiagnostics = {
+  limit: number
+  active: number
+  waiting: number
 }
 
 export type TempReservationInput = {
@@ -35,7 +49,10 @@ export type TempReservationResult =
 export class TempStorageReservations {
   private reservedBytes = 0n
 
-  constructor(private readonly inspect: () => Promise<{ freeBytes: bigint }> = inspectTempStorage) {}
+  constructor(
+    private readonly inspect: () => Promise<{ freeBytes: bigint }> = inspectTempStorage,
+    private readonly resourceDiagnostics: () => HlsResourceDiagnostics = getHlsResourceDiagnostics,
+  ) {}
 
   async tryAcquire(input: TempReservationInput): Promise<TempReservationResult> {
     const { freeBytes } = await this.inspect()
@@ -52,6 +69,7 @@ export class TempStorageReservations {
           reservedBytes: this.reservedBytes,
           requiredBytes,
           reason: 'free_space_reserve',
+          resourceControls: this.resourceDiagnostics(),
         },
       }
     }
@@ -155,7 +173,18 @@ export class FairSemaphore {
     error.name = 'AbortError'
     return error
   }
+
+  diagnostics(): PermitDiagnostics {
+    return { limit: this.limit, active: this.active, waiting: this.waiters.length }
+  }
 }
 
 export const hlsSegmentPermits = new FairSemaphore(env.REMOTE_IMPORT_HLS_GLOBAL_SEGMENT_CONCURRENCY)
 export const ffmpegPermits = new FairSemaphore(env.REMOTE_IMPORT_HLS_FFMPEG_CONCURRENCY)
+
+export function getHlsResourceDiagnostics(): HlsResourceDiagnostics {
+  return {
+    hlsSegmentPermits: hlsSegmentPermits.diagnostics(),
+    ffmpegPermits: ffmpegPermits.diagnostics(),
+  }
+}

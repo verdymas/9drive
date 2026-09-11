@@ -29,6 +29,31 @@ describe('TempStorageReservations', () => {
     })
   })
 
+  it('includes global HLS resource counters in a temporary-storage deferral diagnostic', async () => {
+    const reservations = new TempStorageReservations(
+      async () => ({ freeBytes: 150n }),
+      () => ({
+        hlsSegmentPermits: { limit: 12, active: 4, waiting: 3 },
+        ffmpegPermits: { limit: 2, active: 1, waiting: 0 },
+      }),
+    )
+
+    await expect(reservations.tryAcquire({
+      importId: 'import-a',
+      stage: 'segments',
+      requiredBytes: 60n,
+      reserveBytes: 100n,
+    })).resolves.toMatchObject({
+      admitted: false,
+      diagnostics: {
+        resourceControls: {
+          hlsSegmentPermits: { limit: 12, active: 4, waiting: 3 },
+          ffmpegPermits: { limit: 2, active: 1, waiting: 0 },
+        },
+      },
+    })
+  })
+
   it('releases a reservation exactly once so later work can be admitted', async () => {
     const reservations = new TempStorageReservations(async () => ({ freeBytes: 1_000n }))
     const first = await reservations.tryAcquire({

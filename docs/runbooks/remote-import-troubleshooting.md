@@ -32,6 +32,9 @@ that contains `REMOTE_IMPORT_TEMP_DIR`; do not delete an active import's
 artifacts. Adjust the free-space reserve or conservative unknown/HLS
 reservation only after confirming the worker volume can safely support the
 expected workload. The next delayed queue attempt rechecks capacity.
+The stored diagnostic also includes current HLS segment and FFmpeg permit
+limits, active holders, and queued waiters so capacity pressure can be
+correlated with worker activity without exposing the source URL or credentials.
 
 ## 4. Fetch Failure
 
