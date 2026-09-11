@@ -72,6 +72,9 @@ const envSchema = z.object({
   REMOTE_IMPORT_TEMP_FREE_SPACE_RESERVE_BYTES: z.coerce.number().default(2 * 1024 * 1024 * 1024),
   REMOTE_IMPORT_TEMP_UNKNOWN_RESERVATION_BYTES: z.coerce.number().default(5 * 1024 * 1024 * 1024),
   REMOTE_IMPORT_TEMP_HLS_RESERVATION_BYTES: z.coerce.number().default(10 * 1024 * 1024 * 1024),
+  // Bounded read/upload unit for eligible range-resumable stream-through
+  // direct imports. Also satisfies S3's non-final multipart minimum.
+  REMOTE_IMPORT_STREAM_THROUGH_CHUNK_BYTES: z.coerce.number().int().min(5 * 1024 * 1024).max(64 * 1024 * 1024).default(8 * 1024 * 1024),
   // Max time a `queued` import may sit without evidence of a valid waiting/
   // delayed queue job before the reconcile sweep starts checking queue state.
   REMOTE_IMPORT_QUEUE_START_TIMEOUT_SECONDS: z.coerce.number().default(300),

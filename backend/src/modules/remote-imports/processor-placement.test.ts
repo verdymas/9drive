@@ -71,9 +71,15 @@ const h = vi.hoisted(() => {
     resolvePlacement: vi.fn(),
     downloader: vi.fn(),
     googleUploader: vi.fn(async () => ({ providerFileId: 'drive-file-1', name: 'movie.mkv', mimeType: 'video/x-matroska', sizeBytes: 1000n })),
+    googleStreamUploader: vi.fn(async () => ({ providerFileId: 'drive-stream-1', name: 'movie.mkv', mimeType: 'video/x-matroska', sizeBytes: 1000n })),
     audit: vi.fn(async () => undefined),
     s3UploadSpy: vi.fn(async () => undefined),
+    s3CreateMultipart: vi.fn(async () => 'stream-upload-1'),
+    s3ListParts: vi.fn(async () => []),
+    s3UploadPart: vi.fn(async () => 'stream-etag-1'),
+    s3CompleteMultipart: vi.fn(async () => undefined),
     tempInspector: vi.fn(async () => ({ freeBytes: 100_000_000_000n })),
+    streamRangeProbe: false,
   }
 })
 
@@ -137,6 +143,7 @@ vi.mock('./temp-storage.js', async (importOriginal) => {
 
 vi.mock('./google-resumable-uploader.js', () => ({
   uploadToGoogleResumable: (...args: unknown[]) => h.googleUploader(...args),
+  uploadGoogleResumableStream: (...args: unknown[]) => h.googleStreamUploader(...args),
 }))
 
 vi.mock('../../utils/crypto.js', () => ({
@@ -155,6 +162,29 @@ vi.mock('./secure-fetcher.js', () => ({
     const mockFetcher = {
       fetch: vi.fn(async (input: any) => {
         const url = input.url as string
+        if (h.streamRangeProbe && input.range === 'bytes=0-0') {
+          return {
+            status: 206,
+            headers: { 'content-range': 'bytes 0-0/1000', 'content-length': '1', 'content-type': 'video/x-matroska' },
+            body: (async function* () { yield new Uint8Array([1]) })(),
+            finalUrl: url,
+            redirectCount: 0,
+          }
+        }
+        if (h.streamRangeProbe && typeof input.range === 'string') {
+          const match = /^bytes=(\d+)-(\d+)$/.exec(input.range)
+          if (match) {
+            const start = Number(match[1])
+            const end = Number(match[2])
+            return {
+              status: 206,
+              headers: { 'content-range': `bytes ${start}-${end}/1000`, 'content-length': String(end - start + 1), 'content-type': 'video/x-matroska' },
+              body: (async function* () { yield new Uint8Array(end - start + 1) })(),
+              finalUrl: url,
+              redirectCount: 0,
+            }
+          }
+        }
         if (input.method === 'HEAD') {
           return {
             status: 200,
@@ -232,6 +262,10 @@ vi.mock('../google/google.service.js', () => ({
 vi.mock('../s3/s3.service.js', () => ({
   getS3ConfigForAccount: vi.fn(async () => ({ bucket: 'test', region: 'us-east-1' })),
   uploadS3Object: (...args: unknown[]) => h.s3UploadSpy(...args),
+  createS3MultipartUpload: (...args: unknown[]) => h.s3CreateMultipart(...args),
+  listS3MultipartParts: (...args: unknown[]) => h.s3ListParts(...args),
+  uploadS3MultipartPart: (...args: unknown[]) => h.s3UploadPart(...args),
+  completeS3MultipartUpload: (...args: unknown[]) => h.s3CompleteMultipart(...args),
   buildS3ObjectKey: vi.fn(() => 'provider/object-key.mkv'),
   syncS3Quota: vi.fn(async () => undefined),
 }))
@@ -241,6 +275,7 @@ import { resolveUploadPlacement } from '../storage/upload-placement.service.js'
 
 function reset() {
   vi.clearAllMocks()
+  h.streamRangeProbe = false
   h.tempInspector.mockResolvedValue({ freeBytes: 100_000_000_000n })
   h.rows.clear()
   h.rows.set('import-1', h.baseRow())
@@ -302,6 +337,39 @@ describe('processRemoteImportJob — placement routing (direct)', () => {
     // Import completed.
     const finalRow = h.rows.get('import-1')!
     expect(finalRow.status).toBe('completed')
+  })
+
+  it('uses the resumable Google stream path only after a verified range probe', async () => {
+    h.streamRangeProbe = true
+    const accA = account('acc-a', 'google_drive')
+    h.resolvePlacement.mockResolvedValue({
+      connectedAccount: accA,
+      folderStorageLocation: { id: 'loc-movies-a', folderId: 'movies', connectedAccountId: 'acc-a', provider: 'google_drive', providerFolderId: 'drive-movies-a' },
+    })
+
+    await processRemoteImportJob(job())
+
+    expect(h.googleStreamUploader).toHaveBeenCalledWith(expect.objectContaining({
+      accountId: 'acc-a', totalBytes: 1000n, state: null,
+    }))
+    expect(h.googleUploader).not.toHaveBeenCalled()
+    expect(h.rows.get('import-1')).toMatchObject({ status: 'completed', downloadedBytes: 1000n, uploadedBytes: 1000n })
+  })
+
+  it('uses persisted S3 multipart state for a verified range source', async () => {
+    h.streamRangeProbe = true
+    const accS3 = account('acc-s3', 's3')
+    h.resolvePlacement.mockResolvedValue({
+      connectedAccount: accS3,
+      folderStorageLocation: { id: 'loc-movies-s3', folderId: 'movies', connectedAccountId: 'acc-s3', provider: 's3', providerFolderId: 's3-movies' },
+    })
+
+    await processRemoteImportJob(job())
+
+    expect(h.s3CreateMultipart).toHaveBeenCalled()
+    expect(h.s3UploadPart).toHaveBeenCalledWith(expect.anything(), 'provider/object-key.mkv', 'stream-upload-1', 1, expect.any(Buffer))
+    expect(h.s3CompleteMultipart).toHaveBeenCalledWith(expect.anything(), 'provider/object-key.mkv', 'stream-upload-1', [{ PartNumber: 1, ETag: 'stream-etag-1' }])
+    expect(h.rows.get('import-1')).toMatchObject({ status: 'completed', streamUploadStateEncrypted: null })
   })
 
   it('defers a resource-starved import without downloading or failing it', async () => {

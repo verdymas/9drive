@@ -196,7 +196,7 @@ export async function abortS3MultipartUpload(config: S3Config, key: string, uplo
  */
 export async function listS3MultipartParts(config: S3Config, key: string, uploadId: string) {
   const response = await createS3Client(config).send(new ListPartsCommand({ Bucket: config.bucket, Key: key, UploadId: uploadId }))
-  return (response.Parts ?? []).map((part) => ({ partNumber: part.PartNumber ?? 0, size: BigInt(part.Size ?? 0) }))
+  return (response.Parts ?? []).map((part) => ({ partNumber: part.PartNumber ?? 0, size: BigInt(part.Size ?? 0), eTag: part.ETag ?? null }))
 }
 
 export async function headS3Object(config: S3Config, key: string) {

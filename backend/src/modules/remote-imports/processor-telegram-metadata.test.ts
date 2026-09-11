@@ -137,6 +137,7 @@ vi.mock('./temp-storage.js', async (importOriginal) => {
 
 vi.mock('./google-resumable-uploader.js', () => ({
   uploadToGoogleResumable: (...args: unknown[]) => h.googleUploader(...args),
+  uploadGoogleResumableStream: vi.fn(),
 }))
 
 vi.mock('./secure-fetcher.js', () => ({
@@ -169,6 +170,10 @@ vi.mock('../google/google.service.js', () => ({
 vi.mock('../s3/s3.service.js', () => ({
   getS3ConfigForAccount: vi.fn(async () => ({ bucket: 'test', region: 'us-east-1' })),
   uploadS3Object: vi.fn(async () => undefined),
+  createS3MultipartUpload: vi.fn(async () => 'stream-upload-1'),
+  listS3MultipartParts: vi.fn(async () => []),
+  uploadS3MultipartPart: vi.fn(async () => 'stream-etag-1'),
+  completeS3MultipartUpload: vi.fn(async () => undefined),
   buildS3ObjectKey: vi.fn(() => 'provider/object-key.mkv'),
   syncS3Quota: vi.fn(async () => undefined),
 }))

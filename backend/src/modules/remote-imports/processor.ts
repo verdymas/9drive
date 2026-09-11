@@ -8,7 +8,7 @@ import { createAuditLog } from '../../utils/audit.js'
 import { decryptText, encryptText } from '../../utils/crypto.js'
 import { decryptRequestContext, hopHeaderResolver, type RemoteImportRequestContext } from './request-context.js'
 import { ensureGoogleAppFolder, getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
-import { buildS3ObjectKey, getS3ConfigForAccount, syncS3Quota, uploadS3Object } from '../s3/s3.service.js'
+import { buildS3ObjectKey, completeS3MultipartUpload, createS3MultipartUpload, getS3ConfigForAccount, listS3MultipartParts, syncS3Quota, uploadS3MultipartPart, uploadS3Object } from '../s3/s3.service.js'
 import { getTelegramConfig, markTelegramReauthRequired, uploadTelegramDocument } from '../telegram/telegram.service.js'
 import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
 import { uploadTelegramDocumentWithCrypto } from '../telegram/telegram-caption.service.js'
@@ -17,7 +17,7 @@ import { logicalPathForFileId } from '../files/file-logical-path.js'
 import { resolveUploadPlacement } from '../storage/upload-placement.service.js'
 import type { RemoteImportJobData } from './queue.js'
 import { followRemoteUrl } from './url-downloader.js'
-import { uploadToGoogleResumable } from './google-resumable-uploader.js'
+import { uploadGoogleResumableStream, uploadToGoogleResumable, type GoogleStreamUploadState } from './google-resumable-uploader.js'
 import { createTempPartFile, removeTempFile, appendStreamToTemp, tempFilePath } from './temp-storage.js'
 import { sanitizeFileName } from './filename-sanitize.js'
 import { runHlsPipeline } from './hls/pipeline.js'
@@ -29,6 +29,7 @@ import { hasDriver, resolveDriver } from '../remote-fetch-workers/driver-registr
 import { REMOTE_FETCH_WORKER_ERROR_CODES } from '../remote-fetch-workers/errors.js'
 import { createSecureFetcherForWorkerId, type SecureRemoteFetcher } from './secure-fetcher.js'
 import { estimateTempReservation, tempStorageReservations, type TempStorageDiagnostics, type TempStorageStage } from './resource-control.js'
+import { getStreamThroughEligibility, readVerifiedRange } from './stream-through.js'
 
 const STAGES = {
   PROBING: 'probing',
@@ -175,6 +176,151 @@ async function admitTempStorage(
   }).catch(() => undefined)
   console.warn(`[remote-import] ${importId} deferred: temporary storage reserve would be consumed`)
   return null
+}
+
+function readGoogleStreamState(encrypted: string | null | undefined): GoogleStreamUploadState | null {
+  if (!encrypted) return null
+  try {
+    const parsed = JSON.parse(decryptText(encrypted)) as GoogleStreamUploadState
+    if (parsed.provider !== 'google_drive' || typeof parsed.sessionUri !== 'string' || !/^\d+$/.test(parsed.nextOffset)) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Complete the opt-in Google stream-through path. It is selected only after
+ * placement confirms the provider and every source slice is revalidated by
+ * `readVerifiedRange`; returning false keeps the universal temp-spool path.
+ */
+async function tryGoogleStreamThrough(input: {
+  importId: string
+  record: { userId: string; folderId: string | null; connectedAccountId: string | null; fileName: string; mimeType: string | null; sourceType: string | null; streamUploadStateEncrypted?: string | null }
+  sourceUrl: string
+  requestContext?: RemoteImportRequestContext
+  fetcher: SecureRemoteFetcher
+  contentLength: bigint | null
+  sourceRangeSupported: boolean
+}) {
+  if (input.contentLength == null || !input.sourceRangeSupported) return false
+  await updateStage(input.importId, STAGES.SELECTING_STORAGE)
+  const placement = await resolveUploadPlacement(input.record.userId, input.record.folderId, input.record.connectedAccountId, input.contentLength, undefined, 'remote-import')
+  const account = placement.connectedAccount
+  const eligibility = getStreamThroughEligibility({
+    sourceType: input.record.sourceType,
+    sourceRangeSupported: input.sourceRangeSupported,
+    contentLength: input.contentLength,
+    provider: account.provider,
+  })
+  if (!eligibility.eligible || account.provider !== 'google_drive') return false
+
+  await updateStage(input.importId, STAGES.UPLOADING, { uploadTotalBytes: input.contentLength, uploadedBytes: 0 })
+  const progress = throttledProgressUpdater(input.importId, STAGES.UPLOADING)
+  const uploaded = await uploadGoogleResumableStream({
+    accountId: account.id,
+    fileName: input.record.fileName,
+    mimeType: input.record.mimeType ?? 'application/octet-stream',
+    parentProviderFolderId: placement.folderStorageLocation.providerFolderId,
+    totalBytes: input.contentLength,
+    chunkBytes: BigInt(env.REMOTE_IMPORT_STREAM_THROUGH_CHUNK_BYTES),
+    state: readGoogleStreamState(input.record.streamUploadStateEncrypted),
+    readChunk: (offset, length) => readVerifiedRange(input.fetcher as any, input.sourceUrl, offset, length, input.contentLength!, input.requestContext),
+    saveState: async (state) => {
+      await prisma.remoteImport.update({ where: { id: input.importId }, data: { streamUploadStateEncrypted: encryptText(JSON.stringify(state)) } })
+    },
+    onProgress: (uploadedBytes) => { void progress({ uploadedBytes: uploadedBytes.toString(), downloadedBytes: uploadedBytes.toString() }) },
+  })
+  const file = await registerFile(
+    input.importId,
+    { ...input.record, connectedAccountId: account.id },
+    uploaded.providerFileId,
+    input.contentLength,
+  )
+  await prisma.remoteImport.update({
+    where: { id: input.importId },
+    data: {
+      status: 'completed', stage: STAGES.FINISHED, fileId: file.id, completedAt: new Date(),
+      downloadedBytes: input.contentLength, uploadedBytes: input.contentLength, uploadTotalBytes: input.contentLength,
+      streamUploadStateEncrypted: null, tempPath: null, finalUrlEncrypted: encryptText(input.sourceUrl),
+    },
+  })
+  syncGoogleQuota(account.id).catch(() => undefined)
+  return true
+}
+
+type S3StreamUploadState = {
+  provider: 's3'
+  uploadId: string
+  key: string
+  fileId: string
+  parts: Array<{ partNumber: number; eTag: string; size: string }>
+}
+
+function readS3StreamState(encrypted: string | null | undefined): S3StreamUploadState | null {
+  if (!encrypted) return null
+  try {
+    const state = JSON.parse(decryptText(encrypted)) as S3StreamUploadState
+    if (state.provider !== 's3' || !state.uploadId || !state.key || !state.fileId || !Array.isArray(state.parts)) return null
+    return state
+  } catch {
+    return null
+  }
+}
+
+async function tryS3StreamThrough(input: {
+  importId: string
+  record: { userId: string; folderId: string | null; connectedAccountId: string | null; fileName: string; mimeType: string | null; sourceType: string | null; streamUploadStateEncrypted?: string | null }
+  sourceUrl: string
+  requestContext?: RemoteImportRequestContext
+  fetcher: SecureRemoteFetcher
+  contentLength: bigint | null
+  sourceRangeSupported: boolean
+}) {
+  if (input.contentLength == null || !input.sourceRangeSupported) return false
+  await updateStage(input.importId, STAGES.SELECTING_STORAGE)
+  const placement = await resolveUploadPlacement(input.record.userId, input.record.folderId, input.record.connectedAccountId, input.contentLength, undefined, 'remote-import')
+  const account = placement.connectedAccount
+  const eligibility = getStreamThroughEligibility({ sourceType: input.record.sourceType, sourceRangeSupported: input.sourceRangeSupported, contentLength: input.contentLength, provider: account.provider })
+  if (!eligibility.eligible || account.provider !== 's3') return false
+  const config = await getS3ConfigForAccount(account.id, input.record.userId)
+  let state = readS3StreamState(input.record.streamUploadStateEncrypted)
+  if (!state) {
+    const provisional = await prisma.file.create({
+      data: { userId: input.record.userId, connectedAccountId: account.id, folderId: input.record.folderId, provider: 's3', providerFileId: 'pending', name: input.record.fileName, mimeType: input.record.mimeType ?? 'application/octet-stream', sizeBytes: 0n, status: 'uploading' },
+    })
+    const key = buildS3ObjectKey(config, input.record.userId, provisional.id, input.record.fileName, input.record.folderId ? placement.folderStorageLocation.providerFolderId : undefined)
+    state = { provider: 's3', uploadId: await createS3MultipartUpload(config, key, input.record.mimeType ?? 'application/octet-stream'), key, fileId: provisional.id, parts: [] }
+  } else {
+    const parts = await listS3MultipartParts(config, state.key, state.uploadId)
+    state.parts = parts.map((part) => ({ partNumber: part.partNumber, eTag: part.eTag ?? '', size: part.size.toString() })).filter((part) => Boolean(part.eTag))
+  }
+  const saveState = async () => prisma.remoteImport.update({ where: { id: input.importId }, data: { streamUploadStateEncrypted: encryptText(JSON.stringify(state)) } })
+  await saveState()
+  await updateStage(input.importId, STAGES.UPLOADING, { uploadTotalBytes: input.contentLength, uploadedBytes: 0 })
+  let offset = state.parts.reduce((sum, part) => sum + BigInt(part.size), 0n)
+  let partNumber = state.parts.length + 1
+  const progress = throttledProgressUpdater(input.importId, STAGES.UPLOADING)
+  while (offset < input.contentLength) {
+    const length = input.contentLength - offset > BigInt(env.REMOTE_IMPORT_STREAM_THROUGH_CHUNK_BYTES)
+      ? BigInt(env.REMOTE_IMPORT_STREAM_THROUGH_CHUNK_BYTES)
+      : input.contentLength - offset
+    const chunk = await readVerifiedRange(input.fetcher as any, input.sourceUrl, offset, length, input.contentLength, input.requestContext)
+    const eTag = await uploadS3MultipartPart(config, state.key, state.uploadId, partNumber, chunk)
+    state.parts.push({ partNumber, eTag, size: length.toString() })
+    offset += length
+    partNumber += 1
+    await saveState()
+    await progress({ downloadedBytes: offset.toString(), uploadedBytes: offset.toString() })
+  }
+  await completeS3MultipartUpload(config, state.key, state.uploadId, state.parts.map((part) => ({ PartNumber: part.partNumber, ETag: part.eTag })))
+  const file = await registerFile(input.importId, { ...input.record, connectedAccountId: account.id }, state.key, input.contentLength, { existingFileId: state.fileId })
+  await prisma.remoteImport.update({
+    where: { id: input.importId },
+    data: { status: 'completed', stage: STAGES.FINISHED, fileId: file.id, completedAt: new Date(), downloadedBytes: input.contentLength, uploadedBytes: input.contentLength, uploadTotalBytes: input.contentLength, streamUploadStateEncrypted: null, tempPath: null, finalUrlEncrypted: encryptText(input.sourceUrl) },
+  })
+  syncS3Quota(account.id).catch(() => undefined)
+  return true
 }
 
 /** Fetch + stream a remote URL to a temp part file with byte cap and idle timeout. */
@@ -864,10 +1010,13 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
     // Probe the URL: via SecureRemoteFetcher (Direct or relay) — never raw followRemoteUrl
     let finalUrl: string
     let probedContentLength: bigint | null = record.totalBytes
+    let sourceRangeSupported = false
     try {
       const probeRes = await fetcher.fetch({ method: 'GET', url: sourceUrl, headers: { Range: 'bytes=0-0' }, range: 'bytes=0-0', requestContext: requestContext as any } as any)
-      const length = probeRes.headers['content-length']
-      const supportsRange = probeRes.headers['accept-ranges'] === 'bytes' || probeRes.status === 206
+      const contentRange = probeRes.headers['content-range']
+      const rangeMatch = /^bytes 0-0\/(\d+)$/.exec(contentRange ?? '')
+      const length = rangeMatch?.[1] ?? probeRes.headers['content-length']
+      sourceRangeSupported = probeRes.status === 206 && rangeMatch != null
       // Drain first chunk to keep probe cheap (server may ignore Range)
       if (probeRes.body) {
         const body = probeRes.body as AsyncIterable<Uint8Array> | string
@@ -884,7 +1033,7 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
           await markFailed(importId, 'DOWNLOAD_TOO_LARGE', 'The remote file exceeds the maximum allowed size.')
           return
         }
-        await prisma.remoteImport.update({ where: { id: importId }, data: { totalBytes: declared, sourceRangeSupported: supportsRange } })
+        await prisma.remoteImport.update({ where: { id: importId }, data: { totalBytes: declared, sourceRangeSupported } })
         probedContentLength = declared
       }
     } catch (error) {
@@ -894,6 +1043,25 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
       }
       throw error
     }
+
+    if (await tryGoogleStreamThrough({
+      importId,
+      record,
+      sourceUrl: finalUrl,
+      requestContext,
+      fetcher,
+      contentLength: probedContentLength,
+      sourceRangeSupported,
+    })) return
+    if (await tryS3StreamThrough({
+      importId,
+      record,
+      sourceUrl: finalUrl,
+      requestContext,
+      fetcher,
+      contentLength: probedContentLength,
+      sourceRangeSupported,
+    })) return
 
     const reservation = await admitTempStorage(importId, 'downloading', record.sourceType, probedContentLength)
     if (!reservation) return 'deferred'
