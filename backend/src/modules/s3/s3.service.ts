@@ -1,17 +1,39 @@
-import { DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3'
+import {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  HeadBucketCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  ListPartsCommand,
+  S3Client,
+  UploadPartCommand,
+} from '@aws-sdk/client-s3'
 import { Upload } from '@aws-sdk/lib-storage'
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import type { ConnectedAccount, File, S3StorageConfig } from '@prisma/client'
 import type { Response } from 'express'
 import type { Readable } from 'node:stream'
 import { prisma } from '../../config/prisma.js'
 import { decryptText } from '../../utils/crypto.js'
+import { streamProxyResponse } from '../files/file-delivery.js'
+import type { FileDeliveryDecision } from '../files/file-delivery.js'
 
 type S3Config = S3StorageConfig
 type FileWithAccount = File & { connectedAccount: ConnectedAccount }
 type StreamOptions = { disposition?: 'inline' | 'attachment' }
 
-function contentDisposition(type: 'inline' | 'attachment', fileName: string) {
-  return `${type}; filename="${fileName.replaceAll('"', '')}"`
+type S3DownloadDecisionOptions = {
+  enabled: boolean
+  ttlSeconds: number
+  range?: string
+  disposition?: 'inline' | 'attachment'
+}
+
+function attachmentDisposition(fileName: string) {
+  return `attachment; filename="${fileName.replaceAll('"', '')}"`
 }
 
 export function createS3Client(config: S3Config) {
@@ -74,6 +96,93 @@ export type UploadS3ObjectOptions = {
   onProgress?: (uploadedBytes: bigint) => void
   /** Abort the managed multipart transfer when the originating request ends. */
   signal?: AbortSignal
+}
+
+/**
+ * Return a direct S3 URL only for the ordinary attachment flow. Preview,
+ * WebDAV, archive, and ranged reads intentionally never call this decision.
+ * Signing failures are non-fatal: the caller retains the complete proxy path.
+ */
+export async function getS3DownloadDecision(
+  file: FileWithAccount,
+  options: S3DownloadDecisionOptions,
+): Promise<FileDeliveryDecision> {
+  if (!options.enabled || file.provider !== 's3' || options.range || options.disposition !== 'attachment') {
+    return { kind: 'proxy' }
+  }
+  try {
+    const config = await getS3ConfigForAccount(file.connectedAccountId, file.userId)
+    const url = await getSignedUrl(
+      createS3Client(config),
+      new GetObjectCommand({
+        Bucket: config.bucket,
+        Key: file.providerFileId,
+        ResponseContentDisposition: attachmentDisposition(file.name),
+      }),
+      { expiresIn: options.ttlSeconds },
+    )
+    return { kind: 'redirect', url }
+  } catch {
+    return { kind: 'proxy' }
+  }
+}
+
+/** S3 multipart primitives. Callers keep authority over account/key/session. */
+export async function createS3MultipartUpload(config: S3Config, key: string, mimeType: string) {
+  const response = await createS3Client(config).send(new CreateMultipartUploadCommand({
+    Bucket: config.bucket,
+    Key: key,
+    ContentType: mimeType,
+  }))
+  if (!response.UploadId) throw new Error('S3 did not return a multipart upload ID.')
+  return response.UploadId
+}
+
+export async function getS3PresignedUploadPartUrl(
+  config: S3Config,
+  key: string,
+  uploadId: string,
+  partNumber: number,
+  expiresIn: number,
+) {
+  return getSignedUrl(
+    createS3Client(config),
+    new UploadPartCommand({ Bucket: config.bucket, Key: key, UploadId: uploadId, PartNumber: partNumber }),
+    { expiresIn },
+  )
+}
+
+export async function completeS3MultipartUpload(
+  config: S3Config,
+  key: string,
+  uploadId: string,
+  parts: Array<{ PartNumber: number; ETag: string }>,
+) {
+  await createS3Client(config).send(new CompleteMultipartUploadCommand({
+    Bucket: config.bucket,
+    Key: key,
+    UploadId: uploadId,
+    MultipartUpload: { Parts: parts },
+  }))
+}
+
+export async function abortS3MultipartUpload(config: S3Config, key: string, uploadId: string) {
+  await createS3Client(config).send(new AbortMultipartUploadCommand({ Bucket: config.bucket, Key: key, UploadId: uploadId }))
+}
+
+/**
+ * Parts the provider actually holds for an in-flight multipart upload. The
+ * authoritative answer for "how far did a direct upload get" — the backend
+ * never saw the bytes, so no local bookkeeping can replace it.
+ */
+export async function listS3MultipartParts(config: S3Config, key: string, uploadId: string) {
+  const response = await createS3Client(config).send(new ListPartsCommand({ Bucket: config.bucket, Key: key, UploadId: uploadId }))
+  return (response.Parts ?? []).map((part) => ({ partNumber: part.PartNumber ?? 0, size: BigInt(part.Size ?? 0) }))
+}
+
+export async function headS3Object(config: S3Config, key: string) {
+  const response = await createS3Client(config).send(new HeadObjectCommand({ Bucket: config.bucket, Key: key }))
+  return { contentLength: BigInt(response.ContentLength ?? 0) }
 }
 
 export async function uploadS3Object(
@@ -146,19 +255,32 @@ export async function syncS3Quota(accountId: string) {
   })
 }
 
-export async function streamS3File(file: FileWithAccount, range: string | undefined, res: Response, options: StreamOptions = {}) {
+export async function streamS3File(
+  file: FileWithAccount,
+  range: string | undefined,
+  res: Response,
+  options: StreamOptions = {},
+  signal?: AbortSignal,
+) {
   const config = await getS3ConfigForAccount(file.connectedAccountId)
   const client = createS3Client(config)
-  const response = await client.send(new GetObjectCommand({ Bucket: config.bucket, Key: file.providerFileId, Range: range }))
-
-  res.status(response.ContentRange ? 206 : 200)
-  res.setHeader('Content-Type', response.ContentType ?? file.mimeType)
-  res.setHeader('Accept-Ranges', 'bytes')
-  if (options.disposition) res.setHeader('Content-Disposition', contentDisposition(options.disposition, file.name))
-  if (response.ContentLength !== undefined) res.setHeader('Content-Length', response.ContentLength.toString())
-  if (response.ContentRange) res.setHeader('Content-Range', response.ContentRange)
+  const response = await client.send(new GetObjectCommand({ Bucket: config.bucket, Key: file.providerFileId, Range: range }), { abortSignal: signal })
 
   const body = response.Body as Readable | undefined
-  if (!body) return res.end()
-  return body.pipe(res)
+  if (!body) {
+    res.status(response.ContentRange ? 206 : 200)
+    res.setHeader('Content-Type', response.ContentType ?? file.mimeType)
+    res.setHeader('Accept-Ranges', 'bytes')
+    return res.end()
+  }
+  return streamProxyResponse(res, {
+    body,
+    status: response.ContentRange ? 206 : 200,
+    contentType: response.ContentType ?? file.mimeType,
+    contentLength: response.ContentLength,
+    contentRange: response.ContentRange,
+    disposition: options.disposition,
+    fileName: file.name,
+    abort: () => body.destroy(),
+  })
 }

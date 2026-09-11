@@ -219,3 +219,111 @@ describe('UploadContext batch preflight', () => {
     expect(preflightCalls).toHaveLength(0)
   })
 })
+
+describe('UploadContext direct S3 fast path', () => {
+  function SingleHarness() {
+    const { uploadFiles, uploadProgress } = useUpload()
+    return <>
+      <button onClick={() => uploadFiles([makeFile('direct.bin', 2)], null, 's3-account')} data-testid="trigger-direct">direct upload</button>
+      <div data-testid="progress-direct">{JSON.stringify(uploadProgress)}</div>
+    </>
+  }
+
+  it('uploads advertised S3 parts to signed URLs then completes server-side', async () => {
+    const apiSpy = vi.spyOn(Api, 'apiFetch').mockImplementation(async (path: string) => {
+      if (path === '/uploads/direct-s3/init') return { mode: 'direct-s3', sessionId: 'direct-1', partSizeBytes: 1 }
+      if (path.startsWith('/uploads/direct-s3/direct-1/parts/')) return { url: `https://s3.example.test/${path.split('/').at(-1)}` }
+      if (path === '/uploads/direct-s3/direct-1/complete') return { status: 'completed', file: { id: 'file-1' } }
+      throw new Error(`unexpected apiFetch path: ${path}`)
+    })
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      if (String(input).startsWith('https://s3.example.test/')) return new Response('', { status: 200, headers: { ETag: 'etag-1' } })
+      throw new Error(`unexpected fetch URL: ${input}`)
+    })
+
+    render(<UploadProvider><SingleHarness /></UploadProvider>)
+    await userEvent.click(screen.getByTestId('trigger-direct'))
+
+    await waitFor(() => expect(apiSpy).toHaveBeenCalledWith('/uploads/direct-s3/direct-1/complete', expect.objectContaining({ method: 'POST' })))
+    expect(fetchSpy.mock.calls.filter(([url]) => String(url).startsWith('https://s3.example.test/'))).toHaveLength(2)
+    expect(JSON.parse(screen.getByTestId('progress-direct').textContent ?? '{}').files[0].status).toBe('done')
+  })
+
+  it('reports each direct part byte count so the server can validate its own layout', async () => {
+    const apiSpy = vi.spyOn(Api, 'apiFetch').mockImplementation(async (path: string) => {
+      if (path === '/uploads/direct-s3/init') return { mode: 'direct-s3', sessionId: 'direct-1', partSizeBytes: 3 }
+      if (path.startsWith('/uploads/direct-s3/direct-1/parts/')) return { url: 'https://s3.example.test/part' }
+      if (path === '/uploads/direct-s3/direct-1/complete') return { status: 'completed', file: { id: 'file-1' } }
+      throw new Error(`unexpected apiFetch path: ${path}`)
+    })
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 200, headers: { ETag: 'etag-1' } }))
+
+    render(<UploadProvider><SingleHarness /></UploadProvider>)
+    await userEvent.click(screen.getByTestId('trigger-direct'))
+
+    await waitFor(() => expect(apiSpy).toHaveBeenCalledWith('/uploads/direct-s3/direct-1/complete', expect.anything()))
+    const completeCall = apiSpy.mock.calls.find(([path]) => path === '/uploads/direct-s3/direct-1/complete')
+    // A 2-byte file with a 3-byte part size is one short final part.
+    expect(JSON.parse(String(completeCall?.[1]?.body))).toEqual({ parts: [{ partNumber: 1, etag: 'etag-1', sizeBytes: 2 }] })
+  })
+
+  it('aborts the owned server session when a direct part fails mid-transfer', async () => {
+    const apiSpy = vi.spyOn(Api, 'apiFetch').mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path === '/uploads/direct-s3/init') return { mode: 'direct-s3', sessionId: 'direct-1', partSizeBytes: 1 }
+      if (path === '/uploads/direct-s3/direct-1/parts/1') return { url: 'https://s3.example.test/1' }
+      if (path === '/uploads/direct-s3/direct-1/abort' && options?.method === 'POST') return { status: 'aborted' }
+      throw new Error(`unexpected apiFetch path: ${path}`)
+    })
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 503 }))
+
+    render(<UploadProvider><SingleHarness /></UploadProvider>)
+    await userEvent.click(screen.getByTestId('trigger-direct'))
+
+    await waitFor(() => expect(apiSpy).toHaveBeenCalledWith('/uploads/direct-s3/direct-1/abort', expect.objectContaining({ method: 'POST' })))
+    const progress = JSON.parse(screen.getByTestId('progress-direct').textContent ?? '{}')
+    expect(progress.files[0].status).toBe('error')
+    expect(progress.files[0].errorMessage).toContain('HTTP 503')
+  })
+
+  it('surfaces the server reroute notice for a soft-pinned direct upload', async () => {
+    const apiSpy = vi.spyOn(Api, 'apiFetch').mockImplementation(async (path: string) => {
+      if (path === '/uploads/direct-s3/init') {
+        return { mode: 'direct-s3', sessionId: 'direct-1', partSizeBytes: 2, targetAccountId: 'other-account', targetAccountEmail: 'other@bucket.test' }
+      }
+      if (path.startsWith('/uploads/direct-s3/direct-1/parts/')) return { url: 'https://s3.example.test/part' }
+      if (path === '/uploads/direct-s3/direct-1/complete') return { status: 'completed', file: { id: 'file-1' } }
+      throw new Error(`unexpected apiFetch path: ${path}`)
+    })
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 200, headers: { ETag: 'etag-1' } }))
+
+    function PinnedHarness() {
+      const { uploadFiles, uploadProgress } = useUpload()
+      return <>
+        <button onClick={() => uploadFiles([makeFile('direct.bin', 2)], null, 's3-account', 'My Bucket')} data-testid="trigger-pinned">upload</button>
+        <div data-testid="progress-pinned">{JSON.stringify(uploadProgress)}</div>
+      </>
+    }
+    render(<UploadProvider><PinnedHarness /></UploadProvider>)
+    await userEvent.click(screen.getByTestId('trigger-pinned'))
+
+    await waitFor(() => expect(apiSpy).toHaveBeenCalledWith('/uploads/direct-s3/direct-1/complete', expect.anything()))
+    const progress = JSON.parse(screen.getByTestId('progress-pinned').textContent ?? '{}')
+    expect(progress.files[0].status).toBe('done')
+    expect(progress.files[0].errorMessage).toBe('No space on My Bucket — uploaded to other@bucket.test instead')
+  })
+
+  it('falls back to the existing resumable upload when direct S3 is unavailable', async () => {
+    const apiSpy = vi.spyOn(Api, 'apiFetch').mockImplementation(async (path: string) => {
+      if (path === '/uploads/direct-s3/init') return { mode: 'server' }
+      if (path === '/uploads/resumable/init') return { sessionId: 'resumable-1', provider: 'google_drive' }
+      throw new Error(`unexpected apiFetch path: ${path}`)
+    })
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(chunkResponse(2, 'completed'))
+
+    render(<UploadProvider><SingleHarness /></UploadProvider>)
+    await userEvent.click(screen.getByTestId('trigger-direct'))
+
+    await waitFor(() => expect(apiSpy).toHaveBeenCalledWith('/uploads/resumable/init', expect.anything()))
+    expect(JSON.parse(screen.getByTestId('progress-direct').textContent ?? '{}').files[0].status).toBe('done')
+  })
+})

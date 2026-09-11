@@ -14,6 +14,40 @@ Sources of truth: `backend/src/config/env.ts`, `docker-compose.yml`, and fronten
 - `MAX_UPLOAD_BYTES`
 - `RECAPTCHA_SECRET_KEY`
 
+## Optional S3 Direct Delivery
+
+- `S3_DIRECT_DOWNLOAD_ENABLED` — defaults to `false`. Enables only eligible,
+  ordinary authenticated S3 attachment-download redirects; proxy delivery
+  remains the fallback and is always used by WebDAV, previews, archives, and
+  range requests.
+- `S3_DIRECT_DOWNLOAD_TTL_SECONDS` — signed URL lifetime in seconds; default
+  `300`, allowed range `30`–`900`.
+- `S3_DIRECT_UPLOAD_ENABLED` — defaults to `false`. Allows browser → S3 direct
+  multipart uploads (payload bytes bypass the backend) via the
+  `/uploads/direct-s3/*` flow when placement resolves to an S3 account; every
+  provider keeps the server-relayed resumable upload as fallback. See
+  `docs/application/features/uploads.md`.
+- `S3_DIRECT_UPLOAD_SESSION_TTL_SECONDS` — direct upload session lifetime in
+  seconds before the sweeper aborts it; default `900`, allowed range
+  `300`–`3600`.
+- `S3_DIRECT_UPLOAD_PART_SIZE_BYTES` — fixed browser part size; default
+  `8388608` (8 MiB), allowed range `5242880` (5 MiB, the S3 multipart minimum)
+  to `67108864` (64 MiB).
+- `S3_DIRECT_UPLOAD_PART_URL_TTL_SECONDS` — presigned part PUT lifetime;
+  default `300`, allowed range `30`–`900`.
+
+## Optional Media Plane (Split Deployment)
+
+- `MEDIA_SERVER_ENABLED` — defaults to `false`. Optional split deployment:
+  when true, the `media-server` entry process serves file media routes
+  (preview/download/batch archive), `/public/files/*` streams, and `/webdav`
+  with the all-in-one server still serving everything (see
+  `docs/runbooks/media-plane.md`).
+- `MEDIA_SERVER_PORT` — media process listen port; default `4001`.
+- `MEDIA_SERVER_SHUTDOWN_DRAIN_TIMEOUT_MS` — bounded graceful-drain window
+  for in-flight streams on SIGTERM/SIGINT in BOTH processes; default `30000`,
+  maximum `120000`.
+
 ## Google OAuth / WebDAV / SMB
 
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` are used by setup/seed/compose; runtime also supports database-backed configuration.

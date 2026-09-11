@@ -10,5 +10,7 @@
 | Telegram connection/storage/sync | `telegram-storage.md` |
 | WebDAV / Jellyfin / SMB | `webdav-smb.md` |
 | Browser Capture extension | `browser-capture.md` |
+| Direct S3 upload expired/leftover | `direct-s3-upload-recovery.md` |
+| Run the optional media plane | `media-plane.md` |
 
 Runbooks are operational procedures. For design changes, return to `application/` or `adr/`.

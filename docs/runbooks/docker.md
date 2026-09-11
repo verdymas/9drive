@@ -8,6 +8,9 @@
 - `backend` — Express API, port 4000
 - `remote-import-worker` — dedicated BullMQ consumer + FFmpeg pipeline
 - `frontend` — nginx production build, host port 5178
+- (optional, profile `media`) `media` — dedicated media plane on port 4001;
+  it is NOT started by a plain `docker compose up`. See
+  `docs/runbooks/media-plane.md`.
 
 Persistent/working volumes include MySQL data and Remote Import temporary/upload staging.
 

@@ -571,6 +571,13 @@ model UploadSession {
   sizeBytes                BigInt            @map("size_bytes")
   status                   String            @db.VarChar(32)
   googleSessionUri         String?           @map("google_session_uri") @db.Text
+  // Direct browser → S3 multipart upload state. These identifiers are server
+  // controlled and never serialized to the browser; only presigned part URLs
+  // leave the API. A failed/expired session is retained for audit/recovery.
+  s3MultipartUploadId      String?           @map("s3_multipart_upload_id") @db.Text
+  s3ObjectKey              String?           @map("s3_object_key") @db.Text
+  s3UploadExpiresAt        DateTime?         @map("s3_upload_expires_at")
+  s3CompletedParts         Json?             @map("s3_completed_parts")
   errorMessage             String?           @map("error_message") @db.Text
   createdAt                DateTime          @default(now()) @map("created_at")
   completedAt              DateTime?         @map("completed_at")
@@ -580,6 +587,7 @@ model UploadSession {
 
   @@index([userId])
   @@index([folderId])
+  @@index([status, s3UploadExpiresAt])
   @@map("upload_sessions")
 }
 

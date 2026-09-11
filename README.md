@@ -492,6 +492,10 @@ docker compose down -v
 - Put frontend/backend behind HTTPS reverse proxy.
 - Rebuild frontend when `VITE_API_URL` changes because Vite embeds env at build time.
 - Rebuild frontend when `VITE_RECAPTCHA_SITE_KEY` changes because Vite embeds env at build time.
+- Optional: run a dedicated media plane for file/WebDAV streaming load with
+  `docker compose --profile media up -d` (service `media`, port 4001). It is
+  purely additive — the all-in-one `backend` keeps serving every route, so
+  rollback is dropping the proxy rules. See `docs/runbooks/media-plane.md`.
 
 ### VPS Deployment (Step-by-Step)
 

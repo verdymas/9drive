@@ -243,7 +243,9 @@ describe('WorkersPage', () => {
     render(<WorkersPage />)
     await waitFor(() => expect(screen.getAllByText('9drive-relay').length).toBeGreaterThan(0))
     await userEvent.click(screen.getByTitle('Delete worker'))
-    await userEvent.click(screen.getByRole('button', { name: /^delete worker$/i }))
+    // Case-sensitive match: the row icon button's title is "Delete worker",
+    // the confirm button's accessible name is "Delete Worker".
+    await userEvent.click(screen.getByRole('button', { name: (name) => name === 'Delete Worker' }))
     await waitFor(() => expect(del).toHaveBeenCalledWith('w-a'))
     // Modal stays open; the error surfaces and the fallback is still clickable.
     expect(screen.getByText('WORKER_DEPROVISION_FAILED')).toBeInTheDocument()

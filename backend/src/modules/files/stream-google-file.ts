@@ -1,6 +1,8 @@
 import type { Response } from 'express'
 import type { ConnectedAccount, File } from '@prisma/client'
+import { Readable } from 'node:stream'
 import { getAuthedGoogleClient } from '../google/google.service.js'
+import { streamProxyResponse } from './file-delivery.js'
 
 type FileWithAccount = File & { connectedAccount: ConnectedAccount }
 type StreamOptions = { disposition?: 'inline' | 'attachment' }
@@ -17,10 +19,6 @@ const googlePreviewExportMimeTypes: Record<string, { mimeType: string; extension
   'application/vnd.google-apps.spreadsheet': { mimeType: 'application/pdf', extension: '.pdf' },
 }
 
-function contentDisposition(type: 'inline' | 'attachment', fileName: string) {
-  return `${type}; filename="${fileName.replaceAll('"', '')}"`
-}
-
 export function withExtension(fileName: string, extension: string) {
   return fileName.toLowerCase().endsWith(extension) ? fileName : `${fileName}${extension}`
 }
@@ -31,7 +29,13 @@ export function normalizeHeaders(headers: Headers | Record<string, string>) {
 }
 
 
-export async function streamGoogleFile(file: FileWithAccount, range: string | undefined, res: Response, options: StreamOptions = {}) {
+export async function streamGoogleFile(
+  file: FileWithAccount,
+  range: string | undefined,
+  res: Response,
+  options: StreamOptions = {},
+  signal?: AbortSignal,
+) {
   const auth = await getAuthedGoogleClient(file.connectedAccount)
   const headers = normalizeHeaders(await auth.getRequestHeaders())
   const exportTarget = (options.disposition === 'inline' ? googlePreviewExportMimeTypes : googleDownloadExportMimeTypes)[file.mimeType]
@@ -45,6 +49,7 @@ export async function streamGoogleFile(file: FileWithAccount, range: string | un
       ...headers,
       ...(range && !exportTarget ? { Range: range } : {}),
     },
+    signal,
   })
 
   if (!response.ok) {
@@ -52,29 +57,24 @@ export async function streamGoogleFile(file: FileWithAccount, range: string | un
     return res.status(response.status).json({ code: 'GOOGLE_FILE_STREAM_FAILED', message: message || response.statusText })
   }
 
-  res.status(response.status)
-  res.setHeader('Content-Type', responseMimeType)
-  res.setHeader('Accept-Ranges', 'bytes')
-  if (options.disposition) res.setHeader('Content-Disposition', contentDisposition(options.disposition, responseFileName))
-
-  const contentLength = response.headers.get('content-length')
-  const contentRange = response.headers.get('content-range')
-  if (contentLength) res.setHeader('Content-Length', contentLength)
-  if (contentRange) res.setHeader('Content-Range', contentRange)
-
   if (!response.body) {
+    res.status(response.status)
+    res.setHeader('Content-Type', responseMimeType)
+    res.setHeader('Accept-Ranges', 'bytes')
     res.end()
     return
   }
-  const reader = response.body.getReader()
-  async function pump(): Promise<void> {
-    const { done, value } = await reader.read()
-    if (done) {
-      res.end()
-      return
-    }
-    res.write(Buffer.from(value))
-    return pump()
-  }
-  return pump()
+  return streamProxyResponse(res, {
+    body: Readable.fromWeb(response.body as never),
+    status: response.status,
+    contentType: responseMimeType,
+    contentLength: response.headers.get('content-length'),
+    contentRange: response.headers.get('content-range'),
+    disposition: options.disposition,
+    fileName: responseFileName,
+    abort: () => {
+      if (!signal?.aborted) return
+      void response.body?.cancel().catch(() => undefined)
+    },
+  })
 }

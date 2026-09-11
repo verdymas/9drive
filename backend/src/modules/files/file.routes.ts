@@ -1,4 +1,4 @@
-import { Router } from 'express'
+import { Router, type Request, type Response, type NextFunction } from 'express'
 import { google } from 'googleapis'
 import { z } from 'zod'
 import { prisma } from '../../config/prisma.js'
@@ -12,6 +12,7 @@ import { deleteTelegramDocuments, getTelegramConfig, openTelegramDocument } from
 import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
 import { ensureFolderStorageLocation } from '../storage/folder-materialization.service.js'
 import { streamProviderFile } from './stream-file.js'
+import { resolveAuthenticatedDownload } from './file-download-delivery.js'
 import { googleDownloadExportMimeTypes, normalizeHeaders, withExtension } from './stream-google-file.js'
 import { GetObjectCommand } from '@aws-sdk/client-s3'
 import { Readable } from 'node:stream'
@@ -21,7 +22,7 @@ import { refreshTelegramCaption } from '../telegram/telegram-caption-refresh.js'
 
 export const fileRouter = Router()
 
-fileRouter.get('/preview/:token', async (req, res, next) => {
+async function handleFilePreview(req: Request, res: Response, next: NextFunction) {
   try {
     const token = String(req.params.token)
     const preview = await prisma.filePreviewToken.findFirst({
@@ -33,7 +34,42 @@ fileRouter.get('/preview/:token', async (req, res, next) => {
   } catch (error) {
     return next(error)
   }
-})
+}
+
+/** Authenticated attachment delivery (opt-in S3 redirect, otherwise proxy). */
+async function handleFileDownload(req: AuthRequest, res: Response, next: NextFunction) {
+  try {
+    const fileId = String(req.params.id)
+    const { file, decision } = await resolveAuthenticatedDownload({
+      userId: req.user!.id,
+      fileId,
+      range: req.headers.range,
+      directS3Enabled: env.S3_DIRECT_DOWNLOAD_ENABLED,
+      directS3TtlSeconds: env.S3_DIRECT_DOWNLOAD_TTL_SECONDS,
+    })
+    if (decision.kind === 'redirect') return res.redirect(302, decision.url)
+    return streamProviderFile(file, req.headers.range, res, { disposition: 'attachment' })
+  } catch (error) {
+    return next(error)
+  }
+}
+
+/**
+ * Media-plane subset of `/files` on the SAME mount prefix: token preview,
+ * authenticated attachment download, and the batch archive stream. Mounted by
+ * both `fileRouter` (so the all-in-one server keeps its exact behavior) and
+ * `createMediaPlaneApp()`, which binds these very handlers — external URLs
+ * and semantics therefore cannot drift between the two planes.
+ */
+export function createFileMediaRouter() {
+  const router = Router()
+  router.get('/preview/:token', handleFilePreview)
+  router.get('/:id/download', requireAuth, handleFileDownload)
+  router.post('/batch-download', requireAuth, handleBatchDownload)
+  return router
+}
+
+fileRouter.get('/preview/:token', handleFilePreview)
 
 fileRouter.use(requireAuth)
 
@@ -525,15 +561,7 @@ fileRouter.get('/:id/view-url', async (req: AuthRequest, res, next) => {
   }
 })
 
-fileRouter.get('/:id/download', async (req: AuthRequest, res, next) => {
-  try {
-    const fileId = String(req.params.id)
-    const file = await prisma.file.findFirstOrThrow({ where: { id: fileId, userId: req.user!.id }, include: { connectedAccount: true } })
-    return streamProviderFile(file, req.headers.range, res, { disposition: 'attachment' })
-  } catch (error) {
-    return next(error)
-  }
-})
+fileRouter.get('/:id/download', handleFileDownload)
 
 fileRouter.delete('/:id', async (req: AuthRequest, res, next) => {
   try {
@@ -547,7 +575,7 @@ fileRouter.delete('/:id', async (req: AuthRequest, res, next) => {
   }
 })
 
-fileRouter.post('/batch-download', async (req: AuthRequest, res, next) => {
+async function handleBatchDownload(req: AuthRequest, res: Response, next: NextFunction) {
   try {
     const body = batchFileSchema.parse(req.body)
     const files = await prisma.file.findMany({
@@ -605,4 +633,6 @@ fileRouter.post('/batch-download', async (req: AuthRequest, res, next) => {
   } catch (error) {
     return next(error)
   }
-})
+}
+
+fileRouter.post('/batch-download', handleBatchDownload)

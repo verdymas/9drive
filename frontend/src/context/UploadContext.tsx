@@ -8,6 +8,16 @@ export type UploadProgressState = { open: boolean; fileName: string; percent: nu
 
 type ResumableSession = { sessionId: string; file: File; folderId?: string | null; targetAccountId?: string | null; errorMessage?: string }
 
+type DirectS3InitResult =
+  | {
+      mode: 'direct-s3'
+      sessionId: string
+      partSizeBytes: number
+      targetAccountId?: string | null
+      targetAccountEmail?: string | null
+    }
+  | { mode: 'server' }
+
 type PreflightPlan = {
   fileName: string
   accountId: string | null
@@ -134,6 +144,40 @@ export function UploadProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  async function uploadSingleFileDirectS3(
+    file: File,
+    init: Extract<DirectS3InitResult, { mode: 'direct-s3' }>,
+    onProgress: (percent: number) => void,
+    notice?: () => void,
+  ) {
+    const parts: Array<{ partNumber: number; etag: string; sizeBytes: number }> = []
+    try {
+      for (let start = 0, partNumber = 1; start < file.size; start += init.partSizeBytes, partNumber += 1) {
+        const end = Math.min(start + init.partSizeBytes, file.size)
+        const signed = await apiFetch<{ url: string }>(`/uploads/direct-s3/${init.sessionId}/parts/${partNumber}`, { method: 'POST' })
+        const response = await fetch(signed.url, { method: 'PUT', body: file.slice(start, end) })
+        if (!response.ok) throw new Error(`Direct S3 part upload failed (HTTP ${response.status})`)
+        const etag = response.headers.get('etag')
+        if (!etag) throw new Error('Direct S3 part upload did not return an ETag.')
+        // The declared part size lets the server cross-check the completion
+        // list against the exact byte layout it advertised.
+        parts.push({ partNumber, etag, sizeBytes: end - start })
+        onProgress(Math.min(99, Math.round((end / file.size) * 100)))
+      }
+      await apiFetch(`/uploads/direct-s3/${init.sessionId}/complete`, {
+        method: 'POST',
+        body: JSON.stringify({ parts }),
+      })
+      onProgress(100)
+      notice?.()
+    } catch (error) {
+      // The server owns the multipart upload ID and performs provider cleanup;
+      // a cleanup failure never replaces the original upload error.
+      await apiFetch(`/uploads/direct-s3/${init.sessionId}/abort`, { method: 'POST' }).catch(() => undefined)
+      throw error
+    }
+  }
+
   async function uploadFiles(filesToUpload: File[], targetFolderId: string | null, targetAccountId?: string | null, pinnedAccountName?: string) {
     if (filesToUpload.length === 0) return
 
@@ -201,39 +245,76 @@ export function UploadProvider({ children }: { children: ReactNode }) {
         continue
       }
       try {
-        await uploadSingleFileResumable(
-          file,
-          targetFolderId,
-          (filePercent) => {
-            setUploadProgress((current) => {
-              const nextFiles = [...current.files]
-              if (nextFiles[i]) {
-                nextFiles[i] = { ...nextFiles[i], percent: filePercent, status: filePercent >= 100 ? 'done' : 'uploading' }
-              }
-              const overallPercent = Math.round(nextFiles.reduce((sum, f) => sum + f.percent, 0) / nextFiles.length)
-              return {
-                ...current,
-                percent: overallPercent,
-                files: nextFiles
-              }
-            })
-          },
-          undefined,
-          plannedIds.get(file.name) ?? targetAccountId,
-          pinnedAccountName,
-          (notice) => {
-            // Soft-pin reroute notice: the chosen account was full, so the
-            // server routed this file elsewhere — keep the row marked done
-            // but attach the explanation for the progress panel.
-            setUploadProgress((current) => {
-              const nextFiles = [...current.files]
-              if (nextFiles[i]) {
-                nextFiles[i] = { ...nextFiles[i], errorMessage: notice }
-              }
-              return { ...current, files: nextFiles }
-            })
-          },
-        )
+        const updateProgress = (filePercent: number) => {
+          setUploadProgress((current) => {
+            const nextFiles = [...current.files]
+            if (nextFiles[i]) {
+              nextFiles[i] = { ...nextFiles[i], percent: filePercent, status: filePercent >= 100 ? 'done' : 'uploading' }
+            }
+            const overallPercent = Math.round(nextFiles.reduce((sum, f) => sum + f.percent, 0) / nextFiles.length)
+            return { ...current, percent: overallPercent, files: nextFiles }
+          })
+        }
+        const requestedAccountId = plannedIds.get(file.name) ?? targetAccountId
+        const rerouteNotice = (routedAccountId?: string | null, routedAccountEmail?: string | null) => {
+          if (!requestedAccountId || !routedAccountId || routedAccountId === requestedAccountId || !pinnedAccountName) return
+          setUploadProgress((current) => {
+            const nextFiles = [...current.files]
+            if (nextFiles[i]) {
+              nextFiles[i] = { ...nextFiles[i], errorMessage: `No space on ${pinnedAccountName} — uploaded to ${routedAccountEmail ?? 'another account'} instead` }
+            }
+            return { ...current, files: nextFiles }
+          })
+        }
+        let direct: DirectS3InitResult = { mode: 'server' }
+        try {
+          direct = await apiFetch<DirectS3InitResult>('/uploads/direct-s3/init', {
+            method: 'POST',
+            body: JSON.stringify({
+              fileName: file.name,
+              mimeType: file.type || 'application/octet-stream',
+              sizeBytes: String(file.size),
+              folderId: targetFolderId || undefined,
+              targetAccountId: requestedAccountId || undefined,
+            }),
+          })
+        } catch {
+          // Direct delivery is optional. Preserve the existing resumable path
+          // when a deployment has it disabled or cannot initialize signing.
+        }
+        if (direct.mode === 'direct-s3') {
+          // Record an empty session id so Retry replays this file through a
+          // fresh resumable init: a failed direct session is aborted
+          // server-side and is never resumed part-by-part.
+          setResumableSessions((prev) => ({
+            ...prev,
+            [file.name]: { sessionId: '', file, folderId: targetFolderId, targetAccountId: requestedAccountId, errorMessage: undefined },
+          }))
+          const initiated = direct
+          await uploadSingleFileDirectS3(file, initiated, updateProgress,
+            () => rerouteNotice(initiated.targetAccountId, initiated.targetAccountEmail))
+        } else {
+          await uploadSingleFileResumable(
+            file,
+            targetFolderId,
+            updateProgress,
+            undefined,
+            requestedAccountId,
+            pinnedAccountName,
+            (message) => {
+              // Soft-pin reroute notice: the chosen account was full, so the
+              // server routed this file elsewhere — keep the row marked done
+              // but attach the explanation for the progress panel.
+              setUploadProgress((current) => {
+                const nextFiles = [...current.files]
+                if (nextFiles[i]) {
+                  nextFiles[i] = { ...nextFiles[i], errorMessage: message }
+                }
+                return { ...current, files: nextFiles }
+              })
+            },
+          )
+        }
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : 'Upload failed'
         console.error('File upload failed:', file.name, err)

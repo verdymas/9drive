@@ -40,7 +40,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    environment:
+    environment: &backend-env
       DATABASE_URL: mysql://${MYSQL_USER:-9drive}:${MYSQL_PASSWORD:-change-this-database-password}@mysql:3306/${MYSQL_DATABASE:-9drive}
       APP_PORT: 4000
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
@@ -49,6 +49,15 @@ services:
       ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS:-3600}
       REFRESH_TOKEN_TTL_DAYS: ${REFRESH_TOKEN_TTL_DAYS:-30}
       MAX_UPLOAD_BYTES: 5368709120
+      # Optional S3 direct download/upload fast paths. Keep disabled unless the
+      # public S3 endpoint and CORS policy are intentionally configured for
+      # clients; otherwise backend proxy delivery and server-side uploads stay.
+      S3_DIRECT_DOWNLOAD_ENABLED: ${S3_DIRECT_DOWNLOAD_ENABLED:-false}
+      S3_DIRECT_DOWNLOAD_TTL_SECONDS: ${S3_DIRECT_DOWNLOAD_TTL_SECONDS:-300}
+      S3_DIRECT_UPLOAD_ENABLED: ${S3_DIRECT_UPLOAD_ENABLED:-false}
+      S3_DIRECT_UPLOAD_SESSION_TTL_SECONDS: ${S3_DIRECT_UPLOAD_SESSION_TTL_SECONDS:-900}
+      S3_DIRECT_UPLOAD_PART_SIZE_BYTES: ${S3_DIRECT_UPLOAD_PART_SIZE_BYTES:-8388608}
+      S3_DIRECT_UPLOAD_PART_URL_TTL_SECONDS: ${S3_DIRECT_UPLOAD_PART_URL_TTL_SECONDS:-300}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:4000/connected-accounts/google/callback}
@@ -155,6 +164,33 @@ services:
     # memory grows with the number of *connected* accounts, not the
     # number of streams.
     mem_limit: 512m
+
+  # Optional dedicated media plane. NOT part of the default `docker compose
+  # up` (profile "media"): start it with `docker compose --profile media up -d`
+  # and route the stream prefixes listed in docs/runbooks/media-plane.md to
+  # it from your reverse proxy. It shares the backend image and mounts the
+  # SAME router factories (app-composition.ts) — never copies of handlers —
+  # so auth, range, and public-token semantics are identical. The all-in-one
+  # backend keeps serving every one of those paths as well: this service is
+  # pure load/isolation, and removing it is the rollback.
+  media:
+    profiles: ["media"]
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    command: ["sh", "-c", "node dist/media-server.js"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      <<: *backend-env
+      MEDIA_SERVER_ENABLED: "true"
+      MEDIA_SERVER_PORT: 4001
+    expose:
+      - "4001"
+    ports:
+      - "4001:4001"
 
   remote-import-worker:
     build:

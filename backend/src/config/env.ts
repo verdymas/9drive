@@ -27,6 +27,23 @@ const envSchema = z.object({
   ACCESS_TOKEN_TTL_SECONDS: z.coerce.number().default(900),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().default(30),
   MAX_UPLOAD_BYTES: z.coerce.number().default(5 * 1024 * 1024 * 1024),
+  // Optional direct S3 data-plane fast paths. Both default off so existing
+  // proxy/server-upload deployments retain their established behavior.
+  S3_DIRECT_DOWNLOAD_ENABLED: booleanEnv(false),
+  S3_DIRECT_DOWNLOAD_TTL_SECONDS: z.coerce.number().int().min(30).max(900).default(300),
+  S3_DIRECT_UPLOAD_ENABLED: booleanEnv(false),
+  S3_DIRECT_UPLOAD_SESSION_TTL_SECONDS: z.coerce.number().int().min(300).max(3600).default(900),
+  // S3 multipart requires every non-final part to be at least 5 MiB.
+  S3_DIRECT_UPLOAD_PART_SIZE_BYTES: z.coerce.number().int().min(5 * 1024 * 1024).max(64 * 1024 * 1024).default(8 * 1024 * 1024),
+  S3_DIRECT_UPLOAD_PART_URL_TTL_SECONDS: z.coerce.number().int().min(30).max(900).default(300),
+  // Optional split deployment: run the stream-heavy routes (file
+  // preview/download/archive, public share streams, WebDAV) in a dedicated
+  // media process (`npm run start:media`) so long-lived transfers cannot
+  // starve short control-plane API requests. Disabled by default; the
+  // all-in-one server always keeps serving every route either way.
+  MEDIA_SERVER_ENABLED: booleanEnv(false),
+  MEDIA_SERVER_PORT: z.coerce.number().int().min(1).max(65535).default(4001),
+  MEDIA_SERVER_SHUTDOWN_DRAIN_TIMEOUT_MS: z.coerce.number().int().min(0).max(120_000).default(30_000),
   RECAPTCHA_SECRET_KEY: z.string().optional(),
   WEBDAV_PASSWORD: z.string().optional(),
   SMB_ENABLED: z.coerce.boolean().default(false),

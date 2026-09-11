@@ -15,5 +15,9 @@ export default defineConfig({
     globals: true,
     css: false,
     include: ['src/**/*.test.{ts,tsx}'],
+    // React resolves its production build when NODE_ENV is inherited as
+    // `production` from the caller's shell, which strips `act` and breaks every
+    // DOM test. Pin the test value instead of relying on Vitest's default.
+    env: { NODE_ENV: 'test' },
   },
 })

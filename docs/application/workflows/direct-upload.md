@@ -43,3 +43,30 @@ Multipart bytes are staged through a bounded, session-scoped spool under
 from that spool, while Telegram uses its required file path. Client aborts
 cancel the spool and supported Google/S3 transfers, then mark the upload
 session failed and remove the staged file.
+
+## Optional Direct S3 Branch
+
+With `S3_DIRECT_UPLOAD_ENABLED` (default off), the dashboard first calls
+`POST /uploads/direct-s3/init`. The backend performs the same authoritative
+placement, and only when the resolved account is S3 and signing succeeds does it
+return `mode: 'direct-s3'`; every other outcome returns `mode: 'server'` so the
+existing resumable flow proceeds unchanged. In direct mode the browser obtains
+one short-lived presigned URL per part and PUTs the slice straight to S3; the
+backend never sees the bytes but still performs the multipart create, complete,
+`HEAD` size verification, and final DB registration.
+
+```mermaid
+flowchart LR
+  UI[UploadContext] --> Init[/uploads/direct-s3/init]
+  Init -->|mode server| RS[Resumable server upload]
+  Init -->|mode direct-s3| Sign[/parts/:n presign]
+  Sign --> S3[(Direct S3 PUT)]
+  S3 --> Done[/complete]
+  Done --> Verify[HEAD size + active File row]
+```
+
+An in-flight direct session is visible through
+`GET /uploads/resumable/status/:id`, which reports the provider's summed part
+bytes as the offset. Abandoned sessions are swept, and the `File` row stays
+inactive until completion is verified. See
+`docs/application/features/uploads.md` for the endpoint contract.

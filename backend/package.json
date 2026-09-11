@@ -6,6 +6,8 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc && node scripts/copy-relay-asset.mjs && node scripts/zip-extension.mjs",
     "start": "node dist/server.js",
+    "start:media": "node dist/media-server.js",
+    "dev:media": "tsx watch src/media-server.ts",
     "start:deploy": "npm run db:migrate:deploy && node dist/server.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
@@ -28,6 +30,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.954.0",
     "@aws-sdk/lib-storage": "^3.954.0",
+    "@aws-sdk/s3-request-presigner": "^3.1129.0",
     "@prisma/client": "^6.19.3",
     "archiver": "^8.0.0",
     "argon2": "^0.44.0",

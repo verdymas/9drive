@@ -32,6 +32,7 @@ Additional runtime components:
 | Change auth/login/Google sign-in | `application/features/authentication.md` |
 | Add/change a storage provider | `application/domain/storage-account.md` + `application/features/connected-storage.md` |
 | Change virtual files/folders | `application/domain/virtual-filesystem.md` + `application/features/files-and-folders.md` |
+| Change S3 delivery/signing | `application/integrations/s3.md` + `application/features/files-and-folders.md` |
 | Change upload placement/routing | `application/domain/upload-routing.md` + `application/workflows/direct-upload.md` |
 | Change Remote Import | `application/features/remote-imports.md` + `application/workflows/remote-import.md` |
 | Change HLS/FFmpeg processing | `application/integrations/ffmpeg-hls.md` + `application/features/remote-imports.md` |
@@ -40,6 +41,7 @@ Additional runtime components:
 | Change browser extension/capture | `application/features/browser-capture.md` + `application/workflows/browser-capture-to-import.md` |
 | Change Remote Fetch Workers | `application/features/remote-fetch-workers.md` |
 | Change WebDAV/SMB | `application/features/webdav-and-smb.md` |
+| Change media-plane/stream deployment topology | `runbooks/media-plane.md` |
 | Look up API endpoints/routes | `reference/backend-routes.md` |
 | Look up database models | `reference/database-schema.md` |
 | Look up environment/config | `reference/environment.md` |

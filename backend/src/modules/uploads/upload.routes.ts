@@ -20,8 +20,11 @@ import { resolveUploadParent } from '../storage/provider-folder.service.js'
 import { logicalPathForFileId } from '../files/file-logical-path.js'
 import { metaForMultipartFile, multipartUploadResponse, parseMultipartBatchMeta, type MultipartUploadFields, type MultipartUploadMeta } from './multipart-upload-contract.js'
 import { appendStagedChunk, removeMultipartTemp, removeStagedFile as removeStagedTempFile, spoolMultipartFile, stagedBytes as stagedTempBytes, stagedUploadPath } from './upload-temp-files.js'
+import { directS3UploadRouter } from './direct-s3-upload.routes.js'
+import { directS3UploadedBytes } from './direct-s3-upload.service.js'
 
 export const uploadRouter = Router()
+uploadRouter.use('/direct-s3', directS3UploadRouter)
 
 function logUpload(message: string, metadata?: Record<string, unknown>) {
   console.info('[upload]', message, metadata ?? '')
@@ -552,6 +555,21 @@ uploadRouter.get('/resumable/status/:id', requireAuth, async (req: AuthRequest, 
 
     if (session.status === 'completed') {
       return res.json({ status: 'completed', offset: session.sizeBytes.toString() })
+    }
+
+    // Direct S3 sessions put bytes straight in the provider, so the staged
+    // temp-file offset below would always read 0 and a terminal abort would be
+    // indistinguishable from a broken resumable session. Ask the provider how
+    // many part bytes it actually holds. Retrying a direct upload re-initializes
+    // a fresh multipart upload rather than resuming part-by-part.
+    if (session.status === 'direct_s3_uploading' || session.status === 'aborted') {
+      const uploadedBytes = await directS3UploadedBytes(req.user!.id, session.id)
+      const uploading = session.status === 'direct_s3_uploading'
+      return res.json({
+        status: uploading ? 'uploading' : 'failed',
+        offset: (uploadedBytes ?? 0n).toString(),
+        ...(uploading && session.s3UploadExpiresAt ? { expiresAt: session.s3UploadExpiresAt.toISOString() } : {}),
+      })
     }
 
     if (!session.targetConnectedAccountId) {

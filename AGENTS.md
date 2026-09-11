@@ -35,7 +35,10 @@ Stack:
 - Undici for Google file streaming
 
 Important files:
-- `backend/src/server.ts`: server entrypoint.
+- `backend/src/server.ts`: all-in-one server entrypoint.
+- `backend/src/media-server.ts`: optional media-plane entrypoint (`MEDIA_SERVER_ENABLED`; exits 0 when disabled).
+- `backend/src/app-composition.ts`: shared router composition — `createControlPlaneApp()` (all routes) and `createMediaPlaneApp()` (file media streams, public share streams, WebDAV only); both bind the same handler factories (no duplicated logic).
+- `backend/src/server-lifecycle.ts`: bounded graceful connection draining for both processes.
 - `backend/src/app.ts`: Express app and route mounting.
 - `backend/src/config/env.ts`: environment validation.
 - `backend/src/config/prisma.ts`: Prisma client.
@@ -71,6 +74,9 @@ Environment:
 - `SMB_ENABLED` (enables the SMB share manager; requires Samba on the host)
 - `SMB_CONFIG_PATH` (optional; override smb.conf path)
 - `SMB_ALLOWED_ROOT` (optional; restrict share paths to a directory root)
+- `MEDIA_SERVER_ENABLED` (optional media plane; default `false`)
+- `MEDIA_SERVER_PORT` (media plane listen port; default `4001`)
+- `MEDIA_SERVER_SHUTDOWN_DRAIN_TIMEOUT_MS` (bounded graceful-drain for in-flight streams; default `30000`)
 
 Backend conventions:
 - The SMB manager lives in `backend/src/modules/smb/` and implements the `StorageProtocol` interface in `backend/src/modules/storage/storage-protocol.ts` — the abstraction future protocols (FTP, SFTP, NFS, S3) can also implement.
@@ -255,6 +261,7 @@ Uploads:
 - File fields then match `filesMeta[*].fieldName`, e.g. `file-0`, `file-1`.
 - Backend selects a connected Drive account with enough available quota and streams each file directly to Google Drive.
 - Google Drive uploads are placed under the root Drive folder named `9drive`; virtual folders remain app/database-only.
+- `POST /uploads/direct-s3/init|:sessionId/parts/:n|:sessionId/complete|:sessionId/abort` — opt-in S3 direct multipart fast path (`S3_DIRECT_UPLOAD_ENABLED=false` by default). Server keeps authority over placement, key, size validation, completion, and DB registration; browsers only receive short-lived presigned part URLs.
 - `POST /sync/all` (legacy `POST /files/sync-google` aliases it) treats connected Drive/S3 accounts as source of truth: discover the physical folder tree (Drive BFS / S3 prefix walk), merge same-path folders into ONE virtual folder, create/update/move MySQL file rows, and mark missing resources deleted — account-scoped, only after a full successful scan (see `docs/SYNC.md`).
 
 ## Docker
