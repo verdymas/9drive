@@ -64,7 +64,11 @@ const h = vi.hoisted(() => {
   }
   function fitFile(where: any): (f: Row) => boolean {
     return (f: Row) => {
-      if (where.id !== undefined && f.id !== where.id) return false
+      if (where.id !== undefined) {
+        if (typeof where.id === 'object' && where.id.in) {
+          if (!where.id.in.includes(f.id)) return false
+        } else if (f.id !== where.id) return false
+      }
       if (where.userId !== undefined && f.userId !== where.userId) return false
       if (where.connectedAccountId !== undefined && f.connectedAccountId !== where.connectedAccountId) return false
       if (where.providerFileId !== undefined) {

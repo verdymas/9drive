@@ -332,6 +332,18 @@ model File {
   // to one row per user; the composite covers that without leaking the
   // nullable column into a global unique index.
   @@index([userId, telegramStableId])
+  // Physical-identity lookup for reconciliation: sync and the Telegram index
+  // resolve a page of provider ids with
+  // `{ userId, connectedAccountId, providerFileId: { in: [...] } }`.
+  // Equality columns lead, the IN-range column is last.
+  //
+  // Deliberately NOT unique: `(connectedAccountId, providerFileId)` is not an
+  // invariant. Provisional upload/import rows are created with the literal
+  // placeholder `providerFileId: 'pending'` before the provider id is known,
+  // and failed rows keep that placeholder after being soft-deleted, so one
+  // account legitimately holds many `'pending'` rows. See
+  // docs/application/workflows/provider-sync.md.
+  @@index([userId, connectedAccountId, providerFileId])
   @@map("files")
 }
 

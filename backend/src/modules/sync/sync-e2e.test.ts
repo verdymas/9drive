@@ -192,6 +192,11 @@ const h = vi.hoisted(() => {
   }
   function fitFile(where: any): (f: Row) => boolean {
     return (f: Row) => {
+      if (where.id !== undefined) {
+        if (typeof where.id === 'object' && where.id.in) {
+          if (!where.id.in.includes(f.id)) return false
+        } else if (f.id !== where.id) return false
+      }
       if (where.connectedAccountId !== undefined && f.connectedAccountId !== where.connectedAccountId) return false
       if (where.providerFileId !== undefined) {
         if (Array.isArray(where.providerFileId)) {
@@ -370,6 +375,17 @@ describe('sync E2E (§69)', () => {
     expect(h.db.folders.length).toBe(folders1)
     expect(h.db.locations.length).toBe(locs1)
     expect(h.db.files.length).toBe(files1)
+
+    // The second run stamps unchanged rows through the BATCHED updateMany.
+    // If that batch silently matched nothing, the missing reconciler would
+    // soft-delete every file here — so this asserts batching and generation
+    // semantics still agree.
+    expect(h.db.files.every((f: any) => f.status === 'active')).toBe(true)
+    expect(completed.every((r) => r.stats.filesMissing === 0)).toBe(true)
+    for (const f of h.db.files) {
+      const run = results.find((r) => r.accountId === f.connectedAccountId)!.runId
+      expect(f.lastSeenSyncRunId).toBe(run)
+    }
   })
 
   it('delete a file on A → A-only soft-delete, B untouched', async () => {

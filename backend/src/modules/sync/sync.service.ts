@@ -3,7 +3,7 @@ import { env } from '../../config/env.js'
 import { AppError } from '../../utils/app-error.js'
 import { createSyncRun, completeSyncRun, cancelSyncRun, failSyncRun, emptyStats, SYNC_RUN_STATUS, type SyncStats } from './sync-run.service.js'
 import { resolveVirtualFolder, type SyncRunContext } from './folder-reconciler.js'
-import { reconcileFilePage } from './file-reconciler.js'
+import { reconcileFilePage, emptyFileReconcileDiagnostics, type FileReconcileDiagnostics } from './file-reconciler.js'
 import { reconcileMissing } from './missing-reconciler.js'
 import { scanDriveFolders } from './sync-drive.js'
 import { scanS3Folders } from './sync-s3.js'
@@ -78,11 +78,13 @@ export async function runAccountSync(userId: string, connectedAccountId: string)
   const ctx: SyncRunContext = { userId, accountId: account.id, provider: account.provider, runId: run.id, stats }
   const cancelled = isCancelled(account.id)
 
+  const fileDiagnostics = emptyFileReconcileDiagnostics()
+
   try {
     if (account.provider === 'google_drive') {
-      await runGoogleDriveScan(ctx, cancelled)
+      await runGoogleDriveScan(ctx, cancelled, fileDiagnostics)
     } else if (account.provider === 's3') {
-      await runS3Scan(ctx, cancelled)
+      await runS3Scan(ctx, cancelled, fileDiagnostics)
     } else if (account.provider === 'telegram') {
       // Telegram is flat blob storage and the DB is the source of truth.
       // `runTelegramSync` does three things safely:
@@ -149,6 +151,30 @@ export async function runAccountSync(userId: string, connectedAccountId: string)
     stats.filesMissing = missing.filesMissing
     stats.mappingsMissing = missing.mappingsMissing
 
+    // Run-scoped diagnostics: how many DB write statements the page
+    // classification issued, split into per-row writes and batched stamp
+    // statements. Safe fields only (ids + counters).
+    console.info('[sync]', JSON.stringify({
+      event: 'sync.run.file_diagnostics',
+      runId: run.id,
+      connectedAccountId: account.id,
+      pages: fileDiagnostics.pages,
+      scanned: fileDiagnostics.scanned,
+      created: fileDiagnostics.created,
+      changed: fileDiagnostics.changed,
+      restored: fileDiagnostics.restored,
+      unchanged: fileDiagnostics.unchanged,
+      alreadyStamped: fileDiagnostics.alreadyStamped,
+      failed: fileDiagnostics.failed,
+      rowWrites: fileDiagnostics.rowWrites,
+      batchWrites: fileDiagnostics.batchWrites,
+      batchStamped: fileDiagnostics.batchStamped,
+      dbWriteOps: fileDiagnostics.dbWriteOps,
+      // Writes avoided by batching unchanged stamps: one UPDATE per
+      // unchanged row would have been issued before Phase 2.
+      writesSavedByBatching: fileDiagnostics.unchanged - fileDiagnostics.batchWrites,
+    }))
+
     // Best-effort quota refresh — never fails the run.
     if (account.provider === 'google_drive') await syncGoogleQuota(account.id).catch(() => undefined)
     else await syncS3Quota(account.id).catch(() => undefined)
@@ -167,7 +193,11 @@ export async function runAccountSync(userId: string, connectedAccountId: string)
   }
 }
 
-async function runGoogleDriveScan(ctx: SyncRunContext, cancelled: () => boolean): Promise<void> {
+async function runGoogleDriveScan(
+  ctx: SyncRunContext,
+  cancelled: () => boolean,
+  diagnostics: FileReconcileDiagnostics,
+): Promise<void> {
   // scanDriveFolders needs the full ConnectedAccount (tokens, providerConfigId).
   const fullAccount = await prisma.connectedAccount.findUniqueOrThrow({ where: { id: ctx.accountId } }) as ConnectedAccount & { provider: 'google_drive' }
 
@@ -178,16 +208,21 @@ async function runGoogleDriveScan(ctx: SyncRunContext, cancelled: () => boolean)
     stats: ctx.stats,
     onFolder: async (physical, virtualParentId, _depth) =>
       resolveVirtualFolder(ctx, virtualParentId, physical),
-    onFilePage: async (virtualParentId, files) =>
-      reconcileFilePage(
-        { userId: ctx.userId, accountId: ctx.accountId, provider: ctx.provider, runId: ctx.runId, stats: ctx.stats },
+    onFilePage: async (virtualParentId, files) => {
+      await reconcileFilePage(
+        { userId: ctx.userId, accountId: ctx.accountId, provider: ctx.provider, runId: ctx.runId, stats: ctx.stats, diagnostics },
         virtualParentId,
         files,
-      ),
+      )
+    },
   })
 }
 
-async function runS3Scan(ctx: SyncRunContext, cancelled: () => boolean): Promise<void> {
+async function runS3Scan(
+  ctx: SyncRunContext,
+  cancelled: () => boolean,
+  diagnostics: FileReconcileDiagnostics,
+): Promise<void> {
   const s3Config = await prisma.s3StorageConfig.findFirst({ where: { connectedAccountId: ctx.accountId, status: 'active' }, select: { id: true, bucket: true, prefix: true } })
   if (!s3Config) throw new AppError('SYNC_ACCOUNT_UNAVAILABLE', 'The S3 account has no active configuration.', 404)
 
@@ -198,12 +233,13 @@ async function runS3Scan(ctx: SyncRunContext, cancelled: () => boolean): Promise
     rootPrefix: s3Config.prefix,
     isCancelled: cancelled,
     onFolder: async (physical, parentId) => resolveVirtualFolder(ctx, parentId, physical),
-    onFilePage: async (virtualParentId, files) =>
-      reconcileFilePage(
-        { userId: ctx.userId, accountId: ctx.accountId, provider: ctx.provider, runId: ctx.runId, stats: ctx.stats },
+    onFilePage: async (virtualParentId, files) => {
+      await reconcileFilePage(
+        { userId: ctx.userId, accountId: ctx.accountId, provider: ctx.provider, runId: ctx.runId, stats: ctx.stats, diagnostics },
         virtualParentId,
         files,
-      ),
+      )
+    },
   })
 }
 
