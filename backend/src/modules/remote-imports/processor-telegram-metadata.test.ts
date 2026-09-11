@@ -174,6 +174,7 @@ vi.mock('../s3/s3.service.js', () => ({
   listS3MultipartParts: vi.fn(async () => []),
   uploadS3MultipartPart: vi.fn(async () => 'stream-etag-1'),
   completeS3MultipartUpload: vi.fn(async () => undefined),
+  abortS3MultipartUpload: vi.fn(async () => undefined),
   buildS3ObjectKey: vi.fn(() => 'provider/object-key.mkv'),
   syncS3Quota: vi.fn(async () => undefined),
 }))

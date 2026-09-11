@@ -84,6 +84,9 @@ Sources of truth: `backend/src/config/env.ts`, `docker-compose.yml`, and fronten
 - `REMOTE_IMPORT_TEMP_HLS_RESERVATION_BYTES` — conservative temporary-disk
   reservation for an HLS job, covering materialized segments and conversion
   output; default `10737418240` (10 GiB).
+- `REMOTE_IMPORT_STREAM_THROUGH_CHUNK_BYTES` — bounded source-read and
+  provider-upload chunk size for eligible direct stream-through imports;
+  default `8388608` (8 MiB), allowed range 5–64 MiB.
 - `REMOTE_IMPORT_QUEUE_START_TIMEOUT_SECONDS`
 - `REMOTE_IMPORT_WORKER_HEARTBEAT_TIMEOUT_SECONDS`
 - `REMOTE_IMPORT_TEMP_DIR`

@@ -51,6 +51,7 @@ export async function uploadGoogleResumableStream(
     state: GoogleStreamUploadState | null
     readChunk(offset: bigint, length: bigint): Promise<Buffer>
     saveState(state: GoogleStreamUploadState): Promise<void>
+    assertNotCancelled?(): Promise<void>
     onProgress?(uploadedBytes: bigint): void
   },
 ): Promise<GoogleResumableResult> {
@@ -93,6 +94,7 @@ export async function uploadGoogleResumableStream(
 
   let offset = BigInt(state.nextOffset)
   while (offset < input.totalBytes) {
+    await input.assertNotCancelled?.()
     const length = input.totalBytes - offset > input.chunkBytes ? input.chunkBytes : input.totalBytes - offset
     const chunk = await input.readChunk(offset, length)
     if (BigInt(chunk.byteLength) !== length) throw new AppError('STREAM_SOURCE_RANGE_INVALID', 'The remote source returned an incomplete byte range.', 502)

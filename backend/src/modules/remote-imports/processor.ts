@@ -8,7 +8,7 @@ import { createAuditLog } from '../../utils/audit.js'
 import { decryptText, encryptText } from '../../utils/crypto.js'
 import { decryptRequestContext, hopHeaderResolver, type RemoteImportRequestContext } from './request-context.js'
 import { ensureGoogleAppFolder, getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
-import { buildS3ObjectKey, completeS3MultipartUpload, createS3MultipartUpload, getS3ConfigForAccount, listS3MultipartParts, syncS3Quota, uploadS3MultipartPart, uploadS3Object } from '../s3/s3.service.js'
+import { abortS3MultipartUpload, buildS3ObjectKey, completeS3MultipartUpload, createS3MultipartUpload, getS3ConfigForAccount, listS3MultipartParts, syncS3Quota, uploadS3MultipartPart, uploadS3Object } from '../s3/s3.service.js'
 import { getTelegramConfig, markTelegramReauthRequired, uploadTelegramDocument } from '../telegram/telegram.service.js'
 import { syncTelegramUsage } from '../telegram/telegram-usage.service.js'
 import { uploadTelegramDocumentWithCrypto } from '../telegram/telegram-caption.service.js'
@@ -178,6 +178,14 @@ async function admitTempStorage(
   return null
 }
 
+async function assertImportNotCancelled(importId: string) {
+  const current = await prisma.remoteImport.findUnique({ where: { id: importId } }).catch(() => null)
+  if (current?.status !== 'cancelled') return
+  const error = new AppError('ABORTED', 'The import was cancelled.', 499)
+  error.name = 'AbortError'
+  throw error
+}
+
 function readGoogleStreamState(encrypted: string | null | undefined): GoogleStreamUploadState | null {
   if (!encrypted) return null
   try {
@@ -226,6 +234,7 @@ async function tryGoogleStreamThrough(input: {
     chunkBytes: BigInt(env.REMOTE_IMPORT_STREAM_THROUGH_CHUNK_BYTES),
     state: readGoogleStreamState(input.record.streamUploadStateEncrypted),
     readChunk: (offset, length) => readVerifiedRange(input.fetcher as any, input.sourceUrl, offset, length, input.contentLength!, input.requestContext),
+    assertNotCancelled: () => assertImportNotCancelled(input.importId),
     saveState: async (state) => {
       await prisma.remoteImport.update({ where: { id: input.importId }, data: { streamUploadStateEncrypted: encryptText(JSON.stringify(state)) } })
     },
@@ -301,17 +310,28 @@ async function tryS3StreamThrough(input: {
   let offset = state.parts.reduce((sum, part) => sum + BigInt(part.size), 0n)
   let partNumber = state.parts.length + 1
   const progress = throttledProgressUpdater(input.importId, STAGES.UPLOADING)
-  while (offset < input.contentLength) {
-    const length = input.contentLength - offset > BigInt(env.REMOTE_IMPORT_STREAM_THROUGH_CHUNK_BYTES)
-      ? BigInt(env.REMOTE_IMPORT_STREAM_THROUGH_CHUNK_BYTES)
-      : input.contentLength - offset
-    const chunk = await readVerifiedRange(input.fetcher as any, input.sourceUrl, offset, length, input.contentLength, input.requestContext)
-    const eTag = await uploadS3MultipartPart(config, state.key, state.uploadId, partNumber, chunk)
-    state.parts.push({ partNumber, eTag, size: length.toString() })
-    offset += length
-    partNumber += 1
-    await saveState()
-    await progress({ downloadedBytes: offset.toString(), uploadedBytes: offset.toString() })
+  try {
+    while (offset < input.contentLength) {
+      await assertImportNotCancelled(input.importId)
+      const length = input.contentLength - offset > BigInt(env.REMOTE_IMPORT_STREAM_THROUGH_CHUNK_BYTES)
+        ? BigInt(env.REMOTE_IMPORT_STREAM_THROUGH_CHUNK_BYTES)
+        : input.contentLength - offset
+      const chunk = await readVerifiedRange(input.fetcher as any, input.sourceUrl, offset, length, input.contentLength, input.requestContext)
+      const eTag = await uploadS3MultipartPart(config, state.key, state.uploadId, partNumber, chunk)
+      state.parts.push({ partNumber, eTag, size: length.toString() })
+      offset += length
+      partNumber += 1
+      await saveState()
+      await progress({ downloadedBytes: offset.toString(), uploadedBytes: offset.toString() })
+      await assertImportNotCancelled(input.importId)
+    }
+  } catch (error) {
+    if (error instanceof AppError && error.code === 'ABORTED') {
+      await abortS3MultipartUpload(config, state.key, state.uploadId).catch(() => undefined)
+      await prisma.file.update({ where: { id: state.fileId }, data: { status: 'deleted', deletedAt: new Date() } }).catch(() => undefined)
+      await prisma.remoteImport.update({ where: { id: input.importId }, data: { streamUploadStateEncrypted: null } }).catch(() => undefined)
+    }
+    throw error
   }
   await completeS3MultipartUpload(config, state.key, state.uploadId, state.parts.map((part) => ({ PartNumber: part.partNumber, ETag: part.eTag })))
   const file = await registerFile(input.importId, { ...input.record, connectedAccountId: account.id }, state.key, input.contentLength, { existingFileId: state.fileId })
@@ -1102,6 +1122,10 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
     if (error instanceof AppError && (error as { placementFinalized?: boolean }).placementFinalized) {
       if (error.code === '__PLACEMENT_REAUTH__') keepPartForReauth = true
       return
+    }
+    if (error instanceof AppError && error.code === 'ABORTED') {
+      const current = await prisma.remoteImport.findUnique({ where: { id: importId } }).catch(() => null)
+      if (current?.status === 'cancelled') return
     }
     const message = error instanceof Error ? error.message : 'Unknown error'
     const code = error instanceof AppError ? error.code : 'IMPORT_FAILED'

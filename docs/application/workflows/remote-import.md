@@ -15,8 +15,10 @@ Capacity -->|admitted| Fetch
 Worker --> Fetch{Direct or Remote Fetch Worker}
   Fetch --> Type{Direct file or HLS}
   Type -->|Direct| Temp[Temp file/download]
+  Type -->|Eligible direct range source| Stream[Bounded ranges → Google / S3]
   Type -->|HLS| HLS[Manifest + segments + FFmpeg]
   Temp --> Placement[Storage routing]
+  Stream --> Register
   HLS --> Placement
   Placement --> Upload[Google / S3 / Telegram]
   Upload --> Register[Register File]

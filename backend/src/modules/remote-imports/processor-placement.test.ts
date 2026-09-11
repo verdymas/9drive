@@ -78,6 +78,7 @@ const h = vi.hoisted(() => {
     s3ListParts: vi.fn(async () => []),
     s3UploadPart: vi.fn(async () => 'stream-etag-1'),
     s3CompleteMultipart: vi.fn(async () => undefined),
+    s3AbortMultipart: vi.fn(async () => undefined),
     tempInspector: vi.fn(async () => ({ freeBytes: 100_000_000_000n })),
     streamRangeProbe: false,
   }
@@ -266,6 +267,7 @@ vi.mock('../s3/s3.service.js', () => ({
   listS3MultipartParts: (...args: unknown[]) => h.s3ListParts(...args),
   uploadS3MultipartPart: (...args: unknown[]) => h.s3UploadPart(...args),
   completeS3MultipartUpload: (...args: unknown[]) => h.s3CompleteMultipart(...args),
+  abortS3MultipartUpload: (...args: unknown[]) => h.s3AbortMultipart(...args),
   buildS3ObjectKey: vi.fn(() => 'provider/object-key.mkv'),
   syncS3Quota: vi.fn(async () => undefined),
 }))
@@ -370,6 +372,25 @@ describe('processRemoteImportJob — placement routing (direct)', () => {
     expect(h.s3UploadPart).toHaveBeenCalledWith(expect.anything(), 'provider/object-key.mkv', 'stream-upload-1', 1, expect.any(Buffer))
     expect(h.s3CompleteMultipart).toHaveBeenCalledWith(expect.anything(), 'provider/object-key.mkv', 'stream-upload-1', [{ PartNumber: 1, ETag: 'stream-etag-1' }])
     expect(h.rows.get('import-1')).toMatchObject({ status: 'completed', streamUploadStateEncrypted: null })
+  })
+
+  it('aborts an S3 multipart transfer when cancellation arrives between bounded chunks', async () => {
+    h.streamRangeProbe = true
+    const accS3 = account('acc-s3', 's3')
+    h.resolvePlacement.mockResolvedValue({
+      connectedAccount: accS3,
+      folderStorageLocation: { id: 'loc-movies-s3', folderId: 'movies', connectedAccountId: 'acc-s3', provider: 's3', providerFolderId: 's3-movies' },
+    })
+    h.s3UploadPart.mockImplementation(async () => {
+      h.rows.set('import-1', { ...h.rows.get('import-1')!, status: 'cancelled' })
+      return 'stream-etag-1'
+    })
+
+    await processRemoteImportJob(job())
+
+    expect(h.s3AbortMultipart).toHaveBeenCalledWith(expect.anything(), 'provider/object-key.mkv', 'stream-upload-1')
+    expect(h.s3CompleteMultipart).not.toHaveBeenCalled()
+    expect(h.rows.get('import-1')).toMatchObject({ status: 'cancelled', streamUploadStateEncrypted: null })
   })
 
   it('defers a resource-starved import without downloading or failing it', async () => {

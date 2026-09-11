@@ -39,6 +39,12 @@ expected workload. The next delayed queue attempt rechecks capacity.
 - Protected source: check request-context/cookie scope and whether the feature is enabled.
 - Remote-worker mode: test the worker through `/workers/:id/test` and inspect status/capabilities.
 
+For an eligible stream-through import, a source that ignores a requested range
+falls back to the temporary-spool path before transfer starts. Do not manually
+edit `stream_upload_state_encrypted`; it is encrypted, server-only recovery
+state. Cancelling an active S3 stream-through import aborts its multipart
+upload and removes its provisional file row.
+
 ## 5. HLS Failure
 Check manifest/segment limits and FFmpeg/ffprobe availability. Conversion errors can have a `retry-convert` path that differs from a full retry.
 
