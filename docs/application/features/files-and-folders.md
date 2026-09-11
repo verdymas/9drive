@@ -3,6 +3,8 @@
 ## Frontend
 
 - `frontend/src/pages/AllFilesPage.tsx`
+- `frontend/src/hooks/useAllFiles.ts` — file/folder loading, query construction,
+  account loading, drop moves, and selection state/actions.
 - `frontend/src/pages/RecentPage.tsx`
 - `frontend/src/pages/StarredPage.tsx`
 - `frontend/src/pages/TrashPage.tsx`
@@ -10,6 +12,10 @@
 - `frontend/src/components/drive/FileGrid.tsx`
 - `frontend/src/components/drive/FolderGrid.tsx`
 - context menus/details drawer under `frontend/src/components/drive/`
+
+`AllFilesPage.tsx` remains the route-level composition and dialog layer; the
+hook keeps API data and selection behavior separate from the rendered file
+views.
 
 ## Backend
 

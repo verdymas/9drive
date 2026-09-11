@@ -9,6 +9,8 @@
 ## Frontend
 
 - `frontend/src/context/UploadContext.tsx`
+- `frontend/src/lib/upload-client.ts` — resumable/direct-S3 transport helpers;
+  the context retains public progress and retry state.
 - upload UI is consumed by drive pages/components.
 
 ## HTTP Modes
@@ -116,3 +118,15 @@ exposed header on the object prefix before enabling this path.
 
 ## Agent Checklist
 When adding a provider upload path, verify all of these together: routing eligibility, folder materialization, quota update, file DB registration, audit logging, frontend progress, and synchronization semantics.
+
+## Implementation Boundaries
+
+The compatibility router in `backend/src/modules/uploads/upload.routes.ts` is
+limited to authentication, endpoint registration, and HTTP response
+translation. Multipart parsing and per-file session/cancellation aggregation
+live in `multipart-upload.service.ts`; staged S3/Telegram provider commits and
+compensating cleanup live in `upload-provider.service.ts`; resumable init,
+preflight, status, and chunk flows live in `resumable-upload.service.ts`.
+The exported `handleUpload` entry point remains the same for the dashboard and
+public API routes, and all three services continue to call the shared placement
+service.

@@ -9,7 +9,8 @@
 ## Backend
 
 - routes/service: `backend/src/modules/remote-imports/remote-import.routes.ts`, `remote-import.service.ts`
-- worker: `worker-entry.ts`, `worker.ts`, `processor.ts`
+- worker orchestration: `worker-entry.ts`, `worker.ts`, `processor.ts`
+- worker phases: `processor-context.ts`, `processor-progress.ts`, `processor-probe.ts`, `processor-direct.ts`, `processor-download.ts`, `processor-hls.ts`, `processor-upload.ts`
 - queue/recovery: `queue.ts`, `queue-reconcile.ts`
 - secure networking: `ssrf.ts`, `secure-fetcher.ts`, `url-downloader.ts`, `request-context.ts`
 - HLS: `backend/src/modules/remote-imports/hls/*`
@@ -48,6 +49,35 @@ reported as a provider or download failure. The safe diagnostic stored for the
 operator contains only free, reserved, and required byte counts, stage, import
 ID, and a snapshot of the process-wide HLS segment/FFmpeg permit counters.
 Reservations are released when work completes, fails, cancels, or is deferred.
+
+## Worker processor boundaries
+
+`processor.ts` remains the stable BullMQ entry point and owns persisted-row
+lookup, phase ordering, worker validation, terminal error mapping, and final
+temporary-file cleanup. Phase modules own their local mechanics:
+
+- `processor-context.ts` binds a persisted import to timeout, stage, heartbeat,
+  cancellation, failure, admission, and progress helpers.
+- `processor-probe.ts` performs the bounded range probe and size-cap check.
+- `processor-direct.ts` owns Google/S3 stream-through state and transfers.
+- `processor-download.ts` materializes non-stream-through sources into the
+  import-scoped temporary part.
+- `processor-hls.ts` owns segment/remux lifecycle, resource reservations,
+  resume markers, and HLS completion.
+- `processor-upload.ts` owns provider upload, virtual-file registration, and
+  the shared placement-to-completion tail.
+
+These boundaries preserve the existing stage names, encrypted provider state,
+retry semantics, quota refreshes, and `processRemoteImportJob(job)` export.
+
+## Frontend boundaries
+
+`frontend/src/components/drive/RemoteImportModal.tsx` remains the modal and
+field composition layer. `frontend/src/hooks/useRemoteImportForm.ts` owns URL
+and cURL parsing, probe debounce, HLS option state, and submit lifecycle;
+`frontend/src/components/drive/RemoteImportHlsSection.tsx` owns the typed HLS
+controls. Existing labels, callbacks, routes, and request payloads are
+unchanged.
 
 ## Worker budgets
 

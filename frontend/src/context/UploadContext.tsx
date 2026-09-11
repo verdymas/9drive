@@ -1,22 +1,19 @@
 import { createContext, useContext, useState, type ReactNode } from 'react'
-import { API_URL, apiFetch } from '@/lib/api'
-import { getAccessToken } from '@/lib/auth'
+import { apiFetch } from '@/lib/api'
+import {
+  getResumableUploadStatus,
+  initDirectS3Upload,
+  initResumableUpload,
+  uploadDirectS3File,
+  uploadResumableChunk,
+  type DirectS3InitResult,
+} from '@/lib/upload-client'
 
 export type UploadProgressStatus = 'uploading' | 'done' | 'error' | 'partial'
 export type UploadProgressFile = { name: string; size: number; percent: number; status: UploadProgressStatus; errorMessage?: string; accountName?: string }
 export type UploadProgressState = { open: boolean; fileName: string; percent: number; status: UploadProgressStatus; files: UploadProgressFile[] }
 
 type ResumableSession = { sessionId: string; file: File; folderId?: string | null; targetAccountId?: string | null; errorMessage?: string }
-
-type DirectS3InitResult =
-  | {
-      mode: 'direct-s3'
-      sessionId: string
-      partSizeBytes: number
-      targetAccountId?: string | null
-      targetAccountEmail?: string | null
-    }
-  | { mode: 'server' }
 
 type PreflightPlan = {
   fileName: string
@@ -67,15 +64,12 @@ export function UploadProvider({ children }: { children: ReactNode }) {
 
     // 1. Initialize or get status
     if (!sessionId) {
-      const initData = await apiFetch<{ sessionId: string; provider: string }>('/uploads/resumable/init', {
-        method: 'POST',
-        body: JSON.stringify({
-          fileName: file.name,
-          mimeType: file.type || 'application/octet-stream',
-          sizeBytes: String(file.size),
-          folderId: folderId || undefined,
-          targetAccountId: targetAccountId || undefined
-        })
+      const initData = await initResumableUpload({
+        fileName: file.name,
+        mimeType: file.type || 'application/octet-stream',
+        sizeBytes: file.size,
+        folderId,
+        targetAccountId,
       })
       sessionId = initData.sessionId
       // Update session with the active sessionId
@@ -92,7 +86,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
         onNotice(`No space on ${pinnedAccountName} — uploaded to ${routedName ?? 'another account'} instead`)
       }
     } else {
-      const statusData = await apiFetch<{ status: string; offset: string }>(`/uploads/resumable/status/${sessionId}`)
+      const statusData = await getResumableUploadStatus(sessionId)
       startOffset = Number(statusData.offset)
       if (statusData.status === 'completed') {
         onProgress(100)
@@ -105,34 +99,13 @@ export function UploadProvider({ children }: { children: ReactNode }) {
       const endOffset = Math.min(startOffset + CHUNK_SIZE, file.size)
       const chunk = file.slice(startOffset, endOffset)
 
-      // We use raw fetch with authorization header for binary stream upload
-      const response = await fetch(`${API_URL}/uploads/resumable/chunk/${sessionId}`, {
-        method: 'PUT',
-        headers: {
-          'Authorization': `Bearer ${getAccessToken()}`,
-          'Content-Range': `bytes ${startOffset}-${endOffset - 1}/${file.size}`,
-          'Content-Length': String(chunk.size)
-        },
-        body: chunk
+      const resData = await uploadResumableChunk({
+        sessionId,
+        chunk,
+        startOffset,
+        endOffset,
+        totalBytes: file.size,
       })
-
-      if (!response.ok) {
-        let message = `Chunk upload failed (HTTP ${response.status})`
-        try {
-          const errorBody = await response.json() as { message?: string; code?: string }
-          if (errorBody?.code === 'GOOGLE_REAUTH_REQUIRED') {
-            message = 'Google Drive connection expired. Reconnect this account to continue uploading files.'
-          } else if (errorBody?.message) {
-            message = errorBody.message
-            if (errorBody.code) message = `${errorBody.code}: ${errorBody.message}`
-          }
-        } catch {
-          // Non-JSON error body; keep the HTTP status message
-        }
-        throw new Error(message)
-      }
-
-      const resData = await response.json() as { status: string; offset?: string }
       if (resData.status === 'completed') {
         onProgress(100)
         break
@@ -141,40 +114,6 @@ export function UploadProvider({ children }: { children: ReactNode }) {
       startOffset = Number(resData.offset)
       const percent = Math.min(99, Math.round((startOffset / file.size) * 100))
       onProgress(percent)
-    }
-  }
-
-  async function uploadSingleFileDirectS3(
-    file: File,
-    init: Extract<DirectS3InitResult, { mode: 'direct-s3' }>,
-    onProgress: (percent: number) => void,
-    notice?: () => void,
-  ) {
-    const parts: Array<{ partNumber: number; etag: string; sizeBytes: number }> = []
-    try {
-      for (let start = 0, partNumber = 1; start < file.size; start += init.partSizeBytes, partNumber += 1) {
-        const end = Math.min(start + init.partSizeBytes, file.size)
-        const signed = await apiFetch<{ url: string }>(`/uploads/direct-s3/${init.sessionId}/parts/${partNumber}`, { method: 'POST' })
-        const response = await fetch(signed.url, { method: 'PUT', body: file.slice(start, end) })
-        if (!response.ok) throw new Error(`Direct S3 part upload failed (HTTP ${response.status})`)
-        const etag = response.headers.get('etag')
-        if (!etag) throw new Error('Direct S3 part upload did not return an ETag.')
-        // The declared part size lets the server cross-check the completion
-        // list against the exact byte layout it advertised.
-        parts.push({ partNumber, etag, sizeBytes: end - start })
-        onProgress(Math.min(99, Math.round((end / file.size) * 100)))
-      }
-      await apiFetch(`/uploads/direct-s3/${init.sessionId}/complete`, {
-        method: 'POST',
-        body: JSON.stringify({ parts }),
-      })
-      onProgress(100)
-      notice?.()
-    } catch (error) {
-      // The server owns the multipart upload ID and performs provider cleanup;
-      // a cleanup failure never replaces the original upload error.
-      await apiFetch(`/uploads/direct-s3/${init.sessionId}/abort`, { method: 'POST' }).catch(() => undefined)
-      throw error
     }
   }
 
@@ -268,15 +207,12 @@ export function UploadProvider({ children }: { children: ReactNode }) {
         }
         let direct: DirectS3InitResult = { mode: 'server' }
         try {
-          direct = await apiFetch<DirectS3InitResult>('/uploads/direct-s3/init', {
-            method: 'POST',
-            body: JSON.stringify({
-              fileName: file.name,
-              mimeType: file.type || 'application/octet-stream',
-              sizeBytes: String(file.size),
-              folderId: targetFolderId || undefined,
-              targetAccountId: requestedAccountId || undefined,
-            }),
+          direct = await initDirectS3Upload({
+            fileName: file.name,
+            mimeType: file.type || 'application/octet-stream',
+            sizeBytes: file.size,
+            folderId: targetFolderId,
+            targetAccountId: requestedAccountId,
           })
         } catch {
           // Direct delivery is optional. Preserve the existing resumable path
@@ -291,7 +227,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
             [file.name]: { sessionId: '', file, folderId: targetFolderId, targetAccountId: requestedAccountId, errorMessage: undefined },
           }))
           const initiated = direct
-          await uploadSingleFileDirectS3(file, initiated, updateProgress,
+          await uploadDirectS3File(file, initiated, updateProgress,
             () => rerouteNotice(initiated.targetAccountId, initiated.targetAccountEmail))
         } else {
           await uploadSingleFileResumable(

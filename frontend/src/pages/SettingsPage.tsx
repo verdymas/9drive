@@ -9,51 +9,15 @@ import { TelegramSecurityCard } from '@/components/settings/TelegramSecurityCard
 import { apiFetch, formatBytes, API_URL } from '@/lib/api'
 import { getGravatarUrl } from '@/lib/gravatar'
 import { getStoredUser, getAccessToken, clearAuthSession } from '@/lib/auth'
-import { isReauthRequired, accountStatusLabel, reauthMessage } from '@/lib/connectedAccounts'
 import { TelegramChannelModal } from '@/components/drive/TelegramChannelModal'
-import { telegramChannelStatusLabel, testTelegramConnection, type TelegramChannelInfo } from '@/lib/telegram'
-
-type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string; autoAllocationEnabled: boolean; storageAccount?: { totalBytes: string | null; usedBytes: string; availableBytes: string | null; fileCount?: number | null; lastSyncedAt: string | null } | null; telegram?: TelegramChannelInfo | null }
-
-function providerLabel(provider: string) {
-  if (provider === 's3') return 'S3 Storage'
-  if (provider === 'telegram') return 'Telegram Drive'
-  return 'Google Drive'
-}
-
-function storageLimitLabel(account: ConnectedAccount) {
-  if ((account.provider === 's3' || account.provider === 'telegram') && account.storageAccount?.totalBytes === null) return 'Unlimited'
-  return formatBytes(account.storageAccount?.totalBytes)
-}
-
-function availableLabel(account: ConnectedAccount) {
-  if ((account.provider === 's3' || account.provider === 'telegram') && account.storageAccount?.availableBytes === null) return '—'
-  return formatBytes(account.storageAccount?.availableBytes)
-}
+import { useSettings } from '@/hooks/useSettings'
+import { ConnectedStorageAccountsCard } from '@/components/settings/ConnectedStorageAccountsCard'
 
 export function SettingsPage() {
   const user = getStoredUser()
-  const [accounts, setAccounts] = useState<ConnectedAccount[]>([])
   const [message, setMessage] = useState('')
-  const [connecting, setConnecting] = useState(false)
-  const [s3Open, setS3Open] = useState(false)
-  const [connectingS3, setConnectingS3] = useState(false)
-  const [s3Form, setS3Form] = useState({ name: '', bucket: '', region: 'us-east-1', endpoint: '', accessKeyId: '', secretAccessKey: '', forcePathStyle: false, quotaBytes: '' })
-  const [telegramOpen, setTelegramOpen] = useState(false)
-  const [telegramStep, setTelegramStep] = useState<'credentials' | 'code' | 'password'>('credentials')
-  const [telegramAuthId, setTelegramAuthId] = useState('')
-  const [telegramAccountId, setTelegramAccountId] = useState<string | null>(null)
-  const [telegramForm, setTelegramForm] = useState({ phone: '', apiId: '', apiHash: '', code: '', password: '' })
-  const [connectingTelegram, setConnectingTelegram] = useState(false)
-  const [channelAccount, setChannelAccount] = useState<ConnectedAccount | null>(null)
-  const [testingTelegramId, setTestingTelegramId] = useState<string | null>(null)
-  const [testResult, setTestResult] = useState<string>('')
-  const [syncingAccountId, setSyncingAccountId] = useState<string | null>(null)
-  const [disconnectingAccountId, setDisconnectingAccountId] = useState<string | null>(null)
-  const [accountToDisconnect, setAccountToDisconnect] = useState<ConnectedAccount | null>(null)
   const [profileImageUrl, setProfileImageUrl] = useState('')
   const [avatarError, setAvatarError] = useState(false)
-  const [selectedAccountId, setSelectedAccountId] = useState('')
   const [updatingSystem, setUpdatingSystem] = useState(false)
   const [updateModalOpen, setUpdateModalOpen] = useState(false)
   const [updateModalTitle, setUpdateModalTitle] = useState('')
@@ -81,6 +45,45 @@ export function SettingsPage() {
   const [restoreFile, setRestoreFile] = useState<File | null>(null)
   const [restoreMessage, setRestoreMessage] = useState('')
   const [restoreSuccess, setRestoreSuccess] = useState(false)
+
+  const {
+    accounts,
+    connecting,
+    s3Open,
+    setS3Open,
+    connectingS3,
+    s3Form,
+    setS3Form,
+    telegramOpen,
+    setTelegramOpen,
+    telegramStep,
+    telegramAccountId,
+    telegramForm,
+    setTelegramForm,
+    connectingTelegram,
+    channelAccount,
+    setChannelAccount,
+    testingTelegramId,
+    testResult,
+    syncingAccountId,
+    disconnectingAccountId,
+    accountToDisconnect,
+    setAccountToDisconnect,
+    setSelectedAccountId,
+    selectedAccount,
+    load,
+    connectDrive,
+    reconnectDrive,
+    sync,
+    disconnect,
+    purgeAccount,
+    connectS3,
+    openTelegramConnect,
+    startTelegramAuth,
+    submitTelegramCode,
+    submitTelegramPassword,
+    runTelegramTest,
+  } = useSettings({ onMessage: setMessage })
 
   async function downloadBackup() {
     setDownloadingBackup(true)
@@ -250,15 +253,7 @@ export function SettingsPage() {
     }
   }
 
-  const selectedAccount = accounts.find((account) => account.id === selectedAccountId) ?? accounts[0] ?? null
-
-  async function load() {
-    // includeDisconnected: a disconnected Telegram account still holds its
-    // storage channel claim, so it must stay reachable here to be reconnected
-    // (abandoned-channel recovery). Only this page asks for them.
-    const data = await apiFetch<{ accounts: ConnectedAccount[] }>('/connected-accounts?includeDisconnected=1')
-    setAccounts(data.accounts)
-
+  async function loadGoogleConfig() {
     try {
       const configData = await apiFetch<{ exists: boolean; clientId: string; redirectUri: string; hasSecret: boolean; defaultRedirectUri: string }>('/system/google-config')
       if (configData.exists) {
@@ -273,240 +268,13 @@ export function SettingsPage() {
   }
 
   useEffect(() => {
-    load().catch((error) => setMessage(error instanceof Error ? error.message : 'Failed to load settings'))
+    loadGoogleConfig().catch(() => undefined)
   }, [])
 
   useEffect(() => {
     setAvatarError(false)
     getGravatarUrl(user?.email, 96).then(setProfileImageUrl).catch(() => setProfileImageUrl(''))
   }, [user?.email])
-
-  useEffect(() => {
-    if (accounts.length === 0) {
-      setSelectedAccountId('')
-      return
-    }
-    if (!accounts.some((account) => account.id === selectedAccountId)) setSelectedAccountId(accounts[0].id)
-  }, [accounts, selectedAccountId])
-
-  useEffect(() => {
-    function onMessage(event: MessageEvent) {
-      if (event.origin !== window.location.origin || event.data?.type !== 'GOOGLE_CONNECTED') return
-      setMessage(event.data.status === 'success' ? 'Google Drive connected.' : 'Google Drive connection failed.')
-      load().then(() => {
-        window.dispatchEvent(new Event('9drive:storage-changed'))
-      }).catch(() => undefined)
-    }
-    window.addEventListener('message', onMessage)
-    return () => window.removeEventListener('message', onMessage)
-  }, [])
-
-  async function connectDrive() {
-    setConnecting(true)
-    setMessage('')
-    const popup = window.open('', 'google-drive-connect', 'width=540,height=720')
-    if (popup) {
-      popup.document.write('<html><head><title>Connecting...</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f8fafc;color:#64748b;}</style></head><body><div style="text-align:center;"><h2>Connecting to Google...</h2><p>Please wait while we redirect you.</p></div></body></html>')
-    }
-    try {
-      const data = await apiFetch<{ url: string }>('/connected-accounts/google/connect-url')
-      if (popup) {
-        popup.location.href = data.url
-      } else {
-        window.location.href = data.url
-      }
-    } catch (error) {
-      if (popup) popup.close()
-      setMessage(error instanceof Error ? error.message : 'Failed to start Google Drive connection')
-    } finally {
-      setConnecting(false)
-    }
-  }
-
-  async function reconnectDrive(accountId: string) {
-    setConnecting(true)
-    setMessage('')
-    const popup = window.open('', 'google-drive-connect', 'width=540,height=720')
-    if (popup) {
-      popup.document.write('<html><head><title>Connecting...</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f8fafc;color:#64748b;}</style></head><body><div style="text-align:center;"><h2>Reconnecting to Google...</h2><p>Please wait while we redirect you.</p></div></body></html>')
-    }
-    try {
-      const data = await apiFetch<{ url: string }>(`/connected-accounts/${accountId}/reconnect`, { method: 'POST' })
-      if (popup) {
-        popup.location.href = data.url
-      } else {
-        window.location.href = data.url
-      }
-    } catch (error) {
-      if (popup) popup.close()
-      setMessage(error instanceof Error ? error.message : 'Failed to start Google Drive reconnect')
-    } finally {
-      setConnecting(false)
-    }
-  }
-
-  async function sync(accountId: string) {
-    setSyncingAccountId(accountId)
-    try {
-      await apiFetch(`/connected-accounts/${accountId}/sync-quota`, { method: 'POST' })
-      await load()
-      window.dispatchEvent(new Event('9drive:storage-changed'))
-    } finally {
-      setSyncingAccountId(null)
-    }
-  }
-
-  async function disconnect() {
-    if (!accountToDisconnect) return
-    setDisconnectingAccountId(accountToDisconnect.id)
-    setMessage('')
-    try {
-      await apiFetch(`/connected-accounts/${accountToDisconnect.id}`, { method: 'DELETE' })
-      setAccountToDisconnect(null)
-      setMessage('Storage account disconnected.')
-      await load()
-      window.dispatchEvent(new Event('9drive:storage-changed'))
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Failed to disconnect storage account')
-    } finally {
-      setDisconnectingAccountId(null)
-    }
-  }
-
-  // Hard delete (?purge=1): cascades every file record, sync state, encrypted
-  // session and storage account the row owned. The remote storage (Telegram
-  // channel and its documents, S3 bucket, Google account) is untouched — a
-  // future reconnect + sync can recover it. No undo.
-  async function purgeAccount() {
-    if (!accountToDisconnect) return
-    if (!window.confirm('Delete this storage account from 9Drive forever? File records, sync history and encrypted credentials will be removed. The remote storage (e.g. your Telegram channel and its documents) is not touched.')) return
-    setDisconnectingAccountId(accountToDisconnect.id)
-    setMessage('')
-    try {
-      await apiFetch(`/connected-accounts/${accountToDisconnect.id}?purge=1`, { method: 'DELETE' })
-      setAccountToDisconnect(null)
-      setMessage('Storage account deleted.')
-      await load()
-      window.dispatchEvent(new Event('9drive:storage-changed'))
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Failed to delete storage account')
-    } finally {
-      setDisconnectingAccountId(null)
-    }
-  }
-
-  async function connectS3(event: FormEvent) {
-    event.preventDefault()
-    setConnectingS3(true)
-    setMessage('')
-    try {
-      await apiFetch('/connected-accounts/s3', { method: 'POST', body: JSON.stringify({ ...s3Form, endpoint: s3Form.endpoint || undefined, quotaBytes: s3Form.quotaBytes || null }) })
-      setS3Open(false)
-      setS3Form({ name: '', bucket: '', region: 'us-east-1', endpoint: '', accessKeyId: '', secretAccessKey: '', forcePathStyle: false, quotaBytes: '' })
-      setMessage('S3 storage connected.')
-      await load()
-      window.dispatchEvent(new Event('9drive:storage-changed'))
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Failed to connect S3 storage')
-    } finally {
-      setConnectingS3(false)
-    }
-  }
-
-  function openTelegramConnect(accountId?: string) {
-    setTelegramAccountId(accountId ?? null)
-    setTelegramStep('credentials')
-    setTelegramAuthId('')
-    setTelegramForm({ phone: '', apiId: '', apiHash: '', code: '', password: '' })
-    setMessage('')
-    setTelegramOpen(true)
-  }
-
-  async function startTelegramAuth(event: FormEvent) {
-    event.preventDefault()
-    setConnectingTelegram(true)
-    setMessage('')
-    try {
-      const data = await apiFetch<{ authId: string; nextStep: 'code' }>('/telegram/auth/start', {
-        method: 'POST',
-        body: JSON.stringify({
-          ...(telegramAccountId ? { accountId: telegramAccountId } : {}),
-          phone: telegramForm.phone,
-          apiId: telegramAccountId ? undefined : telegramForm.apiId,
-          apiHash: telegramAccountId ? undefined : telegramForm.apiHash,
-        }),
-      })
-      setTelegramAuthId(data.authId)
-      setTelegramStep('code')
-      setTelegramForm((form) => ({ ...form, code: '', password: '' }))
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Failed to request Telegram login code')
-    } finally {
-      setConnectingTelegram(false)
-    }
-  }
-
-  async function submitTelegramCode(event: FormEvent) {
-    event.preventDefault()
-    setConnectingTelegram(true)
-    setMessage('')
-    try {
-      const data = await apiFetch<{ nextStep: 'password' | 'done'; account?: ConnectedAccount }>('/telegram/auth/verify', {
-        method: 'POST',
-        body: JSON.stringify({ authId: telegramAuthId, code: telegramForm.code }),
-      })
-      if (data.nextStep === 'password') {
-        setTelegramStep('password')
-      } else {
-        setTelegramOpen(false)
-        setMessage('Telegram Drive connected.')
-        await load()
-        window.dispatchEvent(new Event('9drive:storage-changed'))
-      }
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Failed to verify Telegram code')
-    } finally {
-      setConnectingTelegram(false)
-    }
-  }
-
-  async function submitTelegramPassword(event: FormEvent) {
-    event.preventDefault()
-    setConnectingTelegram(true)
-    setMessage('')
-    try {
-      const data = await apiFetch<{ nextStep: 'password' | 'done'; account?: ConnectedAccount }>('/telegram/auth/verify', {
-        method: 'POST',
-        body: JSON.stringify({ authId: telegramAuthId, password: telegramForm.password }),
-      })
-      if (data.nextStep === 'password') {
-        setMessage('Two-step verification password was not accepted.')
-      } else {
-        setTelegramOpen(false)
-        setMessage('Telegram Drive connected.')
-        await load()
-        window.dispatchEvent(new Event('9drive:storage-changed'))
-      }
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Failed to verify Telegram password')
-    } finally {
-      setConnectingTelegram(false)
-    }
-  }
-
-  async function runTelegramTest(account: ConnectedAccount) {
-    setTestingTelegramId(account.id)
-    setTestResult('')
-    try {
-      const result = await testTelegramConnection(account.id)
-      setTestResult(result.ok ? 'Telegram connection OK.' : (result.details || 'Telegram connection failed.'))
-      await load()
-    } catch (error) {
-      setTestResult(error instanceof Error ? error.message : 'Telegram connection test failed.')
-    } finally {
-      setTestingTelegramId(null)
-    }
-  }
 
   return (
     <>
@@ -566,50 +334,20 @@ export function SettingsPage() {
 
           <TelegramSecurityCard />
 
-          <Card className="p-4">
-            <h2 className="text-[16px] font-bold">Connected Storage Accounts</h2>
-            <div className="mt-3.5 grid gap-3">
-              {accounts.length === 0 ? <p className="text-xs text-slate-500">No connected storage account yet.</p> : <>
-                <label className="grid gap-1.5 text-xs font-semibold text-slate-500">Choose Account<select className="h-10 rounded-xl border border-slate-200 bg-white px-3 text-sm focus:outline-none" value={selectedAccount?.id ?? ''} onChange={(event) => setSelectedAccountId(event.target.value)}>{accounts.map((account) => <option key={account.id} value={account.id}>{providerLabel(account.provider)} - {account.displayName || account.email} ({accountStatusLabel(account.status)})</option>)}</select></label>
-                {selectedAccount ? <div className="rounded-xl bg-slate-50 p-3 dark:bg-slate-900/60 border border-slate-100 dark:border-slate-800">
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                    <div className="min-w-0"><p className="break-all font-semibold text-sm">{selectedAccount.displayName || selectedAccount.email}</p><p className="text-xs text-slate-500 mt-0.5">{providerLabel(selectedAccount.provider)} · {accountStatusLabel(selectedAccount.status)}</p></div>
-                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                      {isReauthRequired(selectedAccount) ? <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700" title={reauthMessage(selectedAccount)}>Reconnection Required</span> : null}
-                      {!selectedAccount.autoAllocationEnabled ? <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500" title="Excluded from Automatic storage allocation. Existing files and Sync are not affected.">Allocation Disabled</span> : null}
-                      <div className="grid grid-cols-2 gap-2 sm:flex">
-                        {isReauthRequired(selectedAccount) || selectedAccount.status === 'disconnected' ? <Button className="w-full" size="sm" onClick={() => selectedAccount.provider === 'telegram' ? openTelegramConnect(selectedAccount.id) : reconnectDrive(selectedAccount.id)} disabled={connecting}><Link2 className="h-4 w-4" />{connecting ? 'Opening...' : selectedAccount.provider === 'telegram' ? 'Reconnect Telegram' : 'Reconnect Google Drive'}</Button> : null}
-                        <Button className="w-full" size="sm" variant="outline" onClick={() => sync(selectedAccount.id)} disabled={syncingAccountId === selectedAccount.id}><RefreshCw className={syncingAccountId === selectedAccount.id ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{syncingAccountId === selectedAccount.id ? 'Syncing...' : 'Sync'}</Button>
-                        {selectedAccount.provider === 'telegram' ? <Button className="w-full" size="sm" variant="outline" onClick={() => setChannelAccount(selectedAccount)}><Send className="h-4 w-4" />{selectedAccount.telegram?.channelId ? 'Change Channel' : 'Set Up Channel'}</Button> : null}
-                        {selectedAccount.provider === 'telegram' ? <Button className="w-full" size="sm" variant="outline" onClick={() => runTelegramTest(selectedAccount)} disabled={testingTelegramId === selectedAccount.id}><RefreshCw className={testingTelegramId === selectedAccount.id ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{testingTelegramId === selectedAccount.id ? 'Testing...' : 'Test Connection'}</Button> : null}
-                        <Button className="w-full" size="sm" variant="danger" onClick={() => setAccountToDisconnect(selectedAccount)}><Trash2 className="h-4 w-4" />Disconnect</Button></div>
-                    </div>
-                  </div>
-                  {selectedAccount.provider === 'telegram' ? (
-                    <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-                      {selectedAccount.telegram?.channelId ? (
-                        <span className="rounded-full bg-emerald-100 px-2 py-0.5 font-semibold text-emerald-700" title={`Channel: ${selectedAccount.telegram.channelTitle ?? selectedAccount.telegram.channelId}`}>Channel: {selectedAccount.telegram.channelTitle ?? selectedAccount.telegram.channelId}</span>
-                      ) : (
-                        <span className="rounded-full bg-amber-100 px-2 py-0.5 font-semibold text-amber-700">Storage Channel Required — set one up to enable uploads.</span>
-                      )}
-                      <span className={selectedAccount.telegram?.status === 'connected' || selectedAccount.telegram?.status === 'ready' ? 'rounded-full bg-emerald-100 px-2 py-0.5 font-semibold text-emerald-700' : 'rounded-full bg-slate-100 px-2 py-0.5 font-semibold text-slate-500'}>{selectedAccount.telegram ? telegramChannelStatusLabel(selectedAccount.telegram.status) : '—'}</span>
-                    </div>
-                  ) : null}
-                  {testResult ? <p className="mt-2 rounded-xl bg-blue-50 p-2.5 text-xs text-blue-700">{testResult}</p> : null}
-                  {isReauthRequired(selectedAccount) ? <p className="mt-2 rounded-xl bg-amber-50 p-2.5 text-xs text-amber-800">{reauthMessage(selectedAccount)}</p> : null}
-                  <div className="mt-3 grid grid-cols-3 gap-2 text-center text-xs">
-                    <div className="rounded-xl bg-white dark:bg-slate-950 p-2 border border-slate-100 dark:border-slate-800"><p className="font-extrabold text-slate-950">{formatBytes(selectedAccount.storageAccount?.usedBytes)}</p><p className="mt-0.5 text-[10px] text-slate-500">Used</p></div>
-                    {selectedAccount.provider === 'telegram' ? (
-                      <div className="rounded-xl bg-white dark:bg-slate-950 p-2 border border-slate-100 dark:border-slate-800"><p className="font-extrabold text-slate-950">{selectedAccount.storageAccount?.fileCount ?? '—'}</p><p className="mt-0.5 text-[10px] text-slate-500">Files</p></div>
-                    ) : (
-                      <div className="rounded-xl bg-white dark:bg-slate-950 p-2 border border-slate-100 dark:border-slate-800"><p className="font-extrabold text-slate-950">{storageLimitLabel(selectedAccount)}</p><p className="mt-0.5 text-[10px] text-slate-500">Total</p></div>
-                    )}
-                    <div className="rounded-xl bg-white dark:bg-slate-950 p-2 border border-slate-100 dark:border-slate-800"><p className="font-extrabold text-slate-950">{availableLabel(selectedAccount)}</p><p className="mt-0.5 text-[10px] text-slate-500">Free</p></div>
-                  </div>
-                </div> : null}
-              </>}
-            </div>
-          </Card>
+          <ConnectedStorageAccountsCard
+            accounts={accounts}
+            selectedAccount={selectedAccount}
+            onSelectAccount={setSelectedAccountId}
+            connecting={connecting}
+            onReconnect={(account) => account.provider === 'telegram' ? openTelegramConnect(account.id) : reconnectDrive(account.id)}
+            onSync={sync}
+            syncingAccountId={syncingAccountId}
+            onSetChannel={setChannelAccount}
+            onTestTelegram={runTelegramTest}
+            testingTelegramId={testingTelegramId}
+            testResult={testResult}
+            onDisconnect={setAccountToDisconnect}
+          />
 
           <Card className="p-4">
             <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-3 mb-4">

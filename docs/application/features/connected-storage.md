@@ -17,6 +17,7 @@
 ## Frontend Entry Points
 
 - `frontend/src/pages/SettingsPage.tsx`
+- `frontend/src/hooks/useSettings.ts`
 - `frontend/src/pages/QuotaTrackerPage.tsx`
 - `frontend/src/lib/connectedAccounts.ts`
 - `frontend/src/lib/telegram.ts`

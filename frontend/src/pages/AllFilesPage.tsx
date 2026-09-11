@@ -16,17 +16,14 @@ import { defaultFolderColor, defaultFolderIconUrl, folderColorOptions, folderIco
 import { PageHeader } from '@/components/drive/PageHeader'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
-import { API_URL, apiFetch, formatBytes, formatDate } from '@/lib/api'
+import { API_URL, apiFetch, formatBytes } from '@/lib/api'
 import { getAccessToken } from '@/lib/auth'
 import { createPlyr, ensurePlyr } from '@/lib/plyr'
 import { getPreviewKind, officeViewerUrl } from '@/lib/preview'
 import type { FileItem, FolderItem } from '@/data/drive-data'
 import { useUpload, type UploadPreflightError } from '@/context/UploadContext'
 import { useDriveLayoutActions } from '@/layouts/DriveLayout'
-
-type BackendFile = { id: string; name: string; mimeType: string; sizeBytes: string; createdAt: string; folderId?: string | null; connectedAccount?: { email: string; provider: string }; folder?: { id: string; name: string } | null }
-type BackendFolder = { id: string; name: string; color: string; iconUrl?: string | null; parentId?: string | null; providerFolderId?: string | null; storageLocationCount?: number; primaryLocation?: { connectedAccountId: string; provider: string; providerFolderId: string } | null; updatedAt: string }
-type ConnectedAccount = { id: string; provider: string; email: string; displayName?: string | null; status: string; autoAllocationEnabled: boolean }
+import { useAllFiles } from '@/hooks/useAllFiles'
 
 const sizeActiveClasses: Record<FolderSizeScale, string> = {
   xs: 'bg-white text-slate-800 dark:bg-red-500/20 dark:text-red-300 dark:border-red-500/30 shadow-sm dark:shadow-none',
@@ -60,29 +57,6 @@ const MIME_TYPE_CHOICES: { value: string; label: string }[] = [
   { value: 'application/octet-stream', label: 'Generic blob (application/octet-stream)' },
 ]
 
-function mimeToKind(mimeType: string): FileItem['kind'] {
-  if (mimeType.startsWith('image/')) return 'image'
-  if (mimeType.startsWith('video/')) return 'video'
-  if (mimeType.includes('pdf')) return 'pdf'
-  return 'doc'
-}
-
-function providerLabel(provider: string | undefined) {
-  if (provider === 's3') return 'S3 Storage'
-  if (provider === 'telegram') return 'Telegram Drive'
-  return 'Google Drive'
-}
-
-function mapFile(file: BackendFile): FileItem {
-  return { id: file.id, name: file.name, mimeType: file.mimeType, sizeBytes: file.sizeBytes, createdAt: file.createdAt, accountEmail: file.connectedAccount?.email, accountProvider: providerLabel(file.connectedAccount?.provider), date: formatDate(file.createdAt), size: formatBytes(file.sizeBytes), access: file.connectedAccount?.email ?? providerLabel(file.connectedAccount?.provider), kind: mimeToKind(file.mimeType), shared: 1, folderId: file.folderId, folderName: file.folder?.name }
-}
-
-function mapFolder(folder: BackendFolder): FolderItem {
-  return { id: folder.id, name: folder.name, color: folder.color, iconUrl: folder.iconUrl, parentId: folder.parentId, providerFolderId: folder.providerFolderId, primaryLocation: folder.primaryLocation ?? null, storageLocationCount: folder.storageLocationCount ?? 1, updated: `Updated ${formatDate(folder.updatedAt)}` }
-}
-
-
-
 function FolderAppearanceFields({ color, iconUrl, onColorChange, onIconChange }: { color: string; iconUrl: string; onColorChange: (color: string) => void; onIconChange: (iconUrl: string) => void }) {
   const normalizedColor = normalizeFolderColor(color)
   return (
@@ -115,9 +89,6 @@ export function AllFilesPage() {
   const [previewUrl, setPreviewUrl] = useState('')
   const [previewError, setPreviewError] = useState('')
   const [previewLoading, setPreviewLoading] = useState(false)
-  const [files, setFiles] = useState<FileItem[]>([])
-  const [folders, setFolders] = useState<FolderItem[]>([])
-  const [allFolders, setAllFolders] = useState<FolderItem[]>([])
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [selectedFolderId, setSelectedFolderId] = useState('')
   const [isUploadDragging, setIsUploadDragging] = useState(false)
@@ -130,7 +101,6 @@ export function AllFilesPage() {
   const [folderRenameIconUrl, setFolderRenameIconUrl] = useState(defaultFolderIconUrl)
   const [activeFile, setActiveFile] = useState<FileItem | null>(null)
   const [activeFolderForMenu, setActiveFolderForMenu] = useState<FolderItem | null>(null)
-  const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(new Set())
   const [cutFolder, setCutFolder] = useState<FolderItem | null>(null)
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; file: FileItem | null }>({ x: 0, y: 0, file: null })
   const [folderContextMenu, setFolderContextMenu] = useState<{ x: number; y: number; folder: FolderItem | null }>({ x: 0, y: 0, folder: null })
@@ -156,91 +126,29 @@ export function AllFilesPage() {
     return (v === 'xs' || v === 'sm' || v === 'md' || v === 'lg') ? v : 'md'
   })
   const { setHeaderActions } = useDriveLayoutActions()
-  const [connectedAccounts, setConnectedAccounts] = useState<ConnectedAccount[]>([])
   const [selectedTargetAccountId, setSelectedTargetAccountId] = useState('')
   const [remoteImportOpen, setRemoteImportOpen] = useState(false)
+
+  const {
+    files,
+    folders,
+    allFolders,
+    connectedAccounts,
+    selectedFileIds,
+    moving,
+    loadFiles,
+    loadFolders,
+    loadAll,
+    handleDropItem,
+    toggleFileSelection,
+    toggleAllVisibleFiles,
+    clearSelection,
+  } = useAllFiles({ activeFolderId, searchQuery, searchParams, onMessage: setMessage })
 
   function changeFolderSize(scale: FolderSizeScale) {
     setFolderSizeScale(scale)
     localStorage.setItem('9drive:folder-size', scale)
   }
-
-  async function loadFiles() {
-    const params = new URLSearchParams()
-    if (activeFolderId) params.set('folderId', activeFolderId)
-    if (searchQuery) params.set('q', searchQuery)
-
-    // Add advanced search filters
-    const kind = searchParams.get('kind')
-    const accountId = searchParams.get('accountId')
-    const minSize = searchParams.get('minSize')
-    const maxSize = searchParams.get('maxSize')
-    const startDate = searchParams.get('startDate')
-    const endDate = searchParams.get('endDate')
-
-    if (kind) params.set('kind', kind)
-    if (accountId) params.set('accountId', accountId)
-    if (minSize) params.set('minSize', minSize)
-    if (maxSize) params.set('maxSize', maxSize)
-    if (startDate) params.set('startDate', startDate)
-    if (endDate) params.set('endDate', endDate)
-
-    const query = params.toString()
-    const path = query ? `/files?${query}` : '/files'
-    const data = await apiFetch<{ files: BackendFile[] }>(path)
-    setFiles(data.files.map(mapFile))
-  }
-
-  async function loadFolders() {
-    const visiblePath = activeFolderId ? `/folders?parentId=${activeFolderId}` : '/folders'
-    const [visibleData, allData] = await Promise.all([
-      apiFetch<{ folders: BackendFolder[] }>(visiblePath),
-      apiFetch<{ folders: BackendFolder[] }>('/folders?all=1'),
-    ])
-    setFolders(visibleData.folders.map(mapFolder))
-    setAllFolders(allData.folders.map(mapFolder))
-  }
-
-  async function loadAll() {
-    await Promise.all([loadFiles(), loadFolders()])
-  }
-
-  async function handleDropItem(fileId: string, targetFolderId: string) {
-    const fileIds = selectedFileIds.has(fileId) ? Array.from(selectedFileIds) : [fileId]
-    setLoading(true)
-    setMessage('')
-    try {
-      await apiFetch('/files/batch', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileIds, folderId: targetFolderId })
-      })
-      setMessage(`Successfully moved ${fileIds.length} item(s).`)
-      loadAll().catch(() => undefined)
-      setSelectedFileIds(new Set())
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Failed to move items')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    loadAll().catch((error) => setMessage(error instanceof Error ? error.message : 'Failed to load files'))
-    setSelectedFileIds(new Set())
-  }, [activeFolderId, searchQuery])
-
-  useEffect(() => {
-    async function loadConnectedAccounts() {
-      try {
-        const data = await apiFetch<{ accounts: ConnectedAccount[] }>('/connected-accounts')
-        setConnectedAccounts(data.accounts || [])
-      } catch (error) {
-        console.error('Failed to load connected accounts:', error)
-      }
-    }
-    loadConnectedAccounts()
-  }, [])
 
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
@@ -400,26 +308,6 @@ export function AllFilesPage() {
     event.stopPropagation()
     setActiveFile(file)
     setContextMenu({ x: event.clientX, y: event.clientY, file })
-  }
-
-  function toggleFileSelection(file: FileItem) {
-    if (!file.id) return
-    setSelectedFileIds((current) => {
-      const next = new Set(current)
-      if (next.has(file.id!)) next.delete(file.id!)
-      else next.add(file.id!)
-      return next
-    })
-  }
-
-  function toggleAllVisibleFiles() {
-    const visibleIds = files.map((file) => file.id).filter(Boolean) as string[]
-    const allSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedFileIds.has(id))
-    setSelectedFileIds(allSelected ? new Set() : new Set(visibleIds))
-  }
-
-  function clearSelection() {
-    setSelectedFileIds(new Set())
   }
 
   function changeFileViewMode(mode: FileViewMode) {
@@ -836,7 +724,7 @@ export function AllFilesPage() {
           {activeFolder ? <p className="rounded-xl bg-slate-50 p-3 text-sm text-slate-600">Uploading to: <b>{activeFolder.name}</b></p> : <label className="grid gap-2 text-sm font-semibold">Virtual Folder<select className="h-11 rounded-xl border border-slate-200 px-3 text-sm bg-white" value={selectedFolderId} onChange={(event) => setSelectedFolderId(event.target.value)}><option value="">No folder</option>{allFolders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}</select></label>}
           {preflightError ? <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800"><p className="font-bold">{preflightError.message}</p><p className="mt-1 text-xs">No space on any connected account for: <span className="font-semibold">{preflightError.unroutedFiles.join(', ')}</span></p></div> : null}
           {selectedFiles.length > 0 ? <div className="grid max-h-56 gap-2 overflow-y-auto rounded-xl bg-slate-50 p-3 text-sm text-slate-600"><div className="flex items-center justify-between gap-3"><span className="font-bold text-slate-950">{selectedFiles.length} selected</span><span className="shrink-0">{formatBytes(selectedFiles.reduce((total, file) => total + file.size, 0))}</span></div>{selectedFiles.map((file, index) => <div key={`${file.name}-${file.size}-${index}`} className="flex min-w-0 items-center justify-between gap-3 rounded-lg bg-white px-3 py-2"><span className="min-w-0 flex-1 truncate" title={file.name}>{file.name}</span><span className="shrink-0 text-xs text-slate-500">{formatBytes(file.size)}</span><button type="button" className="shrink-0 text-slate-500 hover:text-red-600" onClick={() => removeUploadFile(index)} aria-label={`Remove ${file.name}`}><X className="h-4 w-4" /></button></div>)}</div> : null}
-          <div className="grid gap-3 sm:flex sm:justify-end"><Button type="button" variant="outline" onClick={() => setUploadOpen(false)}>Cancel</Button><Button disabled={loading || selectedFiles.length === 0}>{loading ? 'Uploading...' : `Upload${selectedFiles.length > 1 ? ` ${selectedFiles.length} files` : ''}`}</Button></div>
+          <div className="grid gap-3 sm:flex sm:justify-end"><Button type="button" variant="outline" onClick={() => setUploadOpen(false)}>Cancel</Button><Button disabled={loading || moving || selectedFiles.length === 0}>{loading ? 'Uploading...' : `Upload${selectedFiles.length > 1 ? ` ${selectedFiles.length} files` : ''}`}</Button></div>
         </form>
       </DummyModal>
        <DummyModal open={folderOpen} title="New Folder" description="Create a virtual folder for organizing files." onClose={() => setFolderOpen(false)}>

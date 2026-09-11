@@ -31,7 +31,9 @@ frontend/
   src/pages/                       Route-level pages
   src/components/drive/            File/folder/upload UI
   src/components/settings/         Settings feature components
+  src/hooks/                       Page/layout state and action hooks
   src/context/UploadContext.tsx     Global upload state/progress
+  src/lib/upload-client.ts          Resumable/direct-S3 browser transport
   src/lib/                         REST clients/helpers
 
 extensions/browser-capture/        Browser extension
