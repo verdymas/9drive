@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { appendExtensionFromMime, extensionFromMime, isOpaqueFileName, nameHasExtension, normalizeExtensionFromMime, sanitizeFileName } from './filename-sanitize.js'
+import { appendExtensionFromMime, extensionFromMime, isOpaqueFileName, nameHasExtension, normalizeExtensionFromMime, normalizeFinalFileName, sanitizeFileName } from './filename-sanitize.js'
 
 describe('sanitizeFileName', () => {
   it('passes through a clean name', () => {
@@ -129,5 +129,38 @@ describe('isOpaqueFileName', () => {
     expect(isOpaqueFileName('matrix1999.mp4', { resourceType: 'video', mimeType: 'video/mp4' })).toBe(false)
     expect(isOpaqueFileName('episode12.mp4', { resourceType: 'video', mimeType: 'video/mp4' })).toBe(false)
     expect(isOpaqueFileName('video2026.mp4', { resourceType: 'video', mimeType: 'video/mp4' })).toBe(false)
+  })
+})
+
+describe('normalizeFinalFileName', () => {
+  it('sanitizes unsafe symbols and trims trailing dots/spaces', () => {
+    expect(normalizeFinalFileName('video<bad>:name?. ', 'video/mp4')).toBe('videobadname.mp4')
+  })
+
+  it('adds the MIME extension to a bare MP4 name', () => {
+    expect(normalizeFinalFileName('video bagus', 'video/mp4')).toBe('video bagus.mp4')
+  })
+
+  it('adds the MIME extension to a bare Matroska name', () => {
+    expect(normalizeFinalFileName('film', 'video/x-matroska')).toBe('film.mkv')
+  })
+
+  it('keeps an existing meaningful extension unchanged', () => {
+    expect(normalizeFinalFileName('film.webm', 'video/mp4')).toBe('film.webm')
+  })
+
+  it('does not duplicate an existing extension', () => {
+    expect(normalizeFinalFileName('film.mp4', 'video/mp4')).toBe('film.mp4')
+  })
+
+  it('neutralizes path traversal', () => {
+    const result = normalizeFinalFileName('../../video.mp4', 'video/mp4')
+    expect(result).toBe('..-..-video.mp4')
+    expect(result).not.toMatch(/[\\/]/)
+  })
+
+  it('preserves an explicit generic extension while completing only a missing one', () => {
+    expect(normalizeFinalFileName('custom.bin', 'video/mp4', { explicit: true })).toBe('custom.bin')
+    expect(normalizeFinalFileName('custom', 'video/mp4', { explicit: true })).toBe('custom.mp4')
   })
 })

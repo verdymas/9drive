@@ -3,7 +3,7 @@ import { prisma } from '../../config/prisma.js'
 import { AppError } from '../../utils/app-error.js'
 import { createAuditLog } from '../../utils/audit.js'
 import { encryptText } from '../../utils/crypto.js'
-import { normalizeExtensionFromMime, sanitizeFileName } from './filename-sanitize.js'
+import { normalizeFinalFileName, sanitizeFileName } from './filename-sanitize.js'
 import {
   decryptRequestContext,
   encryptRequestContext,
@@ -116,14 +116,8 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
   // one ultimately uploaded (§4).
   const hls = input.hls
   const finalFileName = hls
-    ? hlsFinalFileName(fileName, hls.outputContainer)
-    // Direct-file imports: when the remote supplied no extension (no CD name,
-    // extensionless URL), or only supplied a generic transport suffix, give
-    // detected names one from a KNOWN response Content-Type. Never overwrite
-    // an explicit user filename or guess an unknown type.
-    : input.fileName?.trim()
-      ? fileName
-      : normalizeExtensionFromMime(fileName, input.mimeType)
+    ? sanitizeFileName(hlsFinalFileName(fileName, hls.outputContainer))
+    : normalizeFinalFileName(fileName, input.mimeType, { explicit: Boolean(input.fileName?.trim()) })
 
   // Safe provenance diagnostics (never URLs, cookies, tokens, or secrets).
   const nameSource = input.fileName ? 'explicit' : input.detectedFileName ? 'probe' : 'url-fallback'

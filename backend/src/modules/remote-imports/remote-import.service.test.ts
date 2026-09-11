@@ -563,6 +563,16 @@ describe('createRemoteImport', () => {
     expect(created.fileName).toBe('Stream123.mp4')
   })
 
+  it('sanitizes and completes an explicit extensionless filename at creation', async () => {
+    const created = await createRemoteImport({
+      userId: 'user-1',
+      sourceUrl: 'https://cdn.example/stream',
+      fileName: '../../film',
+      mimeType: 'video/x-matroska',
+    })
+    expect(created.fileName).toBe('..-..-film.mkv')
+  })
+
   it('never duplicates an explicit extension when mimeType is supplied', async () => {
     const created = await createRemoteImport({
       userId: 'user-1',

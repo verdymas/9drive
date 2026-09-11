@@ -190,3 +190,20 @@ export function normalizeExtensionFromMime(name: string, mimeType: string | null
   if (GENERIC_TRANSPORT_EXTENSION.test(name)) return name.replace(GENERIC_TRANSPORT_EXTENSION, `.${extension}`)
   return appendExtensionFromMime(name, mimeType)
 }
+
+/**
+ * Canonicalize the filename at the final output boundary. Explicit names keep
+ * their chosen extension; detected names also replace generic transport
+ * suffixes when the response MIME identifies a more specific format.
+ */
+export function normalizeFinalFileName(
+  raw: string,
+  mimeType: string | null | undefined,
+  options: { explicit?: boolean } = {},
+): string {
+  const safe = sanitizeFileName(raw)
+  const withExtension = options.explicit
+    ? appendExtensionFromMime(safe, mimeType)
+    : normalizeExtensionFromMime(safe, mimeType)
+  return sanitizeFileName(withExtension)
+}
