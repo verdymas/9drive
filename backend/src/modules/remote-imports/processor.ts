@@ -28,6 +28,7 @@ import { verifyOutput } from './hls/verify.js'
 import { hasDriver, resolveDriver } from '../remote-fetch-workers/driver-registry.js'
 import { REMOTE_FETCH_WORKER_ERROR_CODES } from '../remote-fetch-workers/errors.js'
 import { createSecureFetcherForWorkerId, type SecureRemoteFetcher } from './secure-fetcher.js'
+import { estimateTempReservation, tempStorageReservations, type TempStorageDiagnostics, type TempStorageStage } from './resource-control.js'
 
 const STAGES = {
   PROBING: 'probing',
@@ -135,6 +136,45 @@ function nowIso() {
 function logProgress(importId: string, stage: Stage, message: string) {
   // Log-only; never includes URL query strings or secrets.
   console.log(`[remote-import] ${nowIso()} ${importId} ${stage}: ${message}`)
+}
+
+function serializeResourceDiagnostics(diagnostics: TempStorageDiagnostics) {
+  return JSON.stringify({
+    ...diagnostics,
+    freeBytes: diagnostics.freeBytes.toString(),
+    reservedBytes: diagnostics.reservedBytes.toString(),
+    requiredBytes: diagnostics.requiredBytes.toString(),
+  })
+}
+
+/** A capacity deferral is recoverable queue state, never a provider failure. */
+async function admitTempStorage(
+  importId: string,
+  stage: TempStorageStage,
+  sourceType: string | null | undefined,
+  contentLength: bigint | null | undefined,
+) {
+  const admission = await tempStorageReservations.tryAcquire({
+    importId,
+    stage,
+    requiredBytes: estimateTempReservation({ sourceType, contentLength }),
+    reserveBytes: BigInt(env.REMOTE_IMPORT_TEMP_FREE_SPACE_RESERVE_BYTES),
+  })
+  if (admission.admitted) return admission.reservation
+
+  await prisma.remoteImport.update({
+    where: { id: importId },
+    data: {
+      status: 'queued',
+      stage: 'waiting',
+      errorCode: 'RESOURCE_WAITING',
+      errorMessage: 'Waiting for temporary storage capacity.',
+      internalError: serializeResourceDiagnostics(admission.diagnostics),
+      heartbeatAt: new Date(),
+    },
+  }).catch(() => undefined)
+  console.warn(`[remote-import] ${importId} deferred: temporary storage reserve would be consumed`)
+  return null
 }
 
 /** Fetch + stream a remote URL to a temp part file with byte cap and idle timeout. */
@@ -473,6 +513,8 @@ async function processHlsImport(
   const fetcher = outerFetcher ?? (await createSecureFetcherForWorkerId(record.workerId, { requestContext, sourceUrl }))
 
   const jobDir = hlsJobDir(userId, importId)
+  const reservation = await admitTempStorage(importId, 'segments', record.sourceType, null)
+  if (!reservation) return 'deferred' as const
   await ensureJobDir(jobDir)
 
   // A convert-only retry (`retryRemoteConvert`) re-enqueues WITHOUT wiping the
@@ -729,6 +771,7 @@ async function processHlsImport(
     await removeResumeMarker(jobDir).catch(() => undefined)
     return { outputPath: outputPath! }
   } finally {
+    reservation.release()
     clearInterval(pollCancel)
     // Keep the job dir ONLY while a resume marker exists (a remux/verify
     // failure leaves one so a convert-only retry can reuse the segments).
@@ -791,6 +834,7 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
     // ── HLS imports skip the direct-download path entirely. ─────────────────
     if (isHlsRecord(record)) {
       const result = await processHlsImport(job, record, fetcher)
+      if (result === 'deferred') return 'deferred'
       if (result) return
       // processHlsImport already finalized status on failure; just return.
       return
@@ -819,6 +863,7 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
 
     // Probe the URL: via SecureRemoteFetcher (Direct or relay) — never raw followRemoteUrl
     let finalUrl: string
+    let probedContentLength: bigint | null = record.totalBytes
     try {
       const probeRes = await fetcher.fetch({ method: 'GET', url: sourceUrl, headers: { Range: 'bytes=0-0' }, range: 'bytes=0-0', requestContext: requestContext as any } as any)
       const length = probeRes.headers['content-length']
@@ -840,6 +885,7 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
           return
         }
         await prisma.remoteImport.update({ where: { id: importId }, data: { totalBytes: declared, sourceRangeSupported: supportsRange } })
+        probedContentLength = declared
       }
     } catch (error) {
       if (error instanceof AppError && error.code === 'DOWNLOAD_TOO_LARGE') {
@@ -849,32 +895,38 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
       throw error
     }
 
-    const downloaded = await downloadToTemp(importId, finalUrl, maxBytes, requestContext, fetcher)
-    finalUrl = downloaded.finalUrl
+    const reservation = await admitTempStorage(importId, 'downloading', record.sourceType, probedContentLength)
+    if (!reservation) return 'deferred'
+    try {
+      const downloaded = await downloadToTemp(importId, finalUrl, maxBytes, requestContext, fetcher)
+      finalUrl = downloaded.finalUrl
 
-    assertWithinTimeout()
+      assertWithinTimeout()
 
-    // Re-check cancellation between phases.
-    const afterDownload = await prisma.remoteImport.findUnique({ where: { id: importId } })
-    if (afterDownload?.status === 'cancelled') {
-      await removeTempFile(importId)
-      return
+      // Re-check cancellation between phases.
+      const afterDownload = await prisma.remoteImport.findUnique({ where: { id: importId } })
+      if (afterDownload?.status === 'cancelled') {
+        await removeTempFile(importId)
+        return
+      }
+
+      assertWithinTimeout()
+
+      // Shared placement→upload→register tail (also used by upload-resume retries).
+      await continueFromPart({
+        importId,
+        record,
+        userId,
+        folderId,
+        fileName,
+        mimeType,
+        sourceUrl: finalUrl,
+        tempPartPath: downloaded.tempPartPath,
+        contentLength: downloaded.contentLength,
+      }, assertWithinTimeout)
+    } finally {
+      reservation.release()
     }
-
-    assertWithinTimeout()
-
-    // Shared placement→upload→register tail (also used by upload-resume retries).
-    await continueFromPart({
-      importId,
-      record,
-      userId,
-      folderId,
-      fileName,
-      mimeType,
-      sourceUrl: finalUrl,
-      tempPartPath: downloaded.tempPartPath,
-      contentLength: downloaded.contentLength,
-    }, assertWithinTimeout)
   } catch (error) {
     // The tail already finalized a placement failure (with the mapped stable
     // code) and signals via this marker so the row is not overwritten. A

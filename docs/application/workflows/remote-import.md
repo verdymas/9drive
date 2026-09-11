@@ -5,8 +5,11 @@ flowchart TD
   UI[Remote Import UI / Browser Capture] --> Probe[Probe / validate]
   Probe --> Create[Create RemoteImport row]
   Create --> Queue[BullMQ Redis]
-  Queue --> Worker[Remote Import worker]
-  Worker --> Fetch{Direct or Remote Fetch Worker}
+Queue --> Worker[Remote Import worker]
+Worker --> Capacity{Temp capacity available?}
+Capacity -->|wait| Queue
+Capacity -->|admitted| Fetch
+Worker --> Fetch{Direct or Remote Fetch Worker}
   Fetch --> Type{Direct file or HLS}
   Type -->|Direct| Temp[Temp file/download]
   Type -->|HLS| HLS[Manifest + segments + FFmpeg]

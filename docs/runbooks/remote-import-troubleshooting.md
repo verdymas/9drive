@@ -21,6 +21,15 @@ The code includes queue reconciliation; read `queue-reconcile.ts` before manuall
 ## 3. Stuck `processing`
 Check `heartbeatAt` and worker logs. The reconciliation sweep marks stale heartbeats according to `REMOTE_IMPORT_WORKER_HEARTBEAT_TIMEOUT_SECONDS`.
 
+## 3a. Waiting for temporary storage
+
+An import with `status: queued`, `stage: waiting`, and
+`errorCode: RESOURCE_WAITING` is recoverable. Inspect free space on the volume
+that contains `REMOTE_IMPORT_TEMP_DIR`; do not delete an active import's
+artifacts. Adjust the free-space reserve or conservative unknown/HLS
+reservation only after confirming the worker volume can safely support the
+expected workload. The next delayed queue attempt rechecks capacity.
+
 ## 4. Fetch Failure
 
 - Direct mode: check SSRF/DNS/redirect/connect/idle timeout behavior.

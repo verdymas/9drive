@@ -73,6 +73,7 @@ const h = vi.hoisted(() => {
     googleUploader: vi.fn(async () => ({ providerFileId: 'drive-file-1', name: 'movie.mkv', mimeType: 'video/x-matroska', sizeBytes: 1000n })),
     audit: vi.fn(async () => undefined),
     s3UploadSpy: vi.fn(async () => undefined),
+    tempInspector: vi.fn(async () => ({ freeBytes: 100_000_000_000n })),
   }
 })
 
@@ -117,6 +118,7 @@ vi.mock('./temp-storage.js', async (importOriginal) => {
     // import-keyed convenience wrappers that fake the file existence.
     tempFilePath: (id: string) => path.join(scratchDir, `${id}.part`),
     finalTempFilePath: (id: string) => path.join(scratchDir, `${id}.download`),
+    inspectTempStorage: h.tempInspector,
     appendStreamToTemp: (filePath: string) => actual.appendStreamToTemp(filePath),
     createTempPartFile: vi.fn(async (id: string) => {
       const filePath = path.join(scratchDir, `${id}.part`)
@@ -239,6 +241,7 @@ import { resolveUploadPlacement } from '../storage/upload-placement.service.js'
 
 function reset() {
   vi.clearAllMocks()
+  h.tempInspector.mockResolvedValue({ freeBytes: 100_000_000_000n })
   h.rows.clear()
   h.rows.set('import-1', h.baseRow())
 }
@@ -299,6 +302,27 @@ describe('processRemoteImportJob — placement routing (direct)', () => {
     // Import completed.
     const finalRow = h.rows.get('import-1')!
     expect(finalRow.status).toBe('completed')
+  })
+
+  it('defers a resource-starved import without downloading or failing it', async () => {
+    h.tempInspector.mockResolvedValue({ freeBytes: 0n })
+
+    const result = await processRemoteImportJob(job())
+
+    expect(result).toBe('deferred')
+    const row = h.rows.get('import-1')!
+    expect(row).toMatchObject({
+      status: 'queued',
+      stage: 'waiting',
+      errorCode: 'RESOURCE_WAITING',
+      errorMessage: 'Waiting for temporary storage capacity.',
+    })
+    expect(JSON.parse(String(row.internalError))).toMatchObject({
+      importId: 'import-1',
+      stage: 'downloading',
+      reason: 'free_space_reserve',
+    })
+    expect(h.resolvePlacement).not.toHaveBeenCalled()
   })
 
   it('fails with NO_ACCOUNT_WITH_ENOUGH_SPACE when Automatic has no eligible account', async () => {

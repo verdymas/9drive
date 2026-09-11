@@ -56,7 +56,8 @@ export function createRemoteImportWorker(): Worker<RemoteImportJobData> {
         // processor's failure path finalizes the row.
         console.error('[remote-import] failed to mark execution started for', importId, err instanceof Error ? err.message : String(err))
       })
-      await processRemoteImportJob(job)
+      const result = await processRemoteImportJob(job)
+      if (result === 'deferred') throw new (await import('bullmq')).DelayedError()
     } finally {
       releasePerUserSlot(userId)
     }

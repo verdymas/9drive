@@ -118,6 +118,7 @@ vi.mock('./temp-storage.js', async (importOriginal) => {
   return {
     tempFilePath: (id: string) => path.join(scratchDir, `${id}.part`),
     finalTempFilePath: (id: string) => path.join(scratchDir, `${id}.download`),
+    inspectTempStorage: vi.fn(async () => ({ freeBytes: 100_000_000_000n })),
     appendStreamToTemp: (filePath: string) => actual.appendStreamToTemp(filePath),
     createTempPartFile: vi.fn(async (id: string) => {
       const filePath = path.join(scratchDir, `${id}.part`)

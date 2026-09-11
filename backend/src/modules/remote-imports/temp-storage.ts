@@ -20,6 +20,13 @@ export async function ensureTempDir() {
   await fsp.mkdir(tempDir(), { recursive: true })
 }
 
+/** Return free bytes available to the process on the remote-import temp volume. */
+export async function inspectTempStorage(): Promise<{ freeBytes: bigint }> {
+  await ensureTempDir()
+  const stats = await fsp.statfs(tempDir())
+  return { freeBytes: BigInt(stats.bavail) * BigInt(stats.bsize) }
+}
+
 export function tempFilePath(importId: string) {
   return path.join(tempDir(), `${importId}.part`)
 }

@@ -71,6 +71,15 @@ Sources of truth: `backend/src/config/env.ts`, `docker-compose.yml`, and fronten
 - `REMOTE_IMPORT_UPLOAD_ATTEMPTS`
 - `REMOTE_IMPORT_TEMP_RETENTION_HOURS`
 - `REMOTE_IMPORT_PROGRESS_UPDATE_INTERVAL_MS`
+- `REMOTE_IMPORT_TEMP_FREE_SPACE_RESERVE_BYTES` — bytes that Remote Import
+  must leave free on the `REMOTE_IMPORT_TEMP_DIR` volume; default `2147483648`
+  (2 GiB).
+- `REMOTE_IMPORT_TEMP_UNKNOWN_RESERVATION_BYTES` — conservative temporary-disk
+  reservation for a direct source whose size cannot be determined; default
+  `5368709120` (5 GiB).
+- `REMOTE_IMPORT_TEMP_HLS_RESERVATION_BYTES` — conservative temporary-disk
+  reservation for an HLS job, covering materialized segments and conversion
+  output; default `10737418240` (10 GiB).
 - `REMOTE_IMPORT_QUEUE_START_TIMEOUT_SECONDS`
 - `REMOTE_IMPORT_WORKER_HEARTBEAT_TIMEOUT_SECONDS`
 - `REMOTE_IMPORT_TEMP_DIR`

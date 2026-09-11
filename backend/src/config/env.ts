@@ -62,6 +62,11 @@ const envSchema = z.object({
   REMOTE_IMPORT_UPLOAD_ATTEMPTS: z.coerce.number().default(2),
   REMOTE_IMPORT_TEMP_RETENTION_HOURS: z.coerce.number().default(24),
   REMOTE_IMPORT_PROGRESS_UPDATE_INTERVAL_MS: z.coerce.number().default(1000),
+  // Keep a fixed reserve on the volume used by Remote Import's temporary
+  // artifacts. Unknown direct sources and HLS jobs use conservative estimates.
+  REMOTE_IMPORT_TEMP_FREE_SPACE_RESERVE_BYTES: z.coerce.number().default(2 * 1024 * 1024 * 1024),
+  REMOTE_IMPORT_TEMP_UNKNOWN_RESERVATION_BYTES: z.coerce.number().default(5 * 1024 * 1024 * 1024),
+  REMOTE_IMPORT_TEMP_HLS_RESERVATION_BYTES: z.coerce.number().default(10 * 1024 * 1024 * 1024),
   // Max time a `queued` import may sit without evidence of a valid waiting/
   // delayed queue job before the reconcile sweep starts checking queue state.
   REMOTE_IMPORT_QUEUE_START_TIMEOUT_SECONDS: z.coerce.number().default(300),
