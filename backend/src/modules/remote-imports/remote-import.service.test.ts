@@ -80,6 +80,7 @@ vi.mock('./queue.js', () => ({
   enqueueRemoteImport: (...args: unknown[]) => h.enqueueSpy(...args),
   removeRemoteImportJob: vi.fn(async () => undefined),
   remoteImportJobId: (importId: string, attempt: number) => `${importId}~${attempt}`,
+  workloadForRemoteImport: (row: { sourceType?: string | null }) => (row.sourceType === 'hls_master' || row.sourceType === 'hls_media' ? 'hls' : 'direct'),
 }))
 
 vi.mock('../../utils/audit.js', () => ({ createAuditLog: (...args: unknown[]) => h.auditSpy(...args) }))
@@ -333,7 +334,7 @@ describe('retryRemoteImport with a selected worker', () => {
     const row = await withRow({ status: 'failed', workerId: 'worker-A', workerNameSnapshot: 'Cloudflare SG #1', sourceType: null, fileId: null })
     void row
     await expect(retryRemoteImport('import-1', 'user-1')).resolves.toMatchObject({ status: 'queued' })
-    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2)
+    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2, 'direct')
   })
 })
 
@@ -379,7 +380,7 @@ describe('retryRemoteConvert', () => {
   it('re-enqueues but never removes the job dir (segments are reused)', async () => {
     await withRow({ status: 'failed', sourceType: 'hls_master', errorCode: 'HLS_REMUX_FAILED' })
     await retryRemoteConvert('import-1', 'user-1')
-    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2)
+    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2, 'hls')
     expect(h.removeJobDirSpy).not.toHaveBeenCalled()
     // Contrast: the generic retry DOES wipe the dir for a full re-run.
     await withRow({ status: 'failed', sourceType: 'hls_master', errorCode: 'HLS_REMUX_FAILED' })
@@ -390,7 +391,7 @@ describe('retryRemoteConvert', () => {
   it('auth-only failure (GOOGLE_REAUTH_REQUIRED) keeps the job dir + output on a generic retry', async () => {
     await withRow({ status: 'failed', sourceType: 'hls_master', errorCode: 'GOOGLE_REAUTH_REQUIRED' })
     await retryRemoteImport('import-1', 'user-1')
-    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2)
+    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2, 'hls')
     // The generic retry usually wipes the dir; for reauth it must NOT, so the
     // remuxed output + resume marker survive and the retry resumes at upload.
     expect(h.removeJobDirSpy).not.toHaveBeenCalled()
@@ -448,7 +449,7 @@ describe('retryRemoteConvert', () => {
     await expect(retryRemoteConvert('import-1', 'user-1')).rejects.toMatchObject({ code: 'REMOTE_IMPORT_ALREADY_ACTIVE' })
     // The queue job was already enqueued by the loser's caller — the winner
     // owns it; no cleanup is attempted here.
-    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2)
+    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2, 'hls')
     expect(h.auditSpy).not.toHaveBeenCalled()
   })
 
@@ -519,7 +520,7 @@ describe('createRemoteImport', () => {
       hls: { sourceType: 'hls_media' },
     })
     expect(created.fileName).toBe('My Movie.mkv')
-    expect(h.enqueueSpy).toHaveBeenCalledWith(created.id, 1)
+    expect(h.enqueueSpy).toHaveBeenCalledWith(created.id, 1, 'hls')
   })
 
   it('silently replaces an explicit filename extension contradicting the container', async () => {
@@ -530,7 +531,7 @@ describe('createRemoteImport', () => {
       hls: { sourceType: 'hls_media', outputContainer: 'mkv' },
     })
     expect(created.fileName).toBe('Movie.mkv')
-    expect(h.enqueueSpy).toHaveBeenCalledWith(created.id, 1)
+    expect(h.enqueueSpy).toHaveBeenCalledWith(created.id, 1, 'hls')
   })
 
   it('appends the output container extension when none is given', async () => {
@@ -625,7 +626,7 @@ describe('createRemoteImport', () => {
     const createArgs = (h.prismaMock.remoteImport.create as ReturnType<typeof vi.fn>).mock.calls[0][0]
     expect(createArgs.data.workerId).toBe('worker-A')
     expect(createArgs.data.workerNameSnapshot).toBe('Cloudflare SG #1')
-    expect(h.enqueueSpy).toHaveBeenCalledWith(created.id, 1)
+    expect(h.enqueueSpy).toHaveBeenCalledWith(created.id, 1, 'hls')
   })
 
   it('Direct mode persists workerId null', async () => {

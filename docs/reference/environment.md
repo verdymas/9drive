@@ -62,6 +62,10 @@ Sources of truth: `backend/src/config/env.ts`, `docker-compose.yml`, and fronten
 - `REMOTE_IMPORT_ENABLED`
 - `REMOTE_IMPORT_MAX_BYTES`
 - `REMOTE_IMPORT_GLOBAL_CONCURRENCY`
+- `REMOTE_IMPORT_DIRECT_CONCURRENCY` — direct HTTP import worker slots. When
+  unset, defaults to `REMOTE_IMPORT_GLOBAL_CONCURRENCY` for compatibility.
+- `REMOTE_IMPORT_HLS_JOB_CONCURRENCY` — HLS job worker slots. When unset,
+  defaults to `REMOTE_IMPORT_GLOBAL_CONCURRENCY` for compatibility.
 - `REMOTE_IMPORT_PER_USER_CONCURRENCY`
 - `REMOTE_IMPORT_MAX_REDIRECTS`
 - `REMOTE_IMPORT_CONNECT_TIMEOUT_SECONDS`

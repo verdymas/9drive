@@ -10,7 +10,7 @@ import {
   serializeRequestContext,
   type RemoteImportRequestContext,
 } from './request-context.js'
-import { enqueueRemoteImport, removeRemoteImportJob, remoteImportJobId } from './queue.js'
+import { enqueueRemoteImport, removeRemoteImportJob, remoteImportJobId, workloadForRemoteImport } from './queue.js'
 import { validateRemoteUrl } from './ssrf.js'
 import { removeTempFile, tempFilePath } from './temp-storage.js'
 import { hlsJobDir, readResumeMarker, removeJobDir } from './hls/job-dir.js'
@@ -157,7 +157,7 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
 
   await createAuditLog(input.userId, 'IMPORT_URL_CREATE', 'remote_import', created.id, { name: created.fileName })
   try {
-    await enqueueRemoteImport(created.id, 1)
+    await enqueueRemoteImport(created.id, 1, workloadForRemoteImport(created))
     // queuedAt is set only when queue.add() actually succeeded (§29/§30).
     await prisma.remoteImport.update({
       where: { id: created.id },
@@ -344,7 +344,7 @@ export async function cancelRemoteImport(importId: string, userId: string) {
 
   // Remove from queue first (worker won't pick it up); in-flight jobs check
   // the status between phases and abort.
-  await removeRemoteImportJob(importId, row.attempt).catch(() => undefined)
+  await removeRemoteImportJob(importId, row.attempt, workloadForRemoteImport(row)).catch(() => undefined)
   const updated = await prisma.remoteImport.update({
     where: { id: importId },
     data: { status: 'cancelled', cancelledAt: new Date() },
@@ -455,7 +455,7 @@ async function enqueueRetry(
   let jobId: string
   try {
     // Enqueue first: the BullMQ job is the source of truth for execution.
-    jobId = await enqueueRemoteImport(importId, nextAttempt)
+    jobId = await enqueueRemoteImport(importId, nextAttempt, workloadForRemoteImport(row))
   } catch (error) {
     // Persist a stable failed/retryable state — NEVER leave the row queued.
     await prisma.remoteImport.update({
@@ -537,7 +537,7 @@ export async function retryRemoteConvert(importId: string, userId: string) {
 /** Delete an import row (does not touch the provider file). */
 export async function deleteRemoteImport(importId: string, userId: string) {
   const row = await getRemoteImportForUser(importId, userId)
-  await removeRemoteImportJob(importId, row.attempt).catch(() => undefined)
+  await removeRemoteImportJob(importId, row.attempt, workloadForRemoteImport(row)).catch(() => undefined)
   await removeTempFile(importId)
   await removeJobDirIfExists(userId, importId)
   await prisma.remoteImport.delete({ where: { id: importId } })

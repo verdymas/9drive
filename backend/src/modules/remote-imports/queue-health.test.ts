@@ -5,11 +5,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const h = vi.hoisted(() => {
   class FakeQueue {
     static last: FakeQueue | null = null
+    static instances: FakeQueue[] = []
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     getWorkersCount = vi.fn(async (): Promise<number> => 1)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     constructor(..._args: any[]) {
       FakeQueue.last = this
+      FakeQueue.instances.push(this)
     }
   }
   return { FakeQueue }
@@ -22,8 +24,8 @@ import { remoteImportQueueHealth } from './queue.js'
 describe('remoteImportQueueHealth (§42 health signal)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    if (h.FakeQueue.last) {
-      ;(h.FakeQueue.last.getWorkersCount as ReturnType<typeof vi.fn>).mockResolvedValue(1)
+    for (const queue of h.FakeQueue.instances) {
+      ;(queue.getWorkersCount as ReturnType<typeof vi.fn>).mockResolvedValue(1)
     }
   })
 
@@ -32,12 +34,16 @@ describe('remoteImportQueueHealth (§42 health signal)', () => {
   })
 
   it('reports worker unknown when no worker is currently connected (soft signal)', async () => {
-    ;(h.FakeQueue.last!.getWorkersCount as ReturnType<typeof vi.fn>).mockResolvedValue(0)
+    for (const queue of h.FakeQueue.instances) {
+      ;(queue.getWorkersCount as ReturnType<typeof vi.fn>).mockResolvedValue(0)
+    }
     expect(await remoteImportQueueHealth()).toEqual({ redis: 'ok', worker: 'unknown' })
   })
 
   it('reports redis down instead of throwing when Redis is unreachable', async () => {
-    ;(h.FakeQueue.last!.getWorkersCount as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('ECONNREFUSED'))
+    for (const queue of h.FakeQueue.instances) {
+      ;(queue.getWorkersCount as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('ECONNREFUSED'))
+    }
     await expect(remoteImportQueueHealth()).resolves.toEqual({ redis: 'down', worker: 'unknown' })
   })
 })

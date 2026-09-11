@@ -49,5 +49,13 @@ operator contains only free, reserved, and required byte counts plus stage and
 import ID. Reservations are released when work completes, fails, cancels, or
 is deferred.
 
+## Worker budgets
+
+Remote Import remains one feature and one status model, but the worker process
+consumes `remote-imports-direct` and `remote-imports-hls` separately. This
+lets ordinary network transfers continue when CPU/disk-heavy HLS work fills its
+own budget. The per-user processing limit is shared by both consumers, so a
+user cannot bypass it by submitting both source types.
+
 ## Existing Deep Reference
 The repository also contains the older `docs/REMOTE_IMPORTS.md`. Use it for additional historical detail, but treat current source code as authoritative.

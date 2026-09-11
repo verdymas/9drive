@@ -8,10 +8,11 @@ import { env } from '../../config/env.js'
  * consumes them. Jobs are persisted in Redis so a worker crash does not lose
  * work: a job that fails mid-run is retried with `attempts` from env.
  */
-const QUEUE_NAME = 'remote-imports'
+const DIRECT_QUEUE_NAME = 'remote-imports-direct'
+const HLS_QUEUE_NAME = 'remote-imports-hls'
 const JOB_NAME = 'import'
 
-export const remoteImportQueue = new Queue<RemoteImportJobData>(QUEUE_NAME, {
+const queueOptions = {
   connection: { url: env.REDIS_URL },
   defaultJobOptions: {
     attempts: env.REMOTE_IMPORT_DOWNLOAD_ATTEMPTS,
@@ -19,13 +20,34 @@ export const remoteImportQueue = new Queue<RemoteImportJobData>(QUEUE_NAME, {
     removeOnComplete: { count: 100 },
     removeOnFail: { count: 500 },
   },
-})
+}
+
+export const remoteImportDirectQueue = new Queue<RemoteImportJobData>(DIRECT_QUEUE_NAME, queueOptions)
+export const remoteImportHlsQueue = new Queue<RemoteImportJobData>(HLS_QUEUE_NAME, queueOptions)
+/** Legacy export retained for callers that only need the direct queue. */
+export const remoteImportQueue = remoteImportDirectQueue
+
+export type RemoteImportWorkload = 'direct' | 'hls'
+
+export function workloadForRemoteImport(row: { sourceType?: string | null | undefined }): RemoteImportWorkload {
+  return row.sourceType === 'hls_master' || row.sourceType === 'hls_media' ? 'hls' : 'direct'
+}
+
+function queueFor(workload: RemoteImportWorkload) {
+  return workload === 'hls' ? remoteImportHlsQueue : remoteImportDirectQueue
+}
+
+function queuesForLookup(workload?: RemoteImportWorkload) {
+  return workload ? [queueFor(workload)] : [remoteImportDirectQueue, remoteImportHlsQueue]
+}
 
 export type RemoteImportJobData = {
   /** Prisma `remote_imports.id` — the domain record that drives progress. */
   importId: string
   /** Monotonic attempt counter; bumped by retry() so the worker can detect it. */
   attempt: number
+  /** Queue class; database sourceType remains the authoritative classifier. */
+  workload: RemoteImportWorkload
 }
 
 /**
@@ -51,10 +73,11 @@ export function remoteImportJobId(importId: string, attempt: number): string {
 export async function enqueueRemoteImport(
   importId: string,
   attempt: number,
+  workload: RemoteImportWorkload = 'direct',
 ): Promise<string> {
-  const data: RemoteImportJobData = { importId, attempt }
+  const data: RemoteImportJobData = { importId, attempt, workload }
   const jobId = remoteImportJobId(importId, attempt)
-  const job = await remoteImportQueue.add(JOB_NAME, data, {
+  const job = await queueFor(workload).add(JOB_NAME, data, {
     jobId,
     attempts: env.REMOTE_IMPORT_DOWNLOAD_ATTEMPTS,
     backoff: { type: 'exponential', delay: 5_000 },
@@ -66,11 +89,16 @@ export async function enqueueRemoteImport(
 export async function removeRemoteImportJob(
   importId: string,
   attempt: number,
+  workload?: RemoteImportWorkload,
 ): Promise<boolean> {
-  const job = await remoteImportQueue.getJob(remoteImportJobId(importId, attempt))
-  if (!job) return false
-  await job.remove()
-  return true
+  const jobId = remoteImportJobId(importId, attempt)
+  for (const queue of queuesForLookup(workload)) {
+    const job = await queue.getJob(jobId)
+    if (!job) continue
+    await job.remove()
+    return true
+  }
+  return false
 }
 
 /**
@@ -80,30 +108,41 @@ export async function removeRemoteImportJob(
 export async function getRemoteImportJob(
   importId: string,
   attempt: number,
+  workload?: RemoteImportWorkload,
 ) {
-  return remoteImportQueue.getJob(remoteImportJobId(importId, attempt))
+  const jobId = remoteImportJobId(importId, attempt)
+  for (const queue of queuesForLookup(workload)) {
+    const job = await queue.getJob(jobId)
+    if (job) return job
+  }
+  return null
 }
 
 /** Load a BullMQ job by its raw stored id (row.jobId). Returns null when gone. */
-export async function getJobById(jobId: string) {
-  return remoteImportQueue.getJob(jobId)
+export async function getJobById(jobId: string, workload?: RemoteImportWorkload) {
+  for (const queue of queuesForLookup(workload)) {
+    const job = await queue.getJob(jobId)
+    if (job) return job
+  }
+  return null
 }
 
 /**
  * Resolve a stored row to its execution job, tolerating legacy rows whose
  * `jobId` was just the import id (pre-fix) instead of `${id}:${attempt}`.
  */
-export async function resolveJobForRow(row: { jobId: string | null; id: string; attempt: number }) {
+export async function resolveJobForRow(row: { jobId: string | null; id: string; attempt: number; sourceType?: string | null }) {
+  const workload = workloadForRemoteImport(row)
   if (row.jobId) {
-    const job = await remoteImportQueue.getJob(row.jobId)
+    const job = await getJobById(row.jobId, workload)
     if (job) return job
   }
-  return remoteImportQueue.getJob(remoteImportJobId(row.id, Math.max(row.attempt, 1)))
+  return getRemoteImportJob(row.id, Math.max(row.attempt, 1), workload)
 }
 
 /** Gracefully close the producer connection (used on API shutdown). */
 export async function closeRemoteImportQueue() {
-  await remoteImportQueue.close()
+  await Promise.all([remoteImportDirectQueue.close(), remoteImportHlsQueue.close()])
 }
 
 /**
@@ -120,8 +159,8 @@ export async function closeRemoteImportQueue() {
  */
 export async function remoteImportQueueHealth(): Promise<{ redis: 'ok' | 'down'; worker: 'ok' | 'unknown' }> {
   try {
-    const workers = await remoteImportQueue.getWorkersCount()
-    return { redis: 'ok', worker: workers > 0 ? 'ok' : 'unknown' }
+    const workers = await Promise.all([remoteImportDirectQueue.getWorkersCount(), remoteImportHlsQueue.getWorkersCount()])
+    return { redis: 'ok', worker: workers.some((count) => count > 0) ? 'ok' : 'unknown' }
   } catch {
     return { redis: 'down', worker: 'unknown' }
   }

@@ -4,8 +4,11 @@
 flowchart TD
   UI[Remote Import UI / Browser Capture] --> Probe[Probe / validate]
   Probe --> Create[Create RemoteImport row]
-  Create --> Queue[BullMQ Redis]
-Queue --> Worker[Remote Import worker]
+Create --> Queue{BullMQ workload queue}
+Queue -->|direct| DirectWorker[Direct-import worker]
+Queue -->|HLS| HlsWorker[HLS-import worker]
+DirectWorker --> Worker[Shared Remote Import state machine]
+HlsWorker --> Worker
 Worker --> Capacity{Temp capacity available?}
 Capacity -->|wait| Queue
 Capacity -->|admitted| Fetch

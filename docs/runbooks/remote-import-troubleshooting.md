@@ -7,6 +7,9 @@ curl http://localhost:4000/health
 ```
 
 Inspect backend and worker logs. Confirm Redis is reachable and the worker process is running.
+The worker process runs two consumers: `remote-imports-direct` and
+`remote-imports-hls`. Check both when imports wait unexpectedly; their limits
+are configured independently, but the per-user limit is shared.
 
 ## 2. Stuck `queued`
 Possible causes:

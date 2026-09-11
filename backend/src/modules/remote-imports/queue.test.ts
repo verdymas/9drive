@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { remoteImportJobId } from './queue.js'
+import { remoteImportDirectQueue, remoteImportHlsQueue, remoteImportJobId, workloadForRemoteImport } from './queue.js'
 
 /**
  * The Remote Import job id scheme (§ queue.ts / remoteImportJobId).
@@ -26,5 +26,18 @@ describe('remoteImportJobId', () => {
   it('produces a distinct id per attempt (retries enqueue fresh jobs)', () => {
     const importId = '645917d6-0592-46d1-ae21-3d039e9f5638'
     expect(remoteImportJobId(importId, 1)).not.toBe(remoteImportJobId(importId, 2))
+  })
+})
+
+describe('workloadForRemoteImport', () => {
+  it('routes HLS records to the HLS budget and ordinary records to the direct budget', () => {
+    expect(workloadForRemoteImport({ sourceType: 'hls_master' })).toBe('hls')
+    expect(workloadForRemoteImport({ sourceType: 'hls_media' })).toBe('hls')
+    expect(workloadForRemoteImport({ sourceType: null })).toBe('direct')
+  })
+
+  it('uses separate queue names so saturated HLS work cannot occupy direct worker slots', () => {
+    expect(remoteImportDirectQueue.name).toBe('remote-imports-direct')
+    expect(remoteImportHlsQueue.name).toBe('remote-imports-hls')
   })
 })

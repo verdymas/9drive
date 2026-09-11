@@ -17,11 +17,11 @@ listed order.
 
 ## Phase 2 — Separate direct and HLS concurrency budgets
 
-- [ ] Classify work early and enforce independent direct/HLS limits.
-- [ ] Preserve one state machine, IDs, status API, and cross-class per-user limit.
-- [ ] Keep retry, cancellation, heartbeat, and reconciliation correct.
-- [ ] Add focused tests and run the relevant Remote Import suite.
-- [ ] Update topology, environment, and worker documentation.
+- [x] Classify work early and enforce independent direct/HLS limits.
+- [x] Preserve one state machine, IDs, status API, and cross-class per-user limit.
+- [x] Keep retry, cancellation, heartbeat, and reconciliation correct.
+- [x] Add focused tests and run the relevant Remote Import suite.
+- [x] Update topology, environment, and worker documentation.
 
 ## Phase 3 — Resumable stream-through direct imports
 
@@ -49,3 +49,4 @@ listed order.
 ## Verification record
 
 - Phase 1 — `cd backend && npm test -- src/modules/remote-imports` → 29 files / 377 tests passed; focused admission/HLS/queue/service verification → 5 files / 69 tests passed; `cd backend && npm run build` → passed (2026-09-11).
+- Phase 2 — `cd backend && npm test -- src/modules/remote-imports/queue.test.ts src/modules/remote-imports/remote-import.service.test.ts src/modules/remote-imports/queue-reconcile.test.ts` → 3 files / 60 tests passed; `cd backend && npm test -- src/modules/remote-imports` → 29 files / 384 tests passed; `cd backend && npm run build` → passed (2026-09-11).

@@ -2,7 +2,7 @@ import '../remote-fetch-workers/index.js'
 import { Worker, type Job } from 'bullmq'
 import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
-import type { RemoteImportJobData } from './queue.js'
+import { type RemoteImportJobData, type RemoteImportWorkload } from './queue.js'
 import { processRemoteImportJob } from './processor.js'
 
 /**
@@ -30,8 +30,13 @@ function releasePerUserSlot(userId: string) {
   else activePerUser.set(userId, current - 1)
 }
 
-export function createRemoteImportWorker(): Worker<RemoteImportJobData> {
-  const worker = new Worker<RemoteImportJobData>('remote-imports', async (job: Job<RemoteImportJobData>) => {
+const queueNameFor = (workload: RemoteImportWorkload) => (workload === 'hls' ? 'remote-imports-hls' : 'remote-imports-direct')
+const concurrencyFor = (workload: RemoteImportWorkload) => (workload === 'hls' ? env.REMOTE_IMPORT_HLS_JOB_CONCURRENCY : env.REMOTE_IMPORT_DIRECT_CONCURRENCY)
+
+/** Build one workload consumer. Both consumers share the same state machine and per-user gate. */
+export function createRemoteImportWorker(workload: RemoteImportWorkload = 'direct'): Worker<RemoteImportJobData> {
+  const queueName = queueNameFor(workload)
+  const worker = new Worker<RemoteImportJobData>(queueName, async (job: Job<RemoteImportJobData>) => {
     const importId = job.data.importId
     const remoteImport = await prisma.remoteImport.findUnique({ where: { id: importId } })
     if (!remoteImport) return
@@ -63,7 +68,7 @@ export function createRemoteImportWorker(): Worker<RemoteImportJobData> {
     }
   }, {
     connection: { url: env.REDIS_URL },
-    concurrency: env.REMOTE_IMPORT_GLOBAL_CONCURRENCY,
+    concurrency: concurrencyFor(workload),
   })
 
   worker.on('failed', (job, err) => {
@@ -88,6 +93,10 @@ export function createRemoteImportWorker(): Worker<RemoteImportJobData> {
   return worker
 }
 
+export function createRemoteImportWorkers(): Worker<RemoteImportJobData>[] {
+  return [createRemoteImportWorker('direct'), createRemoteImportWorker('hls')]
+}
+
 let shutdownHandler: (() => Promise<void>) | null = null
 
 /**
@@ -96,11 +105,12 @@ let shutdownHandler: (() => Promise<void>) | null = null
  * exits (Redis-backed jobs are safe to resume).
  */
 export function startRemoteImportWorker() {
-  const worker = createRemoteImportWorker()
-  console.log(`[remote-import] worker started queue=remote-imports concurrency=${worker.concurrency}`)
+  const workers = createRemoteImportWorkers()
+  console.log(`[remote-import] worker started queue=remote-imports-direct concurrency=${workers[0].concurrency}`)
+  console.log(`[remote-import] worker started queue=remote-imports-hls concurrency=${workers[1].concurrency}`)
   const shutdown = async () => {
     console.log('[remote-import] shutting down worker...')
-    await worker.close()
+    await Promise.all(workers.map((worker) => worker.close()))
     await prisma.$disconnect()
   }
   shutdownHandler = shutdown
@@ -112,5 +122,5 @@ export function startRemoteImportWorker() {
   }
   process.once('SIGINT', signalHandler)
   process.once('SIGTERM', signalHandler)
-  return worker
+  return workers
 }

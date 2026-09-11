@@ -53,6 +53,11 @@ const envSchema = z.object({
   REMOTE_IMPORT_ENABLED: z.coerce.boolean().default(true),
   REMOTE_IMPORT_MAX_BYTES: z.coerce.number().default(5 * 1024 * 1024 * 1024),
   REMOTE_IMPORT_GLOBAL_CONCURRENCY: z.coerce.number().default(4),
+  // When unset, both workload classes retain the legacy global concurrency
+  // default. Set independently to prevent HLS/FFmpeg work from consuming all
+  // direct-download capacity.
+  REMOTE_IMPORT_DIRECT_CONCURRENCY: z.coerce.number().int().min(1).optional(),
+  REMOTE_IMPORT_HLS_JOB_CONCURRENCY: z.coerce.number().int().min(1).optional(),
   REMOTE_IMPORT_PER_USER_CONCURRENCY: z.coerce.number().default(2),
   REMOTE_IMPORT_MAX_REDIRECTS: z.coerce.number().default(5),
   REMOTE_IMPORT_CONNECT_TIMEOUT_SECONDS: z.coerce.number().default(15),
@@ -186,4 +191,10 @@ const envSchema = z.object({
   TELEGRAM_STREAM_SIGNATURE_MAX_SKEW_SECONDS: z.coerce.number().int().min(5).max(300).default(30),
 })
 
-export const env = envSchema.parse(process.env)
+const parsedEnv = envSchema.parse(process.env)
+
+export const env = {
+  ...parsedEnv,
+  REMOTE_IMPORT_DIRECT_CONCURRENCY: parsedEnv.REMOTE_IMPORT_DIRECT_CONCURRENCY ?? parsedEnv.REMOTE_IMPORT_GLOBAL_CONCURRENCY,
+  REMOTE_IMPORT_HLS_JOB_CONCURRENCY: parsedEnv.REMOTE_IMPORT_HLS_JOB_CONCURRENCY ?? parsedEnv.REMOTE_IMPORT_GLOBAL_CONCURRENCY,
+}
