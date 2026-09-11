@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import io
+import json
+from contextlib import redirect_stdout
+
+from app.api import stream as stream_module
+from app.core.errors import AppError
 from tests.conftest import signed_headers
 
 
@@ -91,3 +97,29 @@ def test_zero_size_returns_404(client, secret) -> None:
     r = client.get(path, headers=headers)
     assert r.status_code == 404
     assert r.json()["error"]["code"] == "FILE_NOT_FOUND"
+
+
+def test_resolve_failure_logs_error_code_without_exposing_redacted_code_field(client, secret, monkeypatch) -> None:
+    async def fail_resolve(*, provider_id: str, channel_id: str, message_id: int):
+        raise AppError("TELEGRAM_LAYER_MISMATCH", "Telegram sent an unsupported object.", 502)
+
+    monkeypatch.setattr(stream_module, "resolve_document", fail_resolve)
+    headers = signed_headers(
+        method="GET",
+        path="/v1/stream",
+        provider_id=PROVIDER,
+        channel_id=CHANNEL,
+        message_id=MESSAGE,
+        range_header=None,
+        secret=secret,
+    )
+
+    output = io.StringIO()
+    with redirect_stdout(output):
+        response = client.get(_stream_path(), headers=headers)
+
+    assert response.status_code == 502
+    events = [json.loads(line) for line in output.getvalue().splitlines() if line.strip()]
+    failure = next(event for event in events if event.get("event") == "stream_resolve_failed")
+    assert failure["error_code"] == "TELEGRAM_LAYER_MISMATCH"
+    assert "code" not in failure

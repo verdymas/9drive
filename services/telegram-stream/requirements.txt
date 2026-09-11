@@ -5,10 +5,9 @@ pydantic-settings==2.7.1
 # Telethon, not PyroFork: its StringSession carries the same four fields as the
 # GramJS session 9Drive already stores, so no second login is needed.
 #
-# 1.44.0 (layer 227) is the lowest release that knows `message#7600b9d3`,
-# which the backend's teleproto@1.229.0 negotiated. The auth key is shared,
-# so Telegram serves the newer constructor to both clients. Keep these
-# pins together: if the backend's teleproto is bumped, re-check whether
-# the corresponding Telethon release knows the new `message` constructor.
-telethon==1.44.0
+# 1.45.0 aligns the stream service with the backend's teleproto@1.229.0
+# Telegram protocol layer. The auth key is shared by both clients. Keep these
+# pins together: if the backend's teleproto is bumped, re-check whether the
+# corresponding Telethon release knows the new constructors.
+telethon==1.45.0
 cryptg==0.4.0

@@ -119,11 +119,23 @@ export class TelegramStreamGateway {
     }
 
     res.status(upstream.status)
-    if (upstream.status === 503) {
+    if (upstream.status < 200 || upstream.status >= 300) {
       const body = upstream.body ? await new Response(upstream.body).text() : ''
-      await mirrorReauthRequired(providerId, body)
-      res.setHeader('Content-Type', 'application/json')
-      res.end(body || JSON.stringify({ code: 'STREAM_UNAVAILABLE', message: 'telegram-stream returned 503.' }))
+      if (upstream.status === 503) await mirrorReauthRequired(providerId, body)
+      const upstreamContentType = upstream.headers.get('content-type')
+      res.setHeader(
+        'Content-Type',
+        upstreamContentType && !/^video\//i.test(upstreamContentType)
+          ? upstreamContentType
+          : 'application/json',
+      )
+      res.end(
+        body ||
+          JSON.stringify({
+            code: 'STREAM_UPSTREAM_ERROR',
+            message: `telegram-stream returned ${upstream.status}.`,
+          }),
+      )
       return
     }
     // Byte-range mechanics come from upstream; logical metadata from here.

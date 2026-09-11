@@ -27,6 +27,8 @@ class FakeResponse {
   statusCode = 0
   headers: Record<string, string> = {}
   ended = false
+  endedBody: unknown = undefined
+  writeCount = 0
   destroyed = false
   writableEnded = false
   private _listeners: Record<string, Array<(...args: unknown[]) => void>> = {}
@@ -57,11 +59,13 @@ class FakeResponse {
     for (const fn of this._listeners[event] ?? []) fn(...args)
   }
   write(_chunk: unknown) {
+    this.writeCount += 1
     return true
   }
-  end() {
+  end(body?: unknown) {
     this.ended = true
     this.writableEnded = true
+    this.endedBody = body
   }
   destroy() {
     this.destroyed = true
@@ -206,6 +210,40 @@ describe('telegramStreamGateway.streamFile', () => {
       res as unknown as import('express').Response,
     )
     expect(res.statusCode).toBe(502)
+  })
+
+  it('propagates an upstream 502 JSON error without entering the media pipeline', async () => {
+    const body = JSON.stringify({ error: { code: 'TELEGRAM_LAYER_MISMATCH', message: 'unsupported object' } })
+    fetchMock.mockResolvedValueOnce(
+      makeFetchResponse({
+        status: 502,
+        headers: { 'content-type': 'application/json' },
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(body))
+            controller.close()
+          },
+        }),
+      }),
+    )
+
+    const res = new FakeResponse()
+    await telegramStreamGateway.streamFile(
+      {
+        providerFileId: 'telegram://-1001/42',
+        connectedAccountId: 'acct-1',
+        mimeType: 'video/mp4',
+        sizeBytes: 5,
+      },
+      'bytes=0-4',
+      res as unknown as import('express').Response,
+    )
+
+    expect(res.statusCode).toBe(502)
+    expect(res.headers['content-type']).toBe('application/json')
+    expect(res.headers['content-type']).not.toMatch(/^video\//)
+    expect(res.endedBody).toBe(body)
+    expect(res.writeCount).toBe(0)
   })
 
   it('isTelegramStreamConfigured returns true when both env vars are set', () => {

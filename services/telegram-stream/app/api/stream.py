@@ -172,7 +172,7 @@ async def stream(
             provider_id=providerId, channel_id=channelId, message_id=int(messageId or 0)
         )
     except AppError as exc:
-        emit_error("stream_resolve_failed", request_id=request_id, code=exc.code, status=exc.status)
+        emit_error("stream_resolve_failed", request_id=request_id, error_code=exc.code, status=exc.status)
         raise
     except ValueError as exc:
         raise AppError("INVALID_MESSAGE_ID", "messageId must be an integer.", 400) from exc
