@@ -1,5 +1,5 @@
 import { GetObjectCommand } from '@aws-sdk/client-s3'
-import type { ConnectedAccount, File, Folder } from '@prisma/client'
+import type { ConnectedAccount, File, Prisma } from '@prisma/client'
 import { Readable, type Writable } from 'node:stream'
 import { v2 } from 'webdav-server'
 import { prisma } from '../../config/prisma.js'
@@ -8,6 +8,11 @@ import { getAuthedGoogleClient } from '../google/google.service.js'
 import { createS3Client, getS3ConfigForAccount } from '../s3/s3.service.js'
 import { isTelegramStreamConfigured } from '../telegram/telegram-stream-auth.js'
 import { fetchTelegramStreamAsReadable } from '../telegram/telegram-stream-readable.js'
+import {
+  getDefaultWebDavMetadataCache,
+  SHARED_WEBDAV_NAMESPACE,
+  WebDavMetadataCache,
+} from './webdav-metadata-cache.js'
 
 const { FileSystem, LocalLockManager, LocalPropertyManager, ResourceType } = v2
 
@@ -20,6 +25,37 @@ type Path = v2.Path
 type ResourceTypeInstance = v2.ResourceType
 
 type FileWithAccount = File & { connectedAccount: ConnectedAccount }
+
+/**
+ * WebDAV metadata projections intentionally exclude provider credentials and
+ * unrelated application fields. Provider-account data is loaded separately
+ * only at the stream boundary.
+ */
+export const webDavFolderSelect = {
+  id: true,
+  parentId: true,
+  provider: true,
+  providerFolderId: true,
+  name: true,
+  createdAt: true,
+  updatedAt: true,
+} as const
+
+export const webDavFileSelect = {
+  id: true,
+  folderId: true,
+  connectedAccountId: true,
+  provider: true,
+  providerFileId: true,
+  name: true,
+  mimeType: true,
+  sizeBytes: true,
+  createdAt: true,
+  updatedAt: true,
+} as const
+
+export type WebDavFolder = Prisma.FolderGetPayload<{ select: typeof webDavFolderSelect }>
+export type WebDavFile = Prisma.FileGetPayload<{ select: typeof webDavFileSelect }>
 
 const ROOT_PATH = '/'
 
@@ -71,20 +107,46 @@ function parsePath(path: Path | string): string[] {
  * for every path segment it traverses.
  */
 class VirtualFsCache {
-  private readonly foldersByParent = new Map<string, Promise<Folder[]>>()
-  private readonly foldersById = new Map<string, Promise<Folder | null>>()
-  private readonly filesByFolder = new Map<string, Promise<FileWithAccount[]>>()
+  private readonly foldersByParent = new Map<string, Promise<WebDavFolder[]>>()
+  private readonly foldersById = new Map<string, Promise<WebDavFolder | null>>()
+  private readonly foldersByParentAndName = new Map<string, Promise<WebDavFolder | null>>()
+  private readonly filesByFolder = new Map<string, Promise<WebDavFile[]>>()
   private readonly filesById = new Map<string, Promise<FileWithAccount | null>>()
+  private readonly filesByFolderAndName = new Map<string, Promise<WebDavFile | null>>()
 
-  private async loadFolder(id: string): Promise<Folder | null> {
-    return prisma.folder.findFirst({ where: { id, deletedAt: null } })
+  constructor(
+    private readonly namespace: string,
+    private readonly metadataCache: WebDavMetadataCache,
+  ) {}
+
+  private async loadFolder(id: string): Promise<WebDavFolder | null> {
+    return this.metadataCache.get(
+      { namespace: this.namespace, kind: 'folder-id', id },
+      () => prisma.folder.findFirst({ where: { id, deletedAt: null }, select: webDavFolderSelect }),
+    )
   }
 
   private async loadFile(id: string): Promise<FileWithAccount | null> {
     return prisma.file.findFirst({ where: { id, status: 'active' }, include: { connectedAccount: true } })
   }
 
-  folder(id: string): Promise<Folder | null> {
+  private async loadFolderByName(parentId: string | null, name: string): Promise<WebDavFolder | null> {
+    const parentQuery = parentId === null ? { parentId: null } : { parentId }
+    return this.metadataCache.get(
+      { namespace: this.namespace, kind: 'folder-child', parentId, name },
+      () => prisma.folder.findFirst({ where: { ...parentQuery, deletedAt: null, name }, select: webDavFolderSelect }),
+    )
+  }
+
+  private async loadFileByName(folderId: string | null, name: string): Promise<WebDavFile | null> {
+    const folderQuery = folderId === null ? { folderId: null } : { folderId }
+    return this.metadataCache.get(
+      { namespace: this.namespace, kind: 'file-child', folderId, name },
+      () => prisma.file.findFirst({ where: { ...folderQuery, status: 'active', name }, select: webDavFileSelect }),
+    )
+  }
+
+  folder(id: string): Promise<WebDavFolder | null> {
     if (!this.foldersById.has(id)) this.foldersById.set(id, this.loadFolder(id))
     return this.foldersById.get(id)!
   }
@@ -94,27 +156,51 @@ class VirtualFsCache {
     return this.filesById.get(id)!
   }
 
-  foldersUnder(parentId: string | null): Promise<Folder[]> {
+  childFolder(parentId: string | null, name: string): Promise<WebDavFolder | null> {
+    const key = JSON.stringify([parentId, name])
+    if (!this.foldersByParentAndName.has(key)) this.foldersByParentAndName.set(key, this.loadFolderByName(parentId, name))
+    return this.foldersByParentAndName.get(key)!
+  }
+
+  childFile(folderId: string | null, name: string): Promise<WebDavFile | null> {
+    const key = JSON.stringify([folderId, name])
+    if (!this.filesByFolderAndName.has(key)) this.filesByFolderAndName.set(key, this.loadFileByName(folderId, name))
+    return this.filesByFolderAndName.get(key)!
+  }
+
+  foldersUnder(parentId: string | null): Promise<WebDavFolder[]> {
     const key = parentId ?? '\0'
     if (!this.foldersByParent.has(key)) {
       const query = parentId === null ? { parentId: null } : { parentId }
-      this.foldersByParent.set(key, prisma.folder.findMany({ where: { ...query, deletedAt: null } }))
+      this.foldersByParent.set(
+        key,
+        this.metadataCache.get(
+          { namespace: this.namespace, kind: 'folder-list', parentId },
+          () => prisma.folder.findMany({ where: { ...query, deletedAt: null }, select: webDavFolderSelect }),
+        ),
+      )
     }
     return this.foldersByParent.get(key)!
   }
 
-  filesUnder(folderId: string | null): Promise<FileWithAccount[]> {
+  filesUnder(folderId: string | null): Promise<WebDavFile[]> {
     const key = folderId ?? '\0'
     if (!this.filesByFolder.has(key)) {
       const query = folderId === null ? { folderId: null } : { folderId }
-      this.filesByFolder.set(key, prisma.file.findMany({ where: { ...query, status: 'active' }, include: { connectedAccount: true } }))
+      this.filesByFolder.set(
+        key,
+        this.metadataCache.get(
+          { namespace: this.namespace, kind: 'file-list', folderId },
+          () => prisma.file.findMany({ where: { ...query, status: 'active' }, select: webDavFileSelect }),
+        ),
+      )
     }
     return this.filesByFolder.get(key)!
   }
 
   /** Clear all cached entries (called at the start of every request). */
   reset(): void {
-    for (const map of [this.foldersByParent, this.foldersById, this.filesByFolder, this.filesById]) {
+    for (const map of [this.foldersByParent, this.foldersById, this.foldersByParentAndName, this.filesByFolder, this.filesById, this.filesByFolderAndName]) {
       map.clear()
     }
   }
@@ -122,10 +208,14 @@ class VirtualFsCache {
 
 export class VirtualFileSystem extends FileSystem {
   /** Request-scoped caches. Cleared at the start of every request. */
-  private readonly cache = new VirtualFsCache()
+  private readonly cache: VirtualFsCache
 
-  constructor() {
+  constructor(options: { namespace?: string; metadataCache?: WebDavMetadataCache } = {}) {
     super(noopSerializer)
+    this.cache = new VirtualFsCache(
+      options.namespace ?? SHARED_WEBDAV_NAMESPACE,
+      options.metadataCache ?? getDefaultWebDavMetadataCache(),
+    )
   }
 
   /** Clear per-request caches. Called from the routes layer at the start of every request. */
@@ -150,8 +240,7 @@ export class VirtualFileSystem extends FileSystem {
     let parentId: string | null = null
     for (let i = 0; i < segments.length - 1; ++i) {
       const segment = segments[i]
-      const folders = await this.cache.foldersUnder(parentId)
-      const folder = folders.find((candidate) => candidate.name === segment)
+      const folder = await this.cache.childFolder(parentId, segment)
       if (!folder) return null
       parentId = folder.id
     }
@@ -159,8 +248,7 @@ export class VirtualFileSystem extends FileSystem {
     const last = segments[segments.length - 1]
 
     // The last segment may be a child folder of the resolved parent...
-    const folders = await this.cache.foldersUnder(parentId)
-    const childFolder = folders.find((candidate) => candidate.name === last)
+    const childFolder = await this.cache.childFolder(parentId, last)
     if (childFolder) {
       return {
         id: childFolder.id,
@@ -173,8 +261,7 @@ export class VirtualFileSystem extends FileSystem {
     }
 
     // ...or a file inside the resolved parent.
-    const files = await this.cache.filesUnder(parentId)
-    const file = files.find((candidate) => candidate.name === last)
+    const file = await this.cache.childFile(parentId, last)
     if (file) {
       return {
         id: file.id,
@@ -198,12 +285,12 @@ export class VirtualFileSystem extends FileSystem {
   }
 
   /** Child folders of a folder id (null = top-level folders). */
-  async listFoldersUnder(parentId: string | null): Promise<Folder[]> {
+  async listFoldersUnder(parentId: string | null): Promise<WebDavFolder[]> {
     return this.cache.foldersUnder(parentId)
   }
 
   /** Child files of a folder id. */
-  async listFilesUnder(folderId: string | null): Promise<FileWithAccount[]> {
+  async listFilesUnder(folderId: string | null): Promise<WebDavFile[]> {
     return this.cache.filesUnder(folderId)
   }
 

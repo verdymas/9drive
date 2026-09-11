@@ -59,11 +59,17 @@ vi.mock('../../config/prisma.js', () => ({
   prisma: {
     folder: {
       findMany: vi.fn(async ({ where }: any) => folders.filter((f) => f.parentId === (where.parentId ?? null))),
-      findFirst: vi.fn(async ({ where }: any) => folders.find((f) => f.id === where.id) ?? null),
+      findFirst: vi.fn(async ({ where }: any) => {
+        if (where.id) return folders.find((f) => f.id === where.id) ?? null
+        return folders.find((f) => f.parentId === (where.parentId ?? null) && f.deletedAt === where.deletedAt && f.name === where.name) ?? null
+      }),
     },
     file: {
       findMany: vi.fn(async ({ where }: any) => files.filter((f) => f.folderId === (where.folderId ?? null))),
-      findFirst: vi.fn(async ({ where }: any) => files.find((f) => f.id === where.id) ?? null),
+      findFirst: vi.fn(async ({ where }: any) => {
+        if (where.id) return files.find((f) => f.id === where.id) ?? null
+        return files.find((f) => f.folderId === (where.folderId ?? null) && f.status === where.status && f.name === where.name) ?? null
+      }),
     },
   },
 }))

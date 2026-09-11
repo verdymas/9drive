@@ -23,6 +23,16 @@ A logical file with one physical `connectedAccountId + providerFileId`. A file s
 - When uploading to an account without a physical destination folder, use the folder materialization service.
 - Renaming or moving a Telegram file must refresh its caption so `9drive:path` matches the logical path.
 
+## WebDAV Metadata Reads
+
+The read-only WebDAV adapter resolves each path segment with an exact indexed
+child query. PROPFIND uses separate folder/file list queries with minimal
+metadata projections, while provider-account rows are loaded only for an
+actual stream. Its optional process-local cache is namespace-keyed, bounded,
+and short-lived; it does not cache credentials or file bodies. The current
+shared-password WebDAV contract intentionally uses the instance-wide shared
+namespace and is documented for trusted/single-tenant deployments.
+
 ## Read/Stream
 `streamProviderFile()` is the primary abstraction for provider-neutral streaming to preview, download, and WebDAV. Google has special export/range handling; S3 and Telegram each provide their own implementation.
 

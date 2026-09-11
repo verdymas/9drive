@@ -92,6 +92,11 @@ Source of truth: `backend/prisma/schema.prisma` (MySQL).
 
 **Relations:** `user: User`, `connectedAccount: ConnectedAccount`, `folder: Folder?`, `shares: FileShare[]`, `previewTokens: FilePreviewToken[]`, `remoteImport: RemoteImport?`.
 
+WebDAV exact child resolution uses the composite index
+`files_folder_status_name_idx` on `(folder_id, status, name)`. The index
+matches the existing shared-password WebDAV predicates; normal REST file
+queries continue to use their user-prefixed indexes.
+
 ### `RemoteImport`
 
 **Fields:** `id: String`, `userId: String`, `folderId: String?`, `connectedAccountId: String?`, `workerId: String?`, `workerNameSnapshot: String?`, `fileId: String?`, `sourceUrlEncrypted: String`, `requestContextEncrypted: String?`, `displayUrl: String`, `finalUrlEncrypted: String?`, `fileName: String`, `sourceFileName: String?`, `mimeType: String?`, `status: String`, `stage: String`, `totalBytes: BigInt?`, `downloadedBytes: BigInt`, `uploadedBytes: BigInt`, `uploadTotalBytes: BigInt?`, `sourceETag: String?`, `sourceLastModified: DateTime?`, `sourceRangeSupported: Boolean`, `sourceType: String?`, `hlsPlaylistType: String?`, `hlsVariantId: String?`, `hlsVariantBandwidth: Int?`, `hlsVariantWidth: Int?`, `hlsVariantHeight: Int?`, `hlsAudioTrackId: String?`, `hlsAudioTrackLanguage: String?`, `hlsOutputContainer: String?`, `hlsIsLive: Boolean?`, `hlsRecordingDurationSeconds: Int?`, `hlsMediaDurationSeconds: Float?`, `hlsSegmentCount: Int?`, `hlsCompletedSegmentCount: Int?`, `remuxProgress: Float?`, `outputDurationSeconds: Float?`, `outputCodecSummary: String?`, `tempPath: String?`, `resumeSessionEncrypted: String?`, `jobId: String?`, `attempt: Int`, `queuedAt: DateTime?`, `retryRequestedAt: DateTime?`, `heartbeatAt: DateTime?`, `retryFromStage: String?`, `errorCode: String?`, `errorMessage: String?`, `internalError: String?`, `startedAt: DateTime?`, `completedAt: DateTime?`, `failedAt: DateTime?`, `cancelledAt: DateTime?`, `createdAt: DateTime`, `updatedAt: DateTime`.
@@ -115,6 +120,9 @@ Source of truth: `backend/prisma/schema.prisma` (MySQL).
 **Fields:** `id: String`, `userId: String`, `parentId: String?`, `connectedAccountId: String?`, `provider: String`, `providerFolderId: String?`, `name: String`, `normalizedName: String?`, `origin: String`, `color: String`, `iconUrl: String?`, `createdAt: DateTime`, `updatedAt: DateTime`, `deletedAt: DateTime?`.
 
 **Relations:** `user: User`, `parent: Folder?`, `children: Folder[]`, `connectedAccount: ConnectedAccount?`, `storageLocations: FolderStorageLocation[]`, `files: File[]`, `uploadSessions: UploadSession[]`, `remoteImports: RemoteImport[]`.
+
+WebDAV exact child resolution uses the composite index
+`folders_parent_deleted_name_idx` on `(parent_id, deleted_at, name)`.
 
 ### `FolderStorageLocation`
 

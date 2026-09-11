@@ -52,6 +52,11 @@ Sources of truth: `backend/src/config/env.ts`, `docker-compose.yml`, and fronten
 
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` are used by setup/seed/compose; runtime also supports database-backed configuration.
 - `WEBDAV_PASSWORD`
+- `WEBDAV_METADATA_CACHE_TTL_MS` — cross-request WebDAV metadata cache
+  lifetime; default `1000` ms, allowed range `0`–`60000`. `0` disables the
+  cache and leaves metadata correctness on the direct query path.
+- `WEBDAV_METADATA_CACHE_MAX_ENTRIES` — process-local metadata cache bound;
+  default `1024`, allowed range `0`–`10000`. `0` disables the cache.
 - `SMB_ENABLED`
 - `SMB_CONFIG_PATH`
 - `SMB_ALLOWED_ROOT`

@@ -15,6 +15,19 @@ Backend mount: `/webdav`.
 - Provider streams preserve range/status metadata and are torn down when the
   WebDAV client disconnects, preventing abandoned playback seeks from holding
   upstream work open.
+- Path resolution uses exact folder/file predicates (`parentId`/`folderId`,
+  active/deleted state, and display name) instead of loading all siblings and
+  scanning them in JavaScript. Directory enumeration remains a separate
+  metadata-only projection path for PROPFIND.
+- WebDAV metadata lookups use a bounded process-local TTL cache by default.
+  `WEBDAV_METADATA_CACHE_TTL_MS=0` disables it; the default 1-second TTL is
+  the maximum documented stale window for rename/move/delete visibility. The
+  cache stores metadata only, never provider bytes or decrypted credentials.
+- Cache diagnostics use structured `[webdav-metadata]` lookup logs with
+  hit/miss/bypass/error outcomes and lookup duration. Cache keys include the
+  WebDAV namespace and immutable row/parent identities. The current shared
+  password endpoint intentionally uses one shared namespace because its
+  existing contract exposes the instance-wide tree to trusted deployments.
 - In the optional split deployment, `/webdav` is one of the prefixes the media
   plane serves (the same mounted router, unchanged semantics and path); it
   keeps working inside the default all-in-one process either way. See

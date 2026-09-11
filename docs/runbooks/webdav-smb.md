@@ -19,6 +19,13 @@ If listing works but playback fails:
 3. Check provider-specific streaming (`stream-file.ts`, Telegram open-document, Google range/export).
 4. Check WebDAV authentication and ensure the reverse proxy does not strip the `Range` header.
 
+For metadata latency or stale listings, inspect structured `[webdav-metadata]`
+logs. They report lookup kind, hit/miss/bypass/error outcome, duration, and
+current entry count without logging paths or credentials. The default cache
+TTL is 1 second, so a rename, move, or delete becomes visible after at most
+that window; set `WEBDAV_METADATA_CACHE_TTL_MS=0` to diagnose the uncached
+query path.
+
 ## SMB
 SMB requires Samba to be available in the relevant host/container environment. Check `/smb/status`, the configuration path/allowed root, then use `/smb/reload` after changing shares or users.
 

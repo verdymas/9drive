@@ -824,6 +824,10 @@ rclone ls 9drive:/
 
 - The WebDAV interface is **read-only**: write methods (PUT, MKCOL, DELETE, MOVE, COPY, PROPPATCH) are rejected.
 - With a single shared password, the WebDAV tree shows files/folders from **all users** of the 9Drive instance. Use this feature only for **single-tenant / trusted deployments**, or put the endpoint behind a VPN/reverse-proxy with access control.
+- WebDAV metadata path lookups use exact indexed database predicates and a
+  bounded metadata-only cache. The cache defaults to a 1-second TTL and 1024
+  entries; set `WEBDAV_METADATA_CACHE_TTL_MS=0` to disable it. It never caches
+  provider bytes or decrypted credentials.
 - Prefer `https` in production; credentials are sent with Basic auth (base64, not encrypted).
 
 ## SMB Share Management

@@ -344,6 +344,10 @@ model File {
   // account legitimately holds many `'pending'` rows. See
   // docs/application/workflows/provider-sync.md.
   @@index([userId, connectedAccountId, providerFileId])
+  // WebDAV exact child lookup: { folderId, status, name }.
+  // WebDAV intentionally uses the instance-wide shared-password namespace;
+  // user-scoped REST queries keep their existing user-prefixed indexes.
+  @@index([folderId, status, name], map: "files_folder_status_name_idx")
   @@map("files")
 }
 
@@ -510,6 +514,8 @@ model Folder {
   @@index([userId, deletedAt, updatedAt])
   @@index([userId, deletedAt, parentId, updatedAt])
   @@index([parentId])
+  // WebDAV exact child lookup: { parentId, deletedAt, name }.
+  @@index([parentId, deletedAt, name], map: "folders_parent_deleted_name_idx")
   @@index([connectedAccountId])
   @@map("folders")
 }

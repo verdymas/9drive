@@ -195,18 +195,12 @@ function headHandler(): HTTPMethod {
             ctx.exit()
             return
           }
-          const file = await fs.getFileForStreaming(node.id)
-          if (!file) {
-            ctx.setCodeFromError(v2.Errors.ResourceNotFound)
-            ctx.exit()
-            return
-          }
-          const size = Number(file.sizeBytes ?? 0n)
-          ctx.response.setHeader('Content-Type', file.mimeType ?? 'application/octet-stream')
+          const size = Number(node.sizeBytes ?? 0n)
+          ctx.response.setHeader('Content-Type', node.mimeType ?? 'application/octet-stream')
           ctx.response.setHeader('Accept-Ranges', 'bytes')
           if (size > 0) ctx.response.setHeader('Content-Length', String(size))
-          ctx.response.setHeader('ETag', `"${file.id}:${file.updatedAt.getTime()}"`)
-          ctx.response.setHeader('Last-Modified', file.updatedAt.toUTCString())
+          ctx.response.setHeader('ETag', `"${node.id}:${node.updatedAt.getTime()}"`)
+          ctx.response.setHeader('Last-Modified', node.updatedAt.toUTCString())
           ctx.setCode(v2.HTTPCodes.OK)
           callback()
         })

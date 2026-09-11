@@ -49,6 +49,10 @@ const envSchema = z.object({
   SMB_ENABLED: z.coerce.boolean().default(false),
   SMB_CONFIG_PATH: z.string().optional(),
   SMB_ALLOWED_ROOT: z.string().optional(),
+  // WebDAV metadata cache. TTL 0 disables cross-request metadata caching;
+  // provider byte streams and decrypted credentials are never cached.
+  WEBDAV_METADATA_CACHE_TTL_MS: z.coerce.number().int().min(0).max(60_000).default(1_000),
+  WEBDAV_METADATA_CACHE_MAX_ENTRIES: z.coerce.number().int().min(0).max(10_000).default(1_024),
   // Remote import (URL → storage) feature.
   REMOTE_IMPORT_ENABLED: z.coerce.boolean().default(true),
   REMOTE_IMPORT_MAX_BYTES: z.coerce.number().default(5 * 1024 * 1024 * 1024),
