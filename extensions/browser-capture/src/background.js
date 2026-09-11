@@ -164,6 +164,7 @@ chrome.webRequest.onHeadersReceived.addListener(
         finalUrl,
         type: cls.type,
         quality,
+        mimeType: mimeHeader,
       })
     } else {
       result = resolveFilename({
@@ -174,6 +175,7 @@ chrome.webRequest.onHeadersReceived.addListener(
         pageMetadata,
         type: cls.type,
         quality,
+        mimeType: mimeHeader,
       })
     }
     if (mediaIdentity) {
@@ -290,6 +292,7 @@ async function recheckPendingCaptures(pageUrl, identityPayload = null) {
         finalUrl: row.finalUrl ?? row.url,
         type: row.type,
         quality: row.quality ?? extractQuality(filenameFromUrl(row.url)),
+        mimeType: row.mime ?? null,
       })
       if (row.id) void logIdentityDebug(result, row, identity)
     } else {
@@ -301,6 +304,7 @@ async function recheckPendingCaptures(pageUrl, identityPayload = null) {
         pageMetadata: mergedMeta,
         type: row.type,
         quality: mergedMeta.quality ?? extractQuality(filenameFromUrl(row.url)),
+        mimeType: row.mime ?? null,
       })
     }
     if (result.filename === row.filename) {

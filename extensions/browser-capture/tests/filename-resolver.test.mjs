@@ -7,6 +7,7 @@ import {
   parseContentDispositionFilename,
   sanitizeFilename,
   isGenericName,
+  isOpaqueFilename,
   filenameFromUrl,
   resolveFilename,
   removeSiteSuffix,
@@ -83,6 +84,19 @@ testGeneric('lecture-notes.mp4', 'lecture-notes.mp4', false)
 testGeneric('Big Buck Bunny 1080p.mp4', 'Big Buck Bunny 1080p.mp4', false)
 testGeneric('null', null, false)
 testGeneric('empty string', '', false)
+
+// Opaque transport/object names are only classified when the stem strongly
+// resembles an object id/hash or the generic transport extension is paired
+// with a media resource. Normal numeric titles remain meaningful.
+assert.equal(isOpaqueFilename('55234234e.vid', { type: 'video', mimeType: 'video/mp4' }), true)
+assert.equal(isOpaqueFilename('55234234e.vid'), true)
+assert.equal(isOpaqueFilename('8b2c23f4a776e201.bin', { type: 'video', mimeType: 'video/mp4' }), true)
+assert.equal(isOpaqueFilename('550e8400-e29b-41d4-a716-446655440000.mp4', { type: 'video', mimeType: 'video/mp4' }), true)
+assert.equal(isOpaqueFilename('9273518273.dat', { type: 'video', mimeType: 'video/mp4' }), true)
+assert.equal(isOpaqueFilename('matrix1999.mp4', { type: 'video', mimeType: 'video/mp4' }), false)
+assert.equal(isOpaqueFilename('episode12.mp4', { type: 'video', mimeType: 'video/mp4' }), false)
+assert.equal(isOpaqueFilename('video2026.mp4', { type: 'video', mimeType: 'video/mp4' }), false)
+pass += 7
 
 // ── filenameFromUrl ─────────────────────────────────────────────────────────
 
@@ -162,6 +176,20 @@ testResolve('media title beats og:title',
   { requestUrl: 'https://cdn.com/master.m3u8', finalUrl: 'https://cdn.com/master.m3u8', type: 'hls', quality: '1080p',
     pageMetadata: { title: 'Page Title', ogTitle: 'OG Movie', mediaTitle: 'Media Movie' } },
   'Media Movie 1080p.mkv', SOURCES.MEDIA_TITLE)
+
+testResolve('opaque .vid URL yields the semantic media title with MIME extension',
+  { requestUrl: 'https://cdn.example.com/55234234e.vid', finalUrl: 'https://cdn.example.com/55234234e.vid', type: 'video', mimeType: 'video/mp4',
+    pageMetadata: { mediaTitle: 'video bagus' } },
+  'video bagus.mp4', SOURCES.MEDIA_TITLE)
+
+testResolve('opaque hash URL does not beat the semantic media title',
+  { requestUrl: 'https://cdn.example.com/f2a7d913843b.mp4', finalUrl: 'https://cdn.example.com/f2a7d913843b.mp4', type: 'video', mimeType: 'video/mp4',
+    pageMetadata: { mediaTitle: 'Video Bagus' } },
+  'Video Bagus.mp4', SOURCES.MEDIA_TITLE)
+
+testResolve('meaningful URL basename remains a valid fallback',
+  { requestUrl: 'https://example.com/media/video-bagus.mp4', finalUrl: 'https://example.com/media/video-bagus.mp4', type: 'video', mimeType: 'video/mp4' },
+  'video-bagus.mp4', SOURCES.FINAL_URL)
 
 // HLS non-generic name: extension swapped to .mkv, quality appended
 // (finalUrl === requestUrl here, but FINAL_URL scores higher)

@@ -106,6 +106,32 @@ export function isGenericName(name) {
   return GENERIC_NAMES.has(stem)
 }
 
+const OPAQUE_TRANSPORT_EXT_RE = /\.(?:vid|bin|dat|tmp)$/i
+const UUID_STEM_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const LONG_NUMERIC_STEM_RE = /^\d{8,}$/
+const HEX_STEM_RE = /^[0-9a-f]+$/i
+const OBJECT_STEM_RE = /^[a-z0-9_-]{6,}$/i
+
+/**
+ * True for conservative CDN/object transport names, not merely names that
+ * contain digits. Generic transport extensions count only with an
+ * object-shaped stem, so ordinary numeric media titles remain meaningful.
+ */
+export function isOpaqueFilename(name, _context = {}) {
+  if (!name) return false
+  const base = String(name).replace(/^.*[\\/]/, '').trim()
+  const match = /^(.*)\.([^.]+)$/.exec(base)
+  const stem = (match ? match[1] : base).trim()
+  const ext = match ? match[2].toLowerCase() : ''
+  if (!stem) return false
+
+  if (UUID_STEM_RE.test(stem)) return true
+  if (LONG_NUMERIC_STEM_RE.test(stem)) return true
+  if (HEX_STEM_RE.test(stem) && stem.length >= 12) return true
+  if (OPAQUE_TRANSPORT_EXT_RE.test(`.${ext}`) && OBJECT_STEM_RE.test(stem) && /\d/.test(stem)) return true
+  return false
+}
+
 // ── Content-Disposition parsing (RFC 5987 + 6266) ──────────────────────────
 // Ported from backend/src/modules/remote-imports/content-disposition-parser.ts
 
@@ -334,6 +360,44 @@ export const HLS_OUTPUT_EXTENSION = 'mkv'
 
 const MANIFEST_EXT_RE = /\.(m3u8?|mpd)$/i
 
+const MIME_EXTENSIONS = {
+  'video/mp4': 'mp4',
+  'video/x-matroska': 'mkv',
+  'video/webm': 'webm',
+  'video/quicktime': 'mov',
+  'video/mp2t': 'ts',
+  'video/mpeg': 'mpg',
+  'audio/mpeg': 'mp3',
+  'audio/mp4': 'm4a',
+  'audio/x-m4a': 'm4a',
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/flac': 'flac',
+  'audio/x-flac': 'flac',
+  'audio/ogg': 'ogg',
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'application/pdf': 'pdf',
+}
+
+const GENERIC_TRANSPORT_EXT_RE = /\.(?:vid|bin|dat|tmp)$/i
+
+function extensionFromMime(mimeType) {
+  if (!mimeType) return null
+  const base = String(mimeType).split(';', 1)[0].trim().toLowerCase()
+  return MIME_EXTENSIONS[base] ?? null
+}
+
+function normalizeExtensionFromMime(name, mimeType) {
+  const ext = extensionFromMime(mimeType)
+  if (!ext) return name
+  if (GENERIC_TRANSPORT_EXT_RE.test(name)) return name.replace(GENERIC_TRANSPORT_EXT_RE, `.${ext}`)
+  if (/\.[^./\\]+$/.test(name)) return name
+  return `${name}.${ext}`
+}
+
 /**
  * Convert a candidate to the HLS/DASH output container name: drop the
  * playlist suffix (`.m3u8`/`.mpd`) and any OTHER media extension (e.g. a
@@ -378,14 +442,21 @@ const TITLE_SOURCES = new Set([
  * (HLS container swap, sanitize). Used by both the legacy and the new
  * identity-driven entry points.
  */
-function scoreAndFinalize(candidates, { type, quality }) {
+function scoreAndFinalize(candidates, { type, quality, mimeType }) {
   // Penalize generic/technical names (master.m3u8, 1080.mp4, ...) — they must
   // never dominate a better metadata- or header-derived name.
-  const scored = candidates.map((c) =>
-    isGenericName(c.value) && c.source !== SOURCES.CUSTOM_FILENAME
-      ? FilenameCandidate(c.value, c.source, Math.min(c.score, SOURCE_SCORES[SOURCES.GENERIC_PLAYLIST]))
-      : c,
-  )
+  const urlSources = new Set([SOURCES.FINAL_URL, SOURCES.REQUEST_URL, SOURCES.URL_BASENAME_NON_GENERIC])
+  const scored = candidates.map((c) => {
+    let score = c.score
+    if (c.source !== SOURCES.CUSTOM_FILENAME && urlSources.has(c.source)
+      && isOpaqueFilename(c.value, { type, mimeType })) {
+      score = Math.min(score, SOURCE_SCORES[SOURCES.GENERIC_PLAYLIST])
+    }
+    if (c.source !== SOURCES.CUSTOM_FILENAME && isGenericName(c.value)) {
+      score = Math.min(score, SOURCE_SCORES[SOURCES.GENERIC_PLAYLIST])
+    }
+    return score === c.score ? c : FilenameCandidate(c.value, c.source, score)
+  })
 
   // Sort by score descending (stable: first-collected wins ties).
   scored.sort((a, b) => b.score - a.score)
@@ -406,6 +477,7 @@ function scoreAndFinalize(candidates, { type, quality }) {
     }
   }
 
+  if (!isHlsLike(type)) filename = normalizeExtensionFromMime(filename, mimeType)
   const safe = sanitizeFilename(filename)
 
   // Safe dev-only diagnostics (never URLs, cookies, tokens, or secrets).
@@ -426,9 +498,10 @@ function scoreAndFinalize(candidates, { type, quality }) {
  * @param {object|null} opts.pageMetadata  { title, ogTitle, twitterTitle, mediaTitle, ogVideoTitle, itempropName, thumbnail, duration, resolution, quality }
  * @param {string} opts.type  'hls' | 'dash' | 'video' | 'document' | ...
  * @param {string|null} opts.quality  extracted quality label (e.g. '1080p')
+ * @param {string|null} opts.mimeType  response Content-Type for extension normalization
  * @returns {{ filename: string, source: string, candidates: Array }}
  */
-export function resolveFilename({ customFilename, contentDisposition, downloadAttr, requestUrl, finalUrl, pageMetadata, type, quality }) {
+export function resolveFilename({ customFilename, contentDisposition, downloadAttr, requestUrl, finalUrl, pageMetadata, type, quality, mimeType }) {
   const candidates = []
 
   // 1. Explicit user override — absolute priority.
@@ -464,7 +537,7 @@ export function resolveFilename({ customFilename, contentDisposition, downloadAt
     candidates.push(FilenameCandidate('captured-file', SOURCES.FALLBACK, SOURCE_SCORES[SOURCES.FALLBACK]))
   }
 
-  return scoreAndFinalize(candidates, { type, quality })
+  return scoreAndFinalize(candidates, { type, quality, mimeType })
 }
 
 /**
@@ -511,6 +584,7 @@ function extendedPageMetadataCandidates(metadata) {
  * @param {string|null} [opts.finalUrl]
  * @param {string}      [opts.type]   — resource type
  * @param {string|null} [opts.quality]
+ * @param {string|null} [opts.mimeType]
  * @returns {{ filename: string, source: string, confidence: number, candidates: Array }}
  */
 export function resolveFromMediaIdentity(identity, opts = {}) {
@@ -567,7 +641,7 @@ export function resolveFromMediaIdentity(identity, opts = {}) {
     candidates.push(FilenameCandidate('captured-file', SOURCES.FALLBACK, SOURCE_SCORES[SOURCES.FALLBACK]))
   }
 
-  const result = scoreAndFinalize(candidates, { type, quality })
+  const result = scoreAndFinalize(candidates, { type, quality, mimeType: opts.mimeType })
   return {
     ...result,
     confidence: identity?.identity?.selectedConfidence ?? 0,

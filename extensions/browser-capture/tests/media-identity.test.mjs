@@ -283,6 +283,21 @@ assert.equal(playerSpec.filename, 'Movie Name.mkv', 'Player metadata spec')
 assert.equal(playerSpec.source, IDENTITY_SOURCES.PLAYER_CONFIG_TITLE, 'Player metadata spec source')
 ok('spec: player metadata → "Movie Name.mkv"')
 
+// Direct media — an opaque hash basename must not beat player metadata, and
+// the known response MIME supplies the final extension.
+const opaqueDirect = resolveFromMediaIdentity(
+  extractMediaIdentity({
+    playerConfigs: [{ source: 'videoData', title: 'Video Bagus' }],
+    finalUrl: 'https://cdn.com/f2a7d913843b.mp4',
+    requestUrl: 'https://cdn.com/f2a7d913843b.mp4',
+    type: 'video',
+  }),
+  { type: 'video', mimeType: 'video/mp4' },
+)
+assert.equal(opaqueDirect.filename, 'Video Bagus.mp4', 'opaque direct media filename')
+assert.equal(opaqueDirect.source, IDENTITY_SOURCES.PLAYER_CONFIG_TITLE, 'opaque direct media source')
+ok('spec: opaque direct media → player title + MIME extension')
+
 // User override — customFilename = "My Movie.mkv" → "My Movie.mkv"
 const overrideSpec = resolveFromMediaIdentity(
   extractMediaIdentity({

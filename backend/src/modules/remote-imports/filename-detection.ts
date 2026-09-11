@@ -26,7 +26,7 @@
  * by this name.
  */
 import { parseContentDispositionFileName } from './content-disposition-parser.js'
-import { appendExtension, appendExtensionFromMime, extensionFromMime, sanitizeFileName } from './filename-sanitize.js'
+import { appendExtension, extensionFromMime, isOpaqueFileName, normalizeExtensionFromMime, sanitizeFileName } from './filename-sanitize.js'
 
 export type FileNameSource =
   | 'content-disposition-filename-star'
@@ -97,7 +97,7 @@ export function detectFileName(opts: {
         // A CD name WITHOUT an extension (bare `filename="movie"`) gets one
         // from the KNOWN response Content-Type; an explicit extension is never
         // overwritten.
-        const fileName = appendExtensionFromMime(sanitized, opts.mimeType)
+        const fileName = normalizeExtensionFromMime(sanitized, opts.mimeType)
         const isStar = /filename\*=/i.test(opts.contentDisposition)
         return {
           fileName,
@@ -111,16 +111,49 @@ export function detectFileName(opts: {
   if (finalSegment) {
     // A URL path contributes no extension when the server sends none — give it
     // one from a KNOWN response Content-Type (never guessed, never overwritten).
-    const fileName = appendExtensionFromMime(sanitizeFileName(finalSegment), opts.mimeType)
+    const fileName = normalizeExtensionFromMime(sanitizeFileName(finalSegment), opts.mimeType)
     return { fileName, fileNameSource: 'final-url-path' }
   }
 
   const originalSegment = lastUsablePathSegment(opts.originalUrl)
   if (originalSegment) {
-    const fileName = appendExtensionFromMime(sanitizeFileName(originalSegment), opts.mimeType)
+    const fileName = normalizeExtensionFromMime(sanitizeFileName(originalSegment), opts.mimeType)
     return { fileName, fileNameSource: 'original-url-path' }
   }
 
-  const fallback = generatedFallback(opts.fallbackShortId, opts.extension ?? extensionFromMime(opts.mimeType))
+  const fallback = generatedFallback(opts.fallbackShortId, extensionFromMime(opts.mimeType) ?? opts.extension)
   return { fileName: sanitizeFileName(fallback), fileNameSource: 'generated-fallback' }
+}
+
+/**
+ * Resolve the suggested name carried by a Browser Capture row. The capture
+ * filename is a suggestion, not a user override: semantic capture metadata
+ * and a probed Content-Disposition name can replace an opaque URL/object id.
+ */
+export function resolveCapturedFileName(opts: {
+  suggestedFileName?: string | null
+  mediaIdentityTitle?: string | null
+  pageTitle?: string | null
+  probed?: (DetectedFileName & { mimeType?: string | null }) | null
+  mimeType?: string | null
+  resourceType?: string | null
+}): string {
+  const effectiveMimeType = opts.mimeType ?? opts.probed?.mimeType ?? null
+  const normalize = (value: string) => normalizeExtensionFromMime(sanitizeFileName(value), effectiveMimeType)
+  const mediaIdentityTitle = typeof opts.mediaIdentityTitle === 'string' ? opts.mediaIdentityTitle.trim() : ''
+  const pageTitle = typeof opts.pageTitle === 'string' ? opts.pageTitle.trim() : ''
+  const semantic = mediaIdentityTitle && !isOpaqueFileName(mediaIdentityTitle, opts) ? mediaIdentityTitle : ''
+  const suggested = typeof opts.suggestedFileName === 'string' ? opts.suggestedFileName.trim() : ''
+  const probed = opts.probed?.fileName?.trim() ?? ''
+  const probedIsHeader = opts.probed?.fileNameSource === 'content-disposition-filename'
+    || opts.probed?.fileNameSource === 'content-disposition-filename-star'
+
+  if (probedIsHeader && probed) return normalize(probed)
+  if (semantic) return normalize(semantic)
+  if (suggested && !isOpaqueFileName(suggested, opts)) return normalize(suggested)
+  if (probed && !isOpaqueFileName(probed, opts)) return normalize(probed)
+  if (pageTitle && !isOpaqueFileName(pageTitle, opts)) return normalize(pageTitle)
+  if (suggested) return normalize(suggested)
+  if (probed) return normalize(probed)
+  return normalize('captured-file')
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { appendExtensionFromMime, extensionFromMime, nameHasExtension, sanitizeFileName } from './filename-sanitize.js'
+import { appendExtensionFromMime, extensionFromMime, isOpaqueFileName, nameHasExtension, normalizeExtensionFromMime, sanitizeFileName } from './filename-sanitize.js'
 
 describe('sanitizeFileName', () => {
   it('passes through a clean name', () => {
@@ -111,5 +111,23 @@ describe('extensionFromMime / appendExtensionFromMime', () => {
     expect(appendExtensionFromMime('movie.mp4', 'video/mp4')).toBe('movie.mp4')
     expect(appendExtensionFromMime('clip', 'application/octet-stream')).toBe('clip')
     expect(appendExtensionFromMime('clip', null)).toBe('clip')
+  })
+
+  it('replaces generic transport extensions when MIME identifies the media', () => {
+    expect(normalizeExtensionFromMime('55234234e.vid', 'video/mp4')).toBe('55234234e.mp4')
+    expect(normalizeExtensionFromMime('abc123.bin', 'video/x-matroska')).toBe('abc123.mkv')
+    expect(normalizeExtensionFromMime('matrix1999.mp4', 'video/mp4')).toBe('matrix1999.mp4')
+  })
+})
+
+describe('isOpaqueFileName', () => {
+  it('recognizes transport ids conservatively', () => {
+    expect(isOpaqueFileName('55234234e.vid', { resourceType: 'video', mimeType: 'video/mp4' })).toBe(true)
+    expect(isOpaqueFileName('8b2c23f4a776e201.bin', { resourceType: 'video', mimeType: 'video/mp4' })).toBe(true)
+    expect(isOpaqueFileName('550e8400-e29b-41d4-a716-446655440000.mp4', { resourceType: 'video', mimeType: 'video/mp4' })).toBe(true)
+    expect(isOpaqueFileName('9273518273.dat', { resourceType: 'video', mimeType: 'video/mp4' })).toBe(true)
+    expect(isOpaqueFileName('matrix1999.mp4', { resourceType: 'video', mimeType: 'video/mp4' })).toBe(false)
+    expect(isOpaqueFileName('episode12.mp4', { resourceType: 'video', mimeType: 'video/mp4' })).toBe(false)
+    expect(isOpaqueFileName('video2026.mp4', { resourceType: 'video', mimeType: 'video/mp4' })).toBe(false)
   })
 })

@@ -6,6 +6,7 @@
  */
 import { groupCaptures, displayTypeFor, urlQualityLabel } from '../src/classify.js'
 import { getConfig, setCaptureFilters } from '../src/api.js'
+import { explicitFilenameFromDialog } from '../src/popup-filename.js'
 
 const $ = (sel) => document.querySelector(sel)
 
@@ -13,6 +14,7 @@ const state = {
   connected: false,
   captures: [],
   selectedId: null,        // capture id being imported
+  filenameSuggestion: '',  // original dialog suggestion for the selected capture
   importStatus: 'idle',    // idle | submitting | success | error
   importMsg: '',
   options: null,           // { folders, storageAccounts, workers }
@@ -368,6 +370,7 @@ function fillSelect(select, items) {
 
 async function openImport(capture) {
   state.selectedId = capture.id
+  state.filenameSuggestion = capture.customFilename || capture.filename || ''
   state.importStatus = 'idle'
   state.importMsg = ''
   render()
@@ -376,6 +379,7 @@ async function openImport(capture) {
 
 function cancelImport() {
   state.selectedId = null
+  state.filenameSuggestion = ''
   state.importStatus = 'idle'
   state.importMsg = ''
   render()
@@ -386,7 +390,11 @@ async function startImport() {
   if (!capture) return
   // Snapshot the user's edited filename BEFORE render() re-populates the input
   // from capture.filename — render() must never overwrite explicit user input.
-  const userFilename = $('#dlgName').value.trim() || null
+  const userFilename = explicitFilenameFromDialog({
+    suggestedFilename: state.filenameSuggestion,
+    dialogValue: $('#dlgName').value,
+    existingCustomFilename: capture.customFilename,
+  })
   state.importStatus = 'submitting'
   render()
 

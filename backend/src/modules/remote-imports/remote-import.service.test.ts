@@ -574,6 +574,16 @@ describe('createRemoteImport', () => {
     expect(created.fileName).not.toBe('Movie.mp4.mp4')
   })
 
+  it('normalizes a generic detected transport extension from MIME', async () => {
+    const created = await createRemoteImport({
+      userId: 'user-1',
+      sourceUrl: 'https://cdn.example/55234234e.vid',
+      detectedFileName: '55234234e.vid',
+      mimeType: 'video/mp4',
+    })
+    expect(created.fileName).toBe('55234234e.mp4')
+  })
+
   it('leaves unknown MIME types unextended (no guessing)', async () => {
     const created = await createRemoteImport({
       userId: 'user-1',

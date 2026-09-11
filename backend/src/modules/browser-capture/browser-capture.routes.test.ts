@@ -397,11 +397,28 @@ describe('import via Remote Import pipeline (Phase 03)', () => {
     expect(hImport.createRemoteImport).toHaveBeenCalledWith(expect.objectContaining({
       userId: 'user-1',
       sourceUrl: 'https://cdn.example.com/video/movie.mp4?sig=abc',
-      fileName: 'paper.pdf',
+      fileName: null,
+      detectedFileName: 'paper.pdf',
       mimeType: 'application/pdf',
     }))
     expect(row.status).toBe('consumed')
     expect(row.importedAt).toBeTruthy()
+  })
+
+  it('does not treat an opaque captured suggestion as an explicit filename', async () => {
+    const row = await seedResource({
+      filename: '55234234e.vid',
+      mimeType: 'video/mp4',
+      mediaIdentityTitle: 'video bagus',
+      mediaIdentitySource: 'dom-video-title',
+      mediaIdentityConfidence: 75,
+    })
+    const res = await call('POST', `/resources/${row.id}/import`, {})
+    expect(res.status).toBe(201)
+    expect(hImport.createRemoteImport).toHaveBeenCalledWith(expect.objectContaining({
+      detectedFileName: 'video bagus.mp4',
+      fileName: null,
+    }))
   })
 
   it('explicit filename wins over captured filename', async () => {
@@ -409,6 +426,20 @@ describe('import via Remote Import pipeline (Phase 03)', () => {
     const res = await call('POST', `/resources/${row.id}/import`, { filename: 'My Rename' })
     expect(res.status).toBe(201)
     expect(hImport.createRemoteImport).toHaveBeenCalledWith(expect.objectContaining({ fileName: 'My Rename' }))
+  })
+
+  it('explicit filename wins over an opaque capture suggestion', async () => {
+    const row = await seedResource({
+      filename: 'f2a7d913843b.mp4',
+      mediaIdentityTitle: 'Video Bagus',
+    })
+    const res = await call('POST', `/resources/${row.id}/import`, { filename: 'My Personal Video.mp4' })
+    expect(res.status).toBe(201)
+    expect(hImport.createRemoteImport).toHaveBeenCalledWith(expect.objectContaining({
+      fileName: 'My Personal Video.mp4',
+      detectedFileName: null,
+    }))
+    expect(hProbe.probeRemoteUrl).not.toHaveBeenCalled()
   })
 
   it('forwards destination + worker selection to createRemoteImport', async () => {
@@ -535,7 +566,7 @@ describe('import via Remote Import pipeline (Phase 03)', () => {
     expect(row.status).toBe('pending')
   })
 
-  it('non-HLS captures skip the probe entirely (regression guard)', async () => {
+  it('ordinary non-HLS captures skip the filename probe (regression guard)', async () => {
     const pdf = await seedResource({ type: 'document', mimeType: 'application/pdf' })
     await call('POST', `/resources/${pdf.id}/import`, {})
     const vid = await seedResource()

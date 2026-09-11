@@ -154,3 +154,39 @@ export function appendExtensionFromMime(name: string, mimeType: string | null | 
   if (nameHasExtension(name)) return name
   return appendExtension(name, extensionFromMime(mimeType))
 }
+
+const GENERIC_TRANSPORT_EXTENSION = /\.(?:vid|bin|dat|tmp)$/i
+const UUID_STEM = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const LONG_NUMERIC_STEM = /^\d{8,}$/
+const HEX_STEM = /^[0-9a-f]+$/i
+const OBJECT_STEM = /^[a-z0-9_-]{6,}$/i
+
+/**
+ * Recognize common opaque transport/object names without treating ordinary
+ * numeric media names such as `episode12.mp4` as opaque.
+ */
+export function isOpaqueFileName(
+  name: string | null | undefined,
+  _opts: { resourceType?: string | null; type?: string | null; mimeType?: string | null } = {},
+): boolean {
+  if (!name) return false
+  const base = name.replace(/^.*[\\/]/, '').trim()
+  const match = /^(.*)\.([^.]+)$/.exec(base)
+  const stem = (match?.[1] ?? base).trim()
+  const ext = match?.[2] ?? ''
+  if (!stem) return false
+
+  if (UUID_STEM.test(stem)) return true
+  if (LONG_NUMERIC_STEM.test(stem)) return true
+  if (HEX_STEM.test(stem) && stem.length >= 12) return true
+  if (GENERIC_TRANSPORT_EXTENSION.test(`.${ext}`) && OBJECT_STEM.test(stem) && /\d/.test(stem)) return true
+  return false
+}
+
+/** Replace only generic transport extensions, or append a known MIME suffix. */
+export function normalizeExtensionFromMime(name: string, mimeType: string | null | undefined): string {
+  const extension = extensionFromMime(mimeType)
+  if (!extension) return name
+  if (GENERIC_TRANSPORT_EXTENSION.test(name)) return name.replace(GENERIC_TRANSPORT_EXTENSION, `.${extension}`)
+  return appendExtensionFromMime(name, mimeType)
+}

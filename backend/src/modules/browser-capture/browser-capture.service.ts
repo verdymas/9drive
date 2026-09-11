@@ -13,6 +13,8 @@ import {
 } from '../remote-imports/request-context.js'
 import { createRemoteImport, type CreateRemoteImportHlsOptions } from '../remote-imports/remote-import.service.js'
 import { probeRemoteUrl } from '../remote-imports/probe.js'
+import { resolveCapturedFileName } from '../remote-imports/filename-detection.js'
+import { isOpaqueFileName } from '../remote-imports/filename-sanitize.js'
 import { CAPTURED_RESOURCE_TTL_MS, RESOURCE_TYPES, type CapturedResourceType } from './capture-types.js'
 
 /**
@@ -402,6 +404,32 @@ export async function importCapturedResource(
     mimeType = null
   }
 
+  const explicitFileName = input.filename?.trim() || null
+  let probedName = null
+  if (!explicitFileName && resource.type !== 'hls' && isOpaqueFileName(resource.filename, {
+    resourceType: resource.type,
+    mimeType: resource.mimeType,
+  })) {
+    // Opaque capture suggestions are deliberately re-probed at the backend
+    // boundary. This preserves Content-Disposition as a safety-net signal and
+    // prevents the extension's transport basename from becoming authoritative.
+    try {
+      probedName = await probeRemoteUrl(sourceUrl, resource.id, requestContext ?? undefined, { workerId: input.workerId ?? null })
+    } catch (error) {
+      console.debug(`[browser-capture:filename] probe fallback code=${error instanceof AppError ? error.code : 'network'}`)
+    }
+  }
+  const detectedFileName = explicitFileName
+    ? null
+    : resolveCapturedFileName({
+        suggestedFileName: resource.filename,
+        mediaIdentityTitle: resource.mediaIdentityTitle,
+        pageTitle: resource.pageTitle,
+        probed: probedName,
+        mimeType: resource.mimeType,
+        resourceType: resource.type,
+      })
+
   // The import is created FIRST with its own worker guard + URL gate; the
   // capture row is consumed only after creation succeeds, so a failed create
   // never loses the capture.
@@ -414,16 +442,18 @@ export async function importCapturedResource(
     folderId: input.folderId ?? null,
     connectedAccountId: input.connectedAccountId ?? null,
     workerId: input.workerId ?? null,
-    // Priority chain: user override wins, else the captured filename (already
-    // sanitized at submit; sanitized again inside createRemoteImport).
+    // Priority chain: user override wins; otherwise the captured filename is
+    // passed as detectedFileName because it is only a suggestion. The backend
+    // resolver may replace opaque transport names before persistence.
     // Preserve the original source filename for the UI even when the upload
     // name is container-derived (e.g. master.m3u8 → master.mkv).
-    fileName: input.filename?.trim() || resource.filename,
+    fileName: explicitFileName,
+    detectedFileName,
     sourceFileName: resource.filename,
     mimeType,
     ...(hls ? { hls } : {}),
   })
-  console.debug(`[browser-capture:filename] stage=import source=${input.filename ? 'user-override' : 'captured-filename'} canonical=${input.filename?.trim() || resource.filename}`)
+  console.debug(`[browser-capture:filename] stage=import source=${explicitFileName ? 'user-override' : 'captured-suggestion'} canonical=${explicitFileName || detectedFileName}`)
 
   await prisma.capturedResource.updateMany({
     where: { id: resource.id, status: 'pending' },
