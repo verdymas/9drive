@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { estimateTempReservation, TempStorageReservations } from './resource-control.js'
+import { estimateTempReservation, FairSemaphore, TempStorageReservations } from './resource-control.js'
 
 describe('TempStorageReservations', () => {
   it('uses a known direct content length instead of the unknown-size estimate', () => {
@@ -77,5 +77,34 @@ describe('TempStorageReservations', () => {
         reserveBytes: 100n,
       }),
     ).resolves.toMatchObject({ admitted: true })
+  })
+})
+
+describe('FairSemaphore', () => {
+  it('does not leak a permit when a queued waiter is cancelled', async () => {
+    const semaphore = new FairSemaphore(1)
+    const first = await semaphore.acquire()
+    const abort = new AbortController()
+    const waiting = semaphore.acquire({ signal: abort.signal })
+    abort.abort()
+
+    await expect(waiting).rejects.toMatchObject({ name: 'AbortError' })
+    first.release()
+    await expect(semaphore.acquire()).resolves.toMatchObject({ release: expect.any(Function) })
+  })
+
+  it('bounds aggregate activity across callers', async () => {
+    const semaphore = new FairSemaphore(2)
+    let active = 0
+    let maximum = 0
+    await Promise.all(Array.from({ length: 6 }, async () => {
+      const permit = await semaphore.acquire()
+      active += 1
+      maximum = Math.max(maximum, active)
+      await Promise.resolve()
+      active -= 1
+      permit.release()
+    }))
+    expect(maximum).toBe(2)
   })
 })

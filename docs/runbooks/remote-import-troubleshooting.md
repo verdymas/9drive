@@ -48,6 +48,12 @@ upload and removes its provisional file row.
 ## 5. HLS Failure
 Check manifest/segment limits and FFmpeg/ffprobe availability. Conversion errors can have a `retry-convert` path that differs from a full retry.
 
+If HLS imports are waiting under sustained load, inspect
+`REMOTE_IMPORT_HLS_GLOBAL_SEGMENT_CONCURRENCY` and
+`REMOTE_IMPORT_HLS_FFMPEG_CONCURRENCY` alongside per-job segment limits. Do
+not raise only the per-job limit: the global caps protect the worker from jobs
+collectively exhausting network, disk, or CPU resources.
+
 ## 6. Destination Upload Failure
 Check target-account status, Telegram channel configuration, quota, S3 credentials, Google reauthentication state, and folder materialization.
 

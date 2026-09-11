@@ -84,3 +84,78 @@ export function estimateTempReservation(input: { sourceType: string | null | und
 }
 
 export const tempStorageReservations = new TempStorageReservations()
+
+export type SemaphorePermit = { release(): void }
+
+/** FIFO permit queue with abortable waiters and idempotent releases. */
+export class FairSemaphore {
+  private active = 0
+  private readonly waiters: Array<{
+    resolve: (permit: SemaphorePermit) => void
+    reject: (error: Error) => void
+    signal?: AbortSignal
+    abort?: () => void
+  }> = []
+
+  constructor(private readonly limit: number) {
+    if (!Number.isInteger(limit) || limit < 1) throw new Error('Semaphore limit must be a positive integer.')
+  }
+
+  acquire(options: { signal?: AbortSignal } = {}): Promise<SemaphorePermit> {
+    if (options.signal?.aborted) return Promise.reject(this.abortError())
+    return new Promise<SemaphorePermit>((resolve, reject) => {
+      const waiter = { resolve, reject, signal: options.signal } as (typeof this.waiters)[number]
+      const start = () => {
+        this.active += 1
+        waiter.signal?.removeEventListener('abort', waiter.abort!)
+        let released = false
+        resolve({ release: () => {
+          if (released) return
+          released = true
+          this.active -= 1
+          this.drain()
+        } })
+      }
+      waiter.abort = () => {
+        const index = this.waiters.indexOf(waiter)
+        if (index >= 0) this.waiters.splice(index, 1)
+        reject(this.abortError())
+      }
+      if (this.active < this.limit && this.waiters.length === 0) {
+        start()
+        return
+      }
+      options.signal?.addEventListener('abort', waiter.abort, { once: true })
+      this.waiters.push(waiter)
+    })
+  }
+
+  private drain() {
+    while (this.active < this.limit && this.waiters.length > 0) {
+      const waiter = this.waiters.shift()!
+      if (waiter.signal?.aborted) {
+        waiter.signal.removeEventListener('abort', waiter.abort!)
+        waiter.reject(this.abortError())
+        continue
+      }
+      this.active += 1
+      waiter.signal?.removeEventListener('abort', waiter.abort!)
+      let released = false
+      waiter.resolve({ release: () => {
+        if (released) return
+        released = true
+        this.active -= 1
+        this.drain()
+      } })
+    }
+  }
+
+  private abortError() {
+    const error = new Error('The operation was cancelled while waiting for a resource permit.')
+    error.name = 'AbortError'
+    return error
+  }
+}
+
+export const hlsSegmentPermits = new FairSemaphore(env.REMOTE_IMPORT_HLS_GLOBAL_SEGMENT_CONCURRENCY)
+export const ffmpegPermits = new FairSemaphore(env.REMOTE_IMPORT_HLS_FFMPEG_CONCURRENCY)

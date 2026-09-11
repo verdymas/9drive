@@ -19,3 +19,9 @@ The worker requires `ffmpeg` and `ffprobe`; executable paths are controlled by e
 
 ## Guardrails
 Manifest/playlist depth, variant count, segment count, segment bytes, concurrency, attempts, live-recording duration, key bytes, maximum height/bandwidth, and FFmpeg timeout are all bounded by environment configuration. Preserve this bounded-resource design when adding HLS capabilities.
+
+The per-job segment limit is supplemented by a process-wide FIFO segment
+permit, and every FFmpeg process obtains a second process-wide FIFO permit.
+Cancelled jobs are removed while waiting and never consume a permit. This
+prevents several HLS jobs from multiplying their local segment or FFmpeg
+limits into unbounded aggregate pressure.

@@ -100,6 +100,9 @@ Sources of truth: `backend/src/config/env.ts`, `docker-compose.yml`, and fronten
 - `REMOTE_IMPORT_HLS_MAX_SEGMENTS`
 - `REMOTE_IMPORT_HLS_MAX_SEGMENT_BYTES`
 - `REMOTE_IMPORT_HLS_SEGMENT_CONCURRENCY`
+- `REMOTE_IMPORT_HLS_GLOBAL_SEGMENT_CONCURRENCY` — process-wide cap across
+  every HLS job's segment fetches; default `12`. This works in addition to
+  the per-job segment concurrency limit.
 - `REMOTE_IMPORT_HLS_SEGMENT_ATTEMPTS`
 - `REMOTE_IMPORT_HLS_LIVE_ENABLED`
 - `REMOTE_IMPORT_HLS_MIN_RECORD_SECONDS`
@@ -108,6 +111,9 @@ Sources of truth: `backend/src/config/env.ts`, `docker-compose.yml`, and fronten
 - `REMOTE_IMPORT_FFMPEG_PATH`
 - `REMOTE_IMPORT_FFPROBE_PATH`
 - `REMOTE_IMPORT_FFMPEG_TIMEOUT_SECONDS`
+- `REMOTE_IMPORT_HLS_FFMPEG_CONCURRENCY` — process-wide number of active
+  FFmpeg processes for HLS remux, retry, concat-copy, and re-encode; default
+  `2`.
 - `REMOTE_IMPORT_HLS_MAX_HEIGHT`
 - `REMOTE_IMPORT_HLS_MAX_BANDWIDTH`
 - `REMOTE_IMPORT_HLS_MAX_KEY_BYTES`

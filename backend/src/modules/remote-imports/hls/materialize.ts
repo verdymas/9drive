@@ -33,6 +33,7 @@ import {
 import { validateSegmentFile } from './segment-validator.js'
 import { assertSupportedEncryption, buildRewrittenPlaylist, type NormalizedSegment, type SegmentMap } from './segments.js'
 import { rewriteMediaPlaylist, validateLocalPlaylist } from './manifest-service.js'
+import { hlsSegmentPermits } from '../resource-control.js'
 
 export type MediaLabel = 'video' | 'audio'
 
@@ -197,10 +198,16 @@ export async function materializeMedia(opts: MaterializeMediaOptions): Promise<M
 
       const attemptDownload = () => {
         if (anchorUrl) assertChildAccessible(anchorUrl, new URL(segment.uri), requestContext)
-        if (segment.byterange) {
-          return downloadByteRange(segment.uri, segment.byterange.offset, segment.byterange.length, target, { signal, requestContext, fetcher: opts.fetcher ?? null })
-        }
-        return downloadResource(segment.uri, target, { maxBytes: MAX_SEGMENT_BYTES(), signal, kind: 'segment', requestContext, fetcher: opts.fetcher ?? null })
+        return hlsSegmentPermits.acquire({ signal }).then(async (permit) => {
+          try {
+            if (segment.byterange) {
+              return await downloadByteRange(segment.uri, segment.byterange.offset, segment.byterange.length, target, { signal, requestContext, fetcher: opts.fetcher ?? null })
+            }
+            return await downloadResource(segment.uri, target, { maxBytes: MAX_SEGMENT_BYTES(), signal, kind: 'segment', requestContext, fetcher: opts.fetcher ?? null })
+          } finally {
+            permit.release()
+          }
+        })
       }
 
       let lastError: unknown = null

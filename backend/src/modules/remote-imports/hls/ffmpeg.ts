@@ -21,6 +21,7 @@ import { env } from '../../../config/env.js'
 import { AppError } from '../../../utils/app-error.js'
 import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './errors.js'
 import { selectConcatSegments, validateSegmentFile, type SegmentValidation, type TsLayout } from './segment-validator.js'
+import { ffmpegPermits } from '../resource-control.js'
 
 export type FfmpegProgress = { percent: number | null; speed: string | null }
 
@@ -148,12 +149,14 @@ export function parseFfmpegProgressLine(line: string, totalSeconds: number): { p
  * enforce the timeout, forward abort (SIGTERM → SIGKILL), and rename the
  * `.part` output to its final path only on a clean exit.
  */
-function runFfmpegProcess(args: string[], outputPartPath: string, opts: { cwd: string; signal?: AbortSignal; onProgress?: (p: { percent: number | null }) => void; totalDurationSeconds?: number }): Promise<FfmpegRunResult> {
+async function runFfmpegProcess(args: string[], outputPartPath: string, opts: { cwd: string; signal?: AbortSignal; onProgress?: (p: { percent: number | null }) => void; totalDurationSeconds?: number }): Promise<FfmpegRunResult> {
   const maxStderr = 64 * 1024
   const timeoutMs = env.REMOTE_IMPORT_FFMPEG_TIMEOUT_SECONDS * 1000
   const { cwd, signal, onProgress, totalDurationSeconds } = opts
+  const permit = await ffmpegPermits.acquire({ signal })
 
-  return new Promise((resolve, reject) => {
+  try {
+    return await new Promise((resolve, reject) => {
     const child = spawn(env.REMOTE_IMPORT_FFMPEG_PATH, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
     let stderr = ''
 
@@ -202,7 +205,10 @@ function runFfmpegProcess(args: string[], outputPartPath: string, opts: { cwd: s
       await fsp.rename(outputPartPath, finalPath)
       resolve({ outputPath: finalPath, stderrTail: stderr.slice(-2000) })
     })
-  })
+    })
+  } finally {
+    permit.release()
+  }
 }
 
 /** Shared demux flags — the known-good conversion script (code_example_convert.sh)

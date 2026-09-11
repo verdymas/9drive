@@ -92,6 +92,7 @@ const envSchema = z.object({
   // Per-segment byte cap; the total is enforced by REMOTE_IMPORT_MAX_BYTES.
   REMOTE_IMPORT_HLS_MAX_SEGMENT_BYTES: z.coerce.number().default(256 * 1024 * 1024),
   REMOTE_IMPORT_HLS_SEGMENT_CONCURRENCY: z.coerce.number().default(6),
+  REMOTE_IMPORT_HLS_GLOBAL_SEGMENT_CONCURRENCY: z.coerce.number().int().min(1).default(12),
   REMOTE_IMPORT_HLS_SEGMENT_ATTEMPTS: z.coerce.number().default(4),
   REMOTE_IMPORT_HLS_LIVE_ENABLED: z.coerce.boolean().default(true),
   REMOTE_IMPORT_HLS_MIN_RECORD_SECONDS: z.coerce.number().default(60),
@@ -100,6 +101,7 @@ const envSchema = z.object({
   REMOTE_IMPORT_FFMPEG_PATH: z.string().default('/usr/bin/ffmpeg'),
   REMOTE_IMPORT_FFPROBE_PATH: z.string().default('/usr/bin/ffprobe'),
   REMOTE_IMPORT_FFMPEG_TIMEOUT_SECONDS: z.coerce.number().default(3600),
+  REMOTE_IMPORT_HLS_FFMPEG_CONCURRENCY: z.coerce.number().int().min(1).default(2),
   REMOTE_IMPORT_HLS_MAX_HEIGHT: z.coerce.number().default(2160),
   REMOTE_IMPORT_HLS_MAX_BANDWIDTH: z.coerce.number().default(0),
   REMOTE_IMPORT_HLS_MAX_KEY_BYTES: z.coerce.number().default(65536),
