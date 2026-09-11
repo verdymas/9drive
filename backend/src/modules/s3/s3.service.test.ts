@@ -68,6 +68,7 @@ import {
   createS3MultipartUpload,
   getS3DownloadDecision,
   getS3PresignedUploadPartUrl,
+  uploadS3MultipartPart,
   headS3Object,
   streamS3File,
 } from './s3.service.js'
@@ -176,12 +177,14 @@ describe('direct S3 multipart primitives', () => {
   it('creates, signs, completes, heads, and aborts a server-selected multipart object key', async () => {
     h.send
       .mockResolvedValueOnce({ UploadId: 'upload-1' })
+      .mockResolvedValueOnce({ ETag: 'etag-1' })
       .mockResolvedValueOnce({})
       .mockResolvedValueOnce({ ContentLength: 10 })
       .mockResolvedValueOnce({})
     h.getSignedUrl.mockResolvedValueOnce('https://s3.example.test/part?short-lived')
 
     await expect(createS3MultipartUpload(s3Config, '9drive/user/session/file.txt', 'text/plain')).resolves.toBe('upload-1')
+    await expect(uploadS3MultipartPart(s3Config, '9drive/user/session/file.txt', 'upload-1', 1, Buffer.from('part'))).resolves.toBe('etag-1')
     await expect(getS3PresignedUploadPartUrl(s3Config, '9drive/user/session/file.txt', 'upload-1', 1, 300)).resolves.toContain('short-lived')
     await completeS3MultipartUpload(s3Config, '9drive/user/session/file.txt', 'upload-1', [{ PartNumber: 1, ETag: 'etag-1' }])
     await expect(headS3Object(s3Config, '9drive/user/session/file.txt')).resolves.toEqual({ contentLength: 10n })
@@ -189,6 +192,7 @@ describe('direct S3 multipart primitives', () => {
 
     expect(h.send.mock.calls.map(([command]) => command)).toEqual([
       expect.objectContaining({ input: { Bucket: 'bucket', Key: '9drive/user/session/file.txt', ContentType: 'text/plain' } }),
+      expect.objectContaining({ input: { Bucket: 'bucket', Key: '9drive/user/session/file.txt', UploadId: 'upload-1', PartNumber: 1, Body: expect.any(Buffer) } }),
       expect.objectContaining({ input: { Bucket: 'bucket', Key: '9drive/user/session/file.txt', UploadId: 'upload-1', MultipartUpload: { Parts: [{ PartNumber: 1, ETag: 'etag-1' }] } } }),
       expect.objectContaining({ input: { Bucket: 'bucket', Key: '9drive/user/session/file.txt' } }),
       expect.objectContaining({ input: { Bucket: 'bucket', Key: '9drive/user/session/file.txt', UploadId: 'upload-1' } }),

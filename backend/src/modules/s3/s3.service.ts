@@ -152,6 +152,25 @@ export async function getS3PresignedUploadPartUrl(
   )
 }
 
+/** Upload one server-relayed multipart part and return the provider ETag. */
+export async function uploadS3MultipartPart(
+  config: S3Config,
+  key: string,
+  uploadId: string,
+  partNumber: number,
+  body: Uint8Array,
+) {
+  const response = await createS3Client(config).send(new UploadPartCommand({
+    Bucket: config.bucket,
+    Key: key,
+    UploadId: uploadId,
+    PartNumber: partNumber,
+    Body: body,
+  }))
+  if (!response.ETag) throw new Error('S3 did not return a multipart part ETag.')
+  return response.ETag
+}
+
 export async function completeS3MultipartUpload(
   config: S3Config,
   key: string,

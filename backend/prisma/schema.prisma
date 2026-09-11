@@ -389,6 +389,9 @@ model RemoteImport {
   outputCodecSummary          String?            @map("output_codec_summary") @db.VarChar(191)
   tempPath                    String?            @map("temp_path") @db.Text
   resumeSessionEncrypted      String?            @map("resume_session_encrypted") @db.Text
+  // Encrypted server-only resume metadata for opt-in direct stream-through
+  // imports (Google resumable or S3 multipart). Never serialized to clients.
+  streamUploadStateEncrypted  String?            @map("stream_upload_state_encrypted") @db.Text
   jobId                       String?            @map("job_id") @db.VarChar(191)
   attempt                     Int                @default(0)
   // Queue-lifecycle metadata (spec: retry/queue fix). `queuedAt` is set only
