@@ -10,10 +10,9 @@ the original plan's separate provisioning + second login. Nothing here
 logs in; nothing here stores a session.
 
 `iter_download` is used rather than a hand-rolled `upload.GetFile` loop
-because it already does the three things that are easy to get wrong:
-byte-offset (not chunk-index) addressing, misaligned start offsets
-(`_GenericDownloadIter`), and DC export/import with sender reuse. We stop
-it at the requested end.
+because it owns DC export/import and sender reuse. HTTP range starts are
+explicitly aligned before passing them upstream, then the internal prefix is
+discarded so the client still receives the exact requested bytes.
 
 ponytail: sequential — one in-flight Telegram request per stream, no
 prefetch. Upgrade path if a measured run shows throughput below the
@@ -39,6 +38,7 @@ from app.telegram.file_resolver import FileResolver, ResolvedLocation
 
 # telethon.tl.custom.messagebutton / download semantics: request_size is floored
 # to MIN_CHUNK_SIZE (4 KiB) and capped at MAX_CHUNK_SIZE (512 KiB).
+_TELETHON_MIN_CHUNK = 4 * 1024
 _TELETHON_MAX_CHUNK = 512 * 1024
 
 # Telethon is imported lazily so the unit tests (and any environment that
@@ -179,13 +179,22 @@ async def iter_bytes(
     throws CancelledError into this generator, `finally` closes the download
     iterator, and the Telegram sender is released.
     """
+    # Telegram upload.getFile accepts fixed-size requests whose offsets are
+    # aligned to the request size. Keep the HTTP start untouched, but read from
+    # the preceding valid boundary and discard that private prefix as chunks
+    # arrive. Explicitly matching Telethon's output chunk size to its request
+    # size also prevents an internal request from straddling a file part.
+    request_size = min(settings.chunk_size_bytes, _TELETHON_MAX_CHUNK)
+    request_size -= request_size % _TELETHON_MIN_CHUNK
+    request_size = max(request_size, _TELETHON_MIN_CHUNK)
+    aligned_start = start - (start % request_size)
+    prefix_skip = start - aligned_start
+
     stream = client.raw.iter_download(
         location.raw_location,
-        offset=start,
-        # Telethon rounds request_size down to a multiple of 4 KiB and clamps
-        # it to 512 KiB; clamp here so the configured value isn't silently
-        # different from the one we log and tune against.
-        request_size=min(settings.chunk_size_bytes, _TELETHON_MAX_CHUNK),
+        offset=aligned_start,
+        request_size=request_size,
+        chunk_size=request_size,
         file_size=location.file_size,
     )
     remaining = length
@@ -193,6 +202,12 @@ async def iter_bytes(
         async for chunk in stream:
             if not chunk:
                 break
+            if prefix_skip:
+                if len(chunk) <= prefix_skip:
+                    prefix_skip -= len(chunk)
+                    continue
+                chunk = chunk[prefix_skip:]
+                prefix_skip = 0
             data = bytes(chunk[:remaining]) if len(chunk) > remaining else bytes(chunk)
             metrics.mark_first_byte()
             metrics.add_chunk(len(data))
