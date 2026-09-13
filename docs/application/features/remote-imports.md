@@ -38,6 +38,12 @@
 ## Failure/Retry
 Retry behavior is stage-aware. HLS conversion-specific retry can reuse downloaded/materialized output when safe. Queue/processing reconciliation prevents stuck UI states after a crash or lost queue job.
 
+Expected worker-side waits do not consume normal failure attempts or mark the
+import failed. When the per-user gate is full, or temporary-storage admission
+returns `deferred`, the worker moves the active BullMQ job to `delayed` using
+its current lock token before throwing `DelayedError`; the import remains
+queued/waiting and resumes automatically after a short backoff.
+
 ## Temporary storage admission
 
 Before a direct download or HLS materialization starts, the worker inspects the

@@ -30,6 +30,9 @@ Worker --> Fetch{Direct or Remote Fetch Worker}
 - Creation validates the selected worker first, then applies URL policy validation.
 - Enqueue failure immediately marks the database row as failed.
 - The worker sets `processing` and heartbeat only when execution starts.
+- Per-user concurrency saturation and temporary-storage admission shortages
+  move the active BullMQ job to `delayed` with the worker lock token before
+  signaling `DelayedError`; these expected waits do not consume retry attempts.
 - Cancel/retry operations coordinate persisted state with the queue job.
 - Retry may resume from reusable stages/artifacts; a normal retry can fall back to downloading again.
 - A reconciliation sweep detects queued-job mismatches and stale processing heartbeats.

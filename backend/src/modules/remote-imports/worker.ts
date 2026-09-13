@@ -1,5 +1,5 @@
 import '../remote-fetch-workers/index.js'
-import { Worker, type Job } from 'bullmq'
+import { DelayedError, Worker, type Job } from 'bullmq'
 import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { type RemoteImportJobData, type RemoteImportWorkload } from './queue.js'
@@ -11,11 +11,13 @@ import { processRemoteImportJob } from './processor.js'
  * BullMQ's `concurrency` option limits total parallel jobs across all users.
  * The product requirement is a per-user cap as well, so each user may only
  * have `REMOTE_IMPORT_PER_USER_CONCURRENCY` jobs actively processing. Jobs
- * that exceed the cap are moved back to the waiting state with an internal
- * delay (this worker re-processes them after a short backoff).
+ * that exceed the cap are moved to the delayed state with an internal delay
+ * (this worker re-processes them after a short backoff).
  */
 const activePerUser = new Map<string, number>()
 const perUserGate = env.REMOTE_IMPORT_PER_USER_CONCURRENCY
+const PER_USER_DEFER_DELAY_MS = 1_000
+const RESOURCE_DEFER_DELAY_MS = 5_000
 
 function acquirePerUserSlot(userId: string): boolean {
   const current = activePerUser.get(userId) ?? 0
@@ -30,13 +32,27 @@ function releasePerUserSlot(userId: string) {
   else activePerUser.set(userId, current - 1)
 }
 
+/**
+ * BullMQ only treats DelayedError as a successful deferral when the active job
+ * has already been moved to delayed. The processor token owns that active-job
+ * lock and must be passed through to the transition.
+ */
+async function deferRemoteImportJob(
+  job: Job<RemoteImportJobData>,
+  token: string | undefined,
+  delayMs: number,
+): Promise<never> {
+  await job.moveToDelayed(Date.now() + delayMs, token)
+  throw new DelayedError()
+}
+
 const queueNameFor = (workload: RemoteImportWorkload) => (workload === 'hls' ? 'remote-imports-hls' : 'remote-imports-direct')
 const concurrencyFor = (workload: RemoteImportWorkload) => (workload === 'hls' ? env.REMOTE_IMPORT_HLS_JOB_CONCURRENCY : env.REMOTE_IMPORT_DIRECT_CONCURRENCY)
 
 /** Build one workload consumer. Both consumers share the same state machine and per-user gate. */
 export function createRemoteImportWorker(workload: RemoteImportWorkload = 'direct'): Worker<RemoteImportJobData> {
   const queueName = queueNameFor(workload)
-  const worker = new Worker<RemoteImportJobData>(queueName, async (job: Job<RemoteImportJobData>) => {
+  const worker = new Worker<RemoteImportJobData>(queueName, async (job: Job<RemoteImportJobData>, token?: string) => {
     const importId = job.data.importId
     const remoteImport = await prisma.remoteImport.findUnique({ where: { id: importId } })
     if (!remoteImport) return
@@ -46,7 +62,7 @@ export function createRemoteImportWorker(workload: RemoteImportWorkload = 'direc
     // stays `queued` here — nothing visible to the user changes while the job
     // waits for a slot.
     if (!acquirePerUserSlot(userId)) {
-      throw new (await import('bullmq')).DelayedError()
+      await deferRemoteImportJob(job, token, PER_USER_DEFER_DELAY_MS)
     }
     try {
       // The moment the worker actually begins this execution, persist an
@@ -62,7 +78,7 @@ export function createRemoteImportWorker(workload: RemoteImportWorkload = 'direc
         console.error('[remote-import] failed to mark execution started for', importId, err instanceof Error ? err.message : String(err))
       })
       const result = await processRemoteImportJob(job)
-      if (result === 'deferred') throw new (await import('bullmq')).DelayedError()
+      if (result === 'deferred') await deferRemoteImportJob(job, token, RESOURCE_DEFER_DELAY_MS)
     } finally {
       releasePerUserSlot(userId)
     }
