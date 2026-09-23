@@ -110,8 +110,10 @@ export function looksLikeM3u8Url(url: URL): boolean {
 
 /**
  * Prefix check — the caller reads a strictly size-limited text prefix.
- * Accepts `#EXTM3U` at the very start, and requires at least one HLS-specific
- * tag so an ordinary M3U audio playlist is never treated as HLS.
+ * Confirmed HLS only: `#EXTM3U` at the very start AND at least one
+ * HLS-specific tag, so an ordinary M3U audio playlist is never treated as HLS.
+ * (The `#EXTINF`-only guard in parseManifest below preserves this invariant
+ * for the full body too.)
  */
 export function m3u8PrefixIsHls(prefix: string): boolean {
   const startsWithExtm3u = /^﻿?\s*#EXTM3U\b/.test(prefix)
@@ -201,7 +203,7 @@ function contextAwareStatusError(statusCode: number, hasContext: boolean): AppEr
 export async function fetchManifestForProbe(
   url: string,
   opts: { maxBytes?: number; signal?: AbortSignal; requestContext?: RemoteImportRequestContext; fetcher?: import('../secure-fetcher.js').SecureRemoteFetcher | null } = {},
-): Promise<{ body: string; finalUrl: string }> {
+): Promise<{ body: string; finalUrl: string; contentType: string | null; status: number; contentDisposition: string | null }> {
   const maxBytes = opts.maxBytes ?? env.REMOTE_IMPORT_HLS_MAX_MANIFEST_BYTES
   if (opts.fetcher) {
     const res = await opts.fetcher.fetch({ method: 'GET', url, headers: HLS_MANIFEST_PROFILE_HEADERS, requestContext: opts.requestContext as any, maxBytes } as any)
@@ -223,10 +225,13 @@ export async function fetchManifestForProbe(
       }
       body += Buffer.from(chunk as Uint8Array).toString('utf8')
     }
-    return { body, finalUrl: (res as any).finalUrl ?? url }
+    return { body, finalUrl: (res as any).finalUrl ?? url, contentType: (res.headers?.['content-type'] as string) ?? null, status: res.status, contentDisposition: (res.headers?.['content-disposition'] as string) ?? null }
   }
   let collected = 0
   let body = ''
+  let finalContentType: string | null = null
+  let finalStatus = 200
+  let finalContentDisposition: string | null = null
   try {
     const result = await followRemoteUrl(url, {
       headers: HLS_MANIFEST_PROFILE_HEADERS,
@@ -235,6 +240,9 @@ export async function fetchManifestForProbe(
         if (res.statusCode >= 400) {
           throw contextAwareStatusError(res.statusCode, Boolean(opts.requestContext))
         }
+        finalContentType = res.headers['content-type'] ?? null
+        finalStatus = res.statusCode
+        finalContentDisposition = res.headers['content-disposition'] ?? null
         if (typeof (res.body as { on?: unknown }).on === 'function') {
           (res.body as unknown as { on: (event: 'error', listener: () => void) => void }).on('error', () => undefined)
         }
@@ -253,7 +261,7 @@ export async function fetchManifestForProbe(
         return finalURL
       },
     })
-    return { body, finalUrl: result.finalUrl }
+    return { body, finalUrl: result.finalUrl, contentType: finalContentType, status: finalStatus, contentDisposition: finalContentDisposition }
   } catch (error) {
     // An idle-timeout mid-stream (or a connect timeout) is a DISTINCT outcome
     // from a plain network failure — map it to HLS_MANIFEST_TIMEOUT.

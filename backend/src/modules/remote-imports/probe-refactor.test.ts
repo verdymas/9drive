@@ -275,22 +275,22 @@ describe('probe refactor: HLS detection + invalid bodies (§6, §7)', () => {
     expect(result.hls?.detectedInBody).toBe(true)
   })
 
-  it('rejects a .m3u8 URL returning HTML as HLS_INVALID_MANIFEST', async () => {
+  it('rejects a .m3u8 URL returning HTML as REMOTE_SOURCE_UNEXPECTED_HTML (never HLS_INVALID_MANIFEST)', async () => {
     contentType = 'text/html'
     serveBody = '<html><body>404 page</body></html>'
-    await expect(probeRemoteUrl(`${baseUrl}/stream.m3u8`, 'ref-10')).rejects.toMatchObject({ code: 'HLS_INVALID_MANIFEST' })
+    await expect(probeRemoteUrl(`${baseUrl}/stream.m3u8`, 'ref-10')).rejects.toMatchObject({ code: 'REMOTE_SOURCE_UNEXPECTED_HTML' })
   })
 
-  it('rejects a .m3u8 URL returning a JSON error as HLS_INVALID_MANIFEST', async () => {
+  it('rejects a .m3u8 URL returning a JSON error as REMOTE_SOURCE_UNSUPPORTED_TYPE (never HLS_INVALID_MANIFEST)', async () => {
     contentType = 'application/json'
     serveBody = '{"error":"forbidden"}'
-    await expect(probeRemoteUrl(`${baseUrl}/stream.m3u8`, 'ref-11')).rejects.toMatchObject({ code: 'HLS_INVALID_MANIFEST' })
+    await expect(probeRemoteUrl(`${baseUrl}/stream.m3u8`, 'ref-11')).rejects.toMatchObject({ code: 'REMOTE_SOURCE_UNSUPPORTED_TYPE' })
   })
 
-  it('rejects a .m3u8 URL returning a PNG as HLS_INVALID_MANIFEST', async () => {
+  it('rejects a .m3u8 URL returning a PNG as REMOTE_SOURCE_UNSUPPORTED_TYPE (never HLS_INVALID_MANIFEST)', async () => {
     contentType = 'image/png'
     serveBody = '\x89PNG\r\n\x1a\n' + 'binary'
-    await expect(probeRemoteUrl(`${baseUrl}/stream.m3u8`, 'ref-12')).rejects.toMatchObject({ code: 'HLS_INVALID_MANIFEST' })
+    await expect(probeRemoteUrl(`${baseUrl}/stream.m3u8`, 'ref-12')).rejects.toMatchObject({ code: 'REMOTE_SOURCE_UNSUPPORTED_TYPE' })
   })
 })
 

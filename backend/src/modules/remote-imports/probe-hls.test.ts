@@ -142,6 +142,8 @@ describe('probeRemoteUrl HLS detection', () => {
     // manifest GET runs and the body must validate as #EXTM3U + HLS tags.
     // An ordinary MP3 M3U answers with the HLS-compatible MIME but is not a
     // valid HLS playlist — a STRUCTURED error, never a silent direct_file.
+    // The plain-M3U body has an `#EXTM3U` prefix without HLS-specific tags, so
+    // the HLS parser path still reports HLS_INVALID_MANIFEST here.
     contentType = 'audio/x-mpegurl'
     serveBody = '#EXTM3U\n#EXTINF:300,\nfile.mp3'
     await expect(probeRemoteUrl(`${baseUrl}/audio`, 'corr-hls-5')).rejects.toMatchObject({ code: 'HLS_INVALID_MANIFEST' })

@@ -378,30 +378,40 @@ export async function importCapturedResource(
   const sourceUrl = decryptText(resource.urlEncrypted)
   const requestContext = decryptRequestContext(resource.requestContextEncrypted)
 
-  // HLS captures must enter the existing HLS pipeline, not the generic
-  // direct-download path (which would save the manifest as a file). The probe
-  // runs through the SAME selected worker transport and confirms/refutes HLS;
-  // the create call below then persists `sourceType`, which is what
-  // processor.ts's isHlsRecord() routes on.
+  // HLS captures enter the HLS pipeline ONLY when the fetched response
+  // confirms HLS. The captured `type` is a hint, never authoritative: the
+  // probe runs through the SAME selected worker transport with the captured
+  // request context and classifies the ACTUAL response. A hinted HLS source
+  // that answers with direct media (e.g. `.../55234234e.vid` + `video/mp4`)
+  // is reclassified to the normal direct pipeline — never HLS_INVALID_MANIFEST.
+  // The canonical filename stem (media title etc.) is preserved; only a weak
+  // transport/playlist extension is swapped for the detected media MIME.
   let hls: CreateRemoteImportHlsOptions | undefined
   let mimeType = resource.mimeType
+  let reclassifiedProbed: { fileName: string; fileNameSource: 'content-disposition-filename' | 'content-disposition-filename-star' | 'final-url-path' | 'original-url-path' | 'generated-fallback'; mimeType: string | null } | null = null
   if (resource.type === 'hls') {
-    const probed = await probeRemoteUrl(sourceUrl, resource.id, requestContext ?? undefined, { workerId: input.workerId ?? null })
+    const probed = await probeRemoteUrl(sourceUrl, resource.id, requestContext ?? undefined, {
+      workerId: input.workerId ?? null,
+      capturedType: resource.type,
+    })
     if (probed.sourceType !== 'hls_master' && probed.sourceType !== 'hls_media') {
-      throw new AppError('CAPTURE_NOT_HLS', 'This captured resource is no longer a valid HLS stream.', 400)
+      // Content-aware reclassification: the response is direct media, not HLS.
+      reclassifiedProbed = { fileName: probed.fileName, fileNameSource: probed.fileNameSource, mimeType: probed.mimeType }
+      mimeType = probed.mimeType ?? resource.mimeType
+    } else {
+      if (!probed.hls?.isFinite) {
+        // Live/event sources need a recording duration — that choice lives in the
+        // dashboard's Remote Import modal; the extension popup has no such field.
+        throw new AppError('CAPTURE_LIVE_HLS_UNSUPPORTED', 'Live streams cannot be imported from the extension. Use Remote Import in the 9Drive dashboard to set a recording duration.', 400)
+      }
+      // Default container honors REMOTE_IMPORT_HLS_DEFAULT_CONTAINER ('mp4'
+      // selects MP4 explicitly; anything else → auto, which resolves to MKV).
+      const envContainer = String(env.REMOTE_IMPORT_HLS_DEFAULT_CONTAINER).toLowerCase()
+      hls = { sourceType: probed.sourceType, outputContainer: envContainer === 'mp4' ? 'mp4' : 'auto' }
+      // The manifest MIME must not label the remuxed output — the processor
+      // derives video/x-matroska|video/mp4 from the actual container when null.
+      mimeType = null
     }
-    if (!probed.hls?.isFinite) {
-      // Live/event sources need a recording duration — that choice lives in the
-      // dashboard's Remote Import modal; the extension popup has no such field.
-      throw new AppError('CAPTURE_LIVE_HLS_UNSUPPORTED', 'Live streams cannot be imported from the extension. Use Remote Import in the 9Drive dashboard to set a recording duration.', 400)
-    }
-    // Default container honors REMOTE_IMPORT_HLS_DEFAULT_CONTAINER ('mp4'
-    // selects MP4 explicitly; anything else → auto, which resolves to MKV).
-    const envContainer = String(env.REMOTE_IMPORT_HLS_DEFAULT_CONTAINER).toLowerCase()
-    hls = { sourceType: probed.sourceType, outputContainer: envContainer === 'mp4' ? 'mp4' : 'auto' }
-    // The manifest MIME must not label the remuxed output — the processor
-    // derives video/x-matroska|video/mp4 from the actual container when null.
-    mimeType = null
   }
 
   const explicitFileName = input.filename?.trim() || null
@@ -414,21 +424,39 @@ export async function importCapturedResource(
     // boundary. This preserves Content-Disposition as a safety-net signal and
     // prevents the extension's transport basename from becoming authoritative.
     try {
-      probedName = await probeRemoteUrl(sourceUrl, resource.id, requestContext ?? undefined, { workerId: input.workerId ?? null })
+      probedName = await probeRemoteUrl(sourceUrl, resource.id, requestContext ?? undefined, {
+        workerId: input.workerId ?? null,
+        capturedType: resource.type,
+      })
     } catch (error) {
       console.debug(`[browser-capture:filename] probe fallback code=${error instanceof AppError ? error.code : 'network'}`)
     }
   }
   const detectedFileName = explicitFileName
     ? null
-    : resolveCapturedFileName({
-        suggestedFileName: resource.filename,
-        mediaIdentityTitle: resource.mediaIdentityTitle,
-        pageTitle: resource.pageTitle,
-        probed: probedName,
-        mimeType: resource.mimeType,
-        resourceType: resource.type,
-      })
+    : reclassifiedProbed
+      // Reclassification preserves the canonical stem: the semantic title
+      // (media identity / page title) still wins; only when no semantic
+      // metadata exists does the probe's direct-media filename apply. The
+      // URL basename (`55234234e.vid`) never becomes authoritative here —
+      // resolveCapturedFileName keeps it below semantic sources, and the
+      // probe already swapped its weak extension for the detected MIME.
+      ? resolveCapturedFileName({
+          suggestedFileName: resource.filename,
+          mediaIdentityTitle: resource.mediaIdentityTitle,
+          pageTitle: resource.pageTitle,
+          probed: reclassifiedProbed,
+          mimeType: mimeType ?? resource.mimeType,
+          resourceType: resource.type,
+        })
+      : resolveCapturedFileName({
+          suggestedFileName: resource.filename,
+          mediaIdentityTitle: resource.mediaIdentityTitle,
+          pageTitle: resource.pageTitle,
+          probed: probedName,
+          mimeType: resource.mimeType,
+          resourceType: resource.type,
+        })
 
   // The import is created FIRST with its own worker guard + URL gate; the
   // capture row is consumed only after creation succeeds, so a failed create
@@ -450,7 +478,7 @@ export async function importCapturedResource(
     fileName: explicitFileName,
     detectedFileName,
     sourceFileName: resource.filename,
-    mimeType,
+    mimeType: reclassifiedProbed ? (mimeType ?? null) : mimeType,
     ...(hls ? { hls } : {}),
   })
   console.debug(`[browser-capture:filename] stage=import source=${explicitFileName ? 'user-override' : 'captured-suggestion'} canonical=${explicitFileName || detectedFileName}`)

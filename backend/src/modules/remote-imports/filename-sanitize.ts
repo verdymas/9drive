@@ -155,7 +155,7 @@ export function appendExtensionFromMime(name: string, mimeType: string | null | 
   return appendExtension(name, extensionFromMime(mimeType))
 }
 
-const GENERIC_TRANSPORT_EXTENSION = /\.(?:vid|bin|dat|tmp)$/i
+const GENERIC_TRANSPORT_EXTENSION = /\.(?:vid|bin|dat|blob|tmp)$/i
 const UUID_STEM = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const LONG_NUMERIC_STEM = /^\d{8,}$/
 const HEX_STEM = /^[0-9a-f]+$/i
