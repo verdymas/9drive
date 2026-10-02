@@ -20,6 +20,7 @@
 
 const SERVICE_IDENTITY = '9drive-relay';
 const PROTOCOL_VERSION = '9drive-relay-v1';
+const COOKIE_PROTOCOL_VERSION = '9drive-relay-v2-cookie';
 const SIGNATURE_HEADER = 'x-9drive-signature';
 const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST']);
 const BLOCKED_SCHEMES = new Set(['javascript:', 'file:', 'ftp:', 'data:']);
@@ -87,7 +88,7 @@ async function handleFetch(request) {
   if (protocolVersion === undefined || protocolVersion === null) {
     return json({ error: 'invalid payload', reason: 'MISSING_PROTOCOL' }, 400);
   }
-  if (protocolVersion !== PROTOCOL_VERSION) {
+  if (protocolVersion !== PROTOCOL_VERSION && protocolVersion !== COOKIE_PROTOCOL_VERSION) {
     return json({ error: 'invalid payload', reason: 'INVALID_PROTOCOL' }, 400);
   }
   if (method === undefined || method === null) {
@@ -108,6 +109,10 @@ async function handleFetch(request) {
   if (headers !== undefined && headers !== null && (typeof headers !== 'object' || Array.isArray(headers))) {
     return json({ error: 'invalid payload', reason: 'INVALID_HEADERS' }, 400);
   }
+  const hasCookie = headers && Object.keys(headers).some((key) => key.toLowerCase() === 'cookie');
+  if (hasCookie && protocolVersion !== COOKIE_PROTOCOL_VERSION) {
+    return json({ error: 'invalid payload', reason: 'INVALID_PROTOCOL' }, 400);
+  }
   // Body is optional: when present must be string (not null, not number). HEAD/GET should omit it.
   if (body !== undefined && typeof body !== 'string') {
     return json({ error: 'invalid payload', reason: 'INVALID_BODY_TYPE' }, 400);
@@ -125,7 +130,7 @@ async function handleFetch(request) {
     hasRange = headers && typeof headers === 'object'
       ? Object.keys(headers).some((k) => String(k).toLowerCase() === 'range')
       : false;
-    console.log(`[relay] protocol=${PROTOCOL_VERSION} upstreamMethod=${method} targetHost=${targetHostForLog} payloadKeys=${payloadKeys} contentType=${request.headers.get('content-type')} bodyPresent=${bodyPresent} bodyType=${bodyType} headersCount=${headersCount} headersType=${headersType} hasRange=${hasRange}`);
+    console.log(`[relay] protocol=${protocolVersion} upstreamMethod=${method} targetHost=${targetHostForLog} payloadKeys=${payloadKeys} contentType=${request.headers.get('content-type')} bodyPresent=${bodyPresent} bodyType=${bodyType} headersCount=${headersCount} headersType=${headersType} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)}`);
   } catch {}
   let target;
   try {
@@ -151,7 +156,7 @@ async function handleFetch(request) {
       method,
       headers: outHeaders,
       body: method === 'GET' || method === 'HEAD' ? undefined : body,
-      redirect: 'follow',
+      redirect: protocolVersion === COOKIE_PROTOCOL_VERSION ? 'manual' : 'follow',
     });
 
     // Streaming mode (v1.1): pipe the upstream response through UNBUFFERED —
@@ -190,7 +195,7 @@ async function handleFetch(request) {
         headers: responseHeaders,
         body: btoa(binary),
         finalUrl: upstream.url,
-        protocolVersion: PROTOCOL_VERSION,
+        protocolVersion,
       },
       200
     );
@@ -215,7 +220,7 @@ async function handleFetch(request) {
         }
       }
       const kind = classifyUpstreamError(message, causeCode);
-      console.log(`[relay] event=upstream_fetch_failed upstreamMethod=${method} targetHost=${targetHostForLog} hasRange=${hasRange} errorName=${errorName}${causeCode ? ` cause=${causeCode}` : ''} kind=${kind} message=${JSON.stringify(message.slice(0, 200))}`);
+      console.log(`[relay] event=upstream_fetch_failed upstreamMethod=${method} targetHost=${targetHostForLog} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)} errorName=${errorName}${causeCode ? ` cause=${causeCode}` : ''} kind=${kind}`);
       return json({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION', reason: errorName, kind, ...(causeCode ? { cause: causeCode } : {}) }, 502);
     } catch {}
     return json({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION', reason: errorName }, 502);

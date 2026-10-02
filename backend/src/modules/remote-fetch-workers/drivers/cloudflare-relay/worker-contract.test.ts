@@ -19,6 +19,7 @@ import { loadRelaySource } from '../cloudflare-relay.js'
 import {
   RELAY_FETCH_PATH,
   RELAY_PROTOCOL_VERSION,
+  RELAY_COOKIE_PROTOCOL_VERSION,
   RELAY_SIGNATURE_HEADER,
   serializeRelayRequest,
 } from '../../relay-protocol.js'
@@ -152,6 +153,23 @@ describe('serializer → worker.mjs parser (real artifact, real serializer)', ()
     expect(json.finalUrl).toBe(`${upstreamUrl}/final.m3u8`)
     // The relay (not the backend transport) performed the redirect hop.
     expect(upstreamHits.some((site) => site.url === '/redirect-to-final')).toBe(true)
+  })
+
+  it('Cookie-safe protocol returns a same-origin redirect without following it', async () => {
+    const payload = { protocolVersion: RELAY_COOKIE_PROTOCOL_VERSION, url: `${upstreamUrl}/redirect-to-final`, method: 'GET' as const, headers: { Cookie: 'session=private-value' }, response: 'stream' as const }
+    const before = upstreamHits.length
+    const res = await worker.fetch(buildRequest(payload), { RELAY_SECRET: SECRET })
+    expect(res.headers.get('x-9drive-upstream-status')).toBe('302')
+    expect(res.headers.get('location')).toBe('/final.m3u8')
+    expect(upstreamHits.slice(before).map((hit) => hit.url)).toEqual(['/redirect-to-final'])
+    expect(JSON.stringify([...res.headers])).not.toContain('private-value')
+    await res.body?.cancel()
+  })
+
+  it('rejects Cookie on the old protocol', async () => {
+    expect(() => serializeRelayRequest({ protocolVersion: RELAY_PROTOCOL_VERSION, url: `${upstreamUrl}/sample.m3u8`, method: 'GET', headers: { Cookie: 'session=private-value' } })).toThrow()
+    const res = await worker.fetch(buildRawRequest({ protocolVersion: RELAY_PROTOCOL_VERSION, url: `${upstreamUrl}/sample.m3u8`, method: 'GET', headers: { Cookie: 'session=private-value' } }), { RELAY_SECRET: SECRET })
+    expect(res.status).toBe(400)
   })
 
   it('response:"stream" pipes raw upstream bytes with metadata headers (no envelope)', async () => {

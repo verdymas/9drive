@@ -2,7 +2,7 @@
  * 9Drive Browser Capture — MV3 service worker.
  *
  * Detects media/document resources via chrome.webRequest (observational only —
- * it never reads bodies or cookies), classifies them with classify.js, keeps a
+ * it never reads bodies), classifies them with classify.js, keeps a
  * local pending list + badge, and syncs detections to the 9Drive backend.
  * The extension NEVER downloads file bytes; import goes through the backend's
  * Remote Import pipeline.
@@ -13,6 +13,7 @@ import { addCapture, allCaptures, clearAllCaptures, countPending, displayUrlOf, 
 import { isTypeAllowed } from './filters.js'
 import { getConfig, heartbeat, submitResource, deleteServerResource, setConfig, resolveApiRoot, requestTo } from './api.js'
 import { formatDebugReport } from './media-identity.js'
+import { RequestHeaderTracker } from './request-headers.js'
 
 const EXT_VERSION = chrome.runtime.getManifest().version
 
@@ -23,18 +24,36 @@ const EXT_VERSION = chrome.runtime.getManifest().version
 // details.url remains the primary source).
 
 const requestOrigins = new Map()
+const requestHeaders = new RequestHeaderTracker()
 
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     if (details.type !== 'media' && details.type !== 'xmlhttprequest' && details.type !== 'object' && details.type !== 'other') return
-    requestOrigins.set(details.requestId, { originalUrl: details.url, ts: Date.now() })
+    if (!requestOrigins.has(details.requestId)) requestOrigins.set(details.requestId, { originalUrl: details.url, ts: Date.now() })
     if (requestOrigins.size > 500) {
       const cutoff = Date.now() - 60_000
       for (const [id, e] of requestOrigins) { if (e.ts < cutoff) requestOrigins.delete(id) }
+      while (requestOrigins.size > 500) requestOrigins.delete(requestOrigins.keys().next().value)
     }
   },
   { urls: ['http://*/*', 'https://*/*'] },
 )
+
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    if (details.type !== 'media' && details.type !== 'xmlhttprequest' && details.type !== 'object' && details.type !== 'other') return
+    requestHeaders.record(details.requestId, details.url, details.requestHeaders)
+  },
+  { urls: ['http://*/*', 'https://*/*'] },
+  ['requestHeaders', 'extraHeaders'],
+)
+
+for (const event of [chrome.webRequest.onCompleted, chrome.webRequest.onErrorOccurred]) {
+  event.addListener((details) => {
+    requestHeaders.clear(details.requestId)
+    requestOrigins.delete(details.requestId)
+  }, { urls: ['http://*/*', 'https://*/*'] })
+}
 
 // ── Context menu (Phase 06) ─────────────────────────────────────────────────
 
@@ -94,6 +113,9 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 chrome.webRequest.onHeadersReceived.addListener(
   async (details) => {
     if (details.type !== 'media' && details.type !== 'xmlhttprequest' && details.type !== 'object' && details.type !== 'other') return
+    // Snapshot before the first await; completion may clear the transient map.
+    const observedContext = requestHeaders.snapshot(details.requestId, details.url)
+    const originalUrl = requestOrigins.get(details.requestId)?.originalUrl || details.url
     const headers = new Map((details.responseHeaders ?? []).map((h) => [h.name.toLowerCase(), h.value]))
     const mimeHeader = headers.get('content-type')
     const cls = classifyResource(details.url, mimeHeader)
@@ -105,11 +127,10 @@ chrome.webRequest.onHeadersReceived.addListener(
     if (!isTypeAllowed(cls.type, cfg.captureFilters)) return // capture filter disabled this type
 
     const pageUrl = details.originUrl ?? details.initiator ?? null
-    // Safe request context only (spec Phase 04): the referrer page as Referer
-    // and its origin. Cookie/Authorization are NEVER read — webRequest only
-    // exposes them with the (undeclared here) extra permission, and the
-    // backend's strict schema would reject them anyway.
+    // Cookie and User-Agent come only from this exact media request.
     const safeContext = {}
+    if (observedContext?.cookie) safeContext.cookie = observedContext.cookie
+    if (observedContext?.userAgent) safeContext.userAgent = observedContext.userAgent
     if (pageUrl) {
       try {
         const p = new URL(pageUrl)
@@ -146,9 +167,6 @@ chrome.webRequest.onHeadersReceived.addListener(
         downloadAttr = dlData[dlKey] ?? null
       } catch { /* ignore */ }
     }
-
-    const originEntry = requestOrigins.get(details.requestId)
-    const originalUrl = originEntry?.originalUrl || finalUrl
 
     // Quality hint: the media element's real resolution (content script) beats
     // a number scraped from the URL basename.

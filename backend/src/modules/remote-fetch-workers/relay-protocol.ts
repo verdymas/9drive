@@ -7,6 +7,7 @@ import { z } from 'zod'
  */
 
 export const RELAY_PROTOCOL_VERSION = '9drive-relay-v1' as const
+export const RELAY_COOKIE_PROTOCOL_VERSION = '9drive-relay-v2-cookie' as const
 export const RELAY_HEALTH_PATH = '/health' as const
 export const RELAY_FETCH_PATH = '/fetch' as const
 export const RELAY_SIGNATURE_HEADER = 'x-9drive-signature' as const
@@ -27,12 +28,16 @@ export const UPSTREAM_STATUS_HEADER = 'x-9drive-upstream-status'
 export const FINAL_URL_HEADER = 'x-9drive-final-url'
 
 export const RelayFetchRequestSchema = z.object({
-  protocolVersion: z.literal(RELAY_PROTOCOL_VERSION),
+  protocolVersion: z.enum([RELAY_PROTOCOL_VERSION, RELAY_COOKIE_PROTOCOL_VERSION]),
   url: z.string().url(),
   method: z.enum(['GET', 'HEAD', 'POST']),
   headers: z.record(z.string(), z.string()),
   body: z.string().optional(),
   response: z.enum(['stream']).optional(),
+}).superRefine((request, ctx) => {
+  if (request.protocolVersion === RELAY_PROTOCOL_VERSION && Object.keys(request.headers).some((name) => name.toLowerCase() === 'cookie')) {
+    ctx.addIssue({ code: 'custom', path: ['protocolVersion'], message: 'Cookie requires the Cookie-safe relay protocol.' })
+  }
 })
 
 export type RelayFetchRequest = z.infer<typeof RelayFetchRequestSchema>
@@ -42,7 +47,7 @@ export const RelayFetchResponseSchema = z.object({
   statusText: z.string().optional(),
   headers: z.record(z.string(), z.string()),
   body: z.string(), // base64
-  protocolVersion: z.literal('9drive-relay-v1'),
+  protocolVersion: z.enum([RELAY_PROTOCOL_VERSION, RELAY_COOKIE_PROTOCOL_VERSION]),
 })
 
 export type RelayFetchResponse = z.infer<typeof RelayFetchResponseSchema>

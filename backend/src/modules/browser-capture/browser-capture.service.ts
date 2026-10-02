@@ -221,8 +221,7 @@ export async function submitCapturedResource(input: SubmitResourceInput) {
   const pageTitle = input.pageTitle ? input.pageTitle.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 512) : null
   const mediaIdentity = sanitizeMediaIdentity(input.mediaIdentity)
 
-  // Cookie never crosses the capture boundary — strip before validation.
-  const requestContext = validateRequestContext(stripSensitiveContext(input.requestContext))
+  const requestContext = validateRequestContext(input.requestContext)
 
   const existing = await prisma.capturedResource.findFirst({
     where: { userId: input.userId, displayUrl, type: input.type, status: 'pending' },
@@ -234,9 +233,10 @@ export async function submitCapturedResource(input: SubmitResourceInput) {
       data: {
         detectedAt: new Date(),
         expiresAt: new Date(Date.now() + CAPTURED_RESOURCE_TTL_MS),
+        urlEncrypted: encryptText(parsedUrl.href),
         // A re-detection may carry a fresher page title / context.
         pageTitle: pageTitle ?? existing.pageTitle,
-        requestContextEncrypted: requestContext ? encryptRequestContext(requestContext) : existing.requestContextEncrypted,
+        requestContextEncrypted: requestContext ? encryptRequestContext(requestContext) : null,
         // Phase 14: only upgrade identity fields when the new value has a
         // higher confidence than the existing one. A null/lower-confidence
         // incoming value never overwrites a richer record.
@@ -270,15 +270,6 @@ export async function submitCapturedResource(input: SubmitResourceInput) {
     },
   })
   return serializeCapturedResource(row)
-}
-
-function stripSensitiveContext(ctx: Partial<RemoteImportRequestContext> | null | undefined): Partial<RemoteImportRequestContext> | null {
-  if (!ctx || typeof ctx !== 'object') return null
-  const safe: Partial<RemoteImportRequestContext> = {}
-  if (ctx.referer != null) safe.referer = ctx.referer
-  if (ctx.origin != null) safe.origin = ctx.origin
-  if (ctx.userAgent != null) safe.userAgent = ctx.userAgent
-  return Object.keys(safe).length > 0 ? safe : null
 }
 
 /** Strip path separators/control chars; cap length; keep a non-empty fallback. */

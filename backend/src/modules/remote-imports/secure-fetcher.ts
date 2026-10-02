@@ -45,17 +45,17 @@ export class SecureRemoteFetcher {
 
   /** Convenience for HEAD probe */
   async head(url: string, opts: { headers?: Record<string, string>; requestContext?: RemoteImportRequestContext | null; sourceUrl?: string } = {}): Promise<RemoteFetchResponse & { finalUrl?: string }> {
-    return this.fetch({ method: 'HEAD', url, headers: opts.headers, requestContext: opts.requestContext as any, maxBytes: 0 } as any)
+    return this.fetch({ method: 'HEAD', url, headers: opts.headers, requestContext: opts.requestContext as any, sourceUrl: opts.sourceUrl, maxBytes: 0 } as any)
   }
 
   /** Convenience for ranged GET (bytes=0-0) */
   async rangedGet(url: string, opts: { headers?: Record<string, string>; requestContext?: RemoteImportRequestContext | null; sourceUrl?: string } = {}): Promise<RemoteFetchResponse & { finalUrl?: string }> {
-    return this.fetch({ method: 'GET', url, headers: opts.headers, range: 'bytes=0-0', requestContext: opts.requestContext as any } as any)
+    return this.fetch({ method: 'GET', url, headers: opts.headers, range: 'bytes=0-0', requestContext: opts.requestContext as any, sourceUrl: opts.sourceUrl } as any)
   }
 
   /** Bounded GET for manifests (string body) */
   async boundedGet(url: string, opts: { headers?: Record<string, string>; maxBytes?: number; signal?: AbortSignal; requestContext?: RemoteImportRequestContext | null; sourceUrl?: string } = {}): Promise<{ status: number; headers: Record<string, string>; body: string; finalUrl: string }> {
-    const res = await this.fetch({ method: 'GET', url, headers: opts.headers, maxBytes: opts.maxBytes, requestContext: opts.requestContext as any, timeoutMs: opts.signal ? 10000 : undefined } as any)
+    const res = await this.fetch({ method: 'GET', url, headers: opts.headers, maxBytes: opts.maxBytes, requestContext: opts.requestContext as any, sourceUrl: opts.sourceUrl, timeoutMs: opts.signal ? 10000 : undefined } as any)
     // Collect body as string (manifests are small)
     let body = ''
     if (typeof res.body === 'string') {
@@ -78,7 +78,7 @@ export class SecureRemoteFetcher {
 
   /** Download a resource to a local file via transport */
   async downloadToFile(url: string, targetPath: string, opts: { maxBytes?: bigint; signal?: AbortSignal; requestContext?: RemoteImportRequestContext | null; sourceUrl?: string; kind?: string } = {}): Promise<bigint> {
-    const res = await this.fetch({ method: 'GET', url, requestContext: opts.requestContext as any } as any)
+    const res = await this.fetch({ method: 'GET', url, requestContext: opts.requestContext as any, sourceUrl: opts.sourceUrl } as any)
     if (res.status === 401 || res.status === 403) {
       if (opts.requestContext) {
         throw new AppError('REMOTE_SOURCE_ACCESS_EXPIRED', 'The source access has expired. Please capture a fresh request.', res.status)
@@ -170,6 +170,8 @@ export async function createSecureFetcherForWorkerId(
   if (anyTransport.opts) {
     anyTransport.opts.workerId = workerId
     anyTransport.opts.driver = worker.driver
+    anyTransport.opts.sourceUrl = opts.sourceUrl
+    anyTransport.opts.requestContext = opts.requestContext
   }
   return new SecureRemoteFetcher(transport, { route: 'worker', workerId: worker.id, driver: worker.driver, relayHost })
 }
@@ -206,6 +208,8 @@ export function createSecureFetcherForWorker(
   if (anyTransport.opts) {
     anyTransport.opts.workerId = worker.id
     anyTransport.opts.driver = worker.driver
+    anyTransport.opts.sourceUrl = opts.sourceUrl
+    anyTransport.opts.requestContext = opts.requestContext
   }
   return new SecureRemoteFetcher(transport, { route: 'worker', workerId: worker.id, driver: worker.driver, relayHost })
 }

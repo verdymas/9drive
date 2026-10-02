@@ -115,7 +115,7 @@ export function submitResource(entry) {
       // The full candidate list stays in the extension; the backend stores only
       // the winner and surfaces it in the Remote Imports UI.
       mediaIdentity: entry.mediaIdentity ?? null,
-      // Safe context only — the backend's strict schema rejects cookie/keys.
+      // The backend validates the allowlisted context and stores it encrypted.
       requestContext: entry.requestContext ?? null,
     },
   })

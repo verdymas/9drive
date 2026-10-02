@@ -39,6 +39,7 @@ export type RemoteFetchRequest = {
   range?: string
   body?: string
   requestContext?: Record<string, string>
+  sourceUrl?: string
   maxBytes?: number
   timeoutMs?: number
 }

@@ -18,3 +18,9 @@ A Cloudflare Worker only fetches/relays resources according to the relay protoco
 - `CLOUDFLARE_API_BASE`
 - `CLOUDFLARE_DEPLOY_TIMEOUT_SECONDS`
 - per-worker credentials/configuration are stored encrypted in the database.
+
+## Cookie forwarding
+
+Cookie-bearing imports use `9drive-relay-v2-cookie`. The Worker returns upstream redirects without following them; the backend validates every hop and recomputes Cookie against the original import source origin. HLS child requests use the same origin anchor. Requests without Cookie retain the v1 protocol.
+
+Existing deployed relays must be redeployed before Cookie-bearing imports can use them. Older relays reject the new protocol; they continue to serve imports without Cookie.

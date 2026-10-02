@@ -24,7 +24,7 @@ downloads file bytes and never runs FFmpeg — it is a capture client only.
 - `contextMenus` — reserved for the Phase 06 context-menu actions.
 - `host_permissions (http/https)` — required by `chrome.webRequest` to observe
   response headers for media detection on any page. The extension reads
-  **headers only** (Content-Type), never bodies, cookies, or Authorization
+  **headers only** (Content-Type and the matching request's Cookie and User-Agent), never bodies or Authorization
   values, and never logs URLs' query strings.
 
 ## Tests

@@ -43,3 +43,9 @@ Import bridge:
 
 ## Build
 The backend build runs `scripts/zip-extension.mjs` so the extension artifact can be served from `/browser-capture/extension.zip`.
+
+## Authenticated requests
+
+The extension observes Cookie and User-Agent on the matching media request through `webRequest` with `extraHeaders`. Cookie stays in short-lived service-worker memory and goes only in the device-authenticated submission. It is absent from local captures, popup messages, and logs. A failed offline submission loses that context; capture the request again after reconnecting.
+
+The API validates the allowlisted request context and stores it encrypted for Remote Import. Resource and import responses report header presence as booleans. Cookie is forwarded only to the exact origin of the original import URL, including its scheme and port.

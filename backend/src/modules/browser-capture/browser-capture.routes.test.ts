@@ -147,7 +147,7 @@ import { browserCaptureRouter } from './browser-capture.routes.js'
 import { errorMiddleware } from '../../middleware/error.middleware.js'
 import { resetRateLimits } from './rate-limit.middleware.js'
 import { AppError } from '../../utils/app-error.js'
-import { hashToken, randomToken, encryptText } from '../../utils/crypto.js'
+import { hashToken, randomToken, encryptText, decryptText } from '../../utils/crypto.js'
 import { encryptRequestContext } from '../remote-imports/request-context.js'
 
 let app: express.Express
@@ -267,33 +267,43 @@ describe('captured resource submission + validation', () => {
     expect(res.status).toBe(400)
   })
 
-  it('rejects cookie-bearing context outright (never accepted, never stored)', async () => {
+  it('encrypts Cookie, returns booleans, and clears it on a later cookieless detection', async () => {
     const { token } = await seedDevice()
     const res = await call('POST', '/resources', {
       url: 'https://x.example.com/a.m3u8',
       type: 'hls',
-      requestContext: { cookie: 'session=stealer', referer: 'https://x.example.com/' } as any,
+      requestContext: { cookie: 'session=private-value', referer: 'https://x.example.com/' },
     }, token)
-    // Strict schema: cookies are REJECTED at the boundary, not silently stripped.
-    expect(res.status).toBe(400)
+    expect(res.status).toBe(201)
+    expect(res.body.requestContext).toEqual({ attached: true, referer: true, origin: false, userAgent: false, cookie: true })
+    expect(JSON.stringify(res.body)).not.toContain('private-value')
+    expect(h.resources[0].requestContextEncrypted).not.toContain('private-value')
     const ok = await call('POST', '/resources', {
       url: 'https://x.example.com/a.m3u8',
       type: 'hls',
       requestContext: { referer: 'https://x.example.com/', userAgent: 'Mozilla/5.0' },
     }, token)
     expect(ok.status).toBe(201)
+    expect(ok.body.id).toBe(res.body.id)
     expect(ok.body.requestContext).toEqual({ attached: true, referer: true, origin: false, userAgent: true, cookie: false })
+    expect(JSON.stringify(ok.body)).not.toContain('private-value')
+    expect(h.resources[0].requestContextEncrypted).not.toContain('private-value')
+    const listed = await call('GET', '/resources', undefined, token)
+    expect(listed.body.items[0].requestContext.cookie).toBe(false)
+    const rejected = await call('POST', '/resources', { url: 'https://x.example.com/b.mp4', type: 'video', requestContext: { authorization: 'Bearer secret' } }, token)
+    expect(rejected.status).toBe(400)
   })
 
   it('dedupes re-detected URLs by refreshing instead of duplicating', async () => {
     const { token } = await seedDevice()
-    const payload = { url: 'https://cdn.example.com/hls/master.m3u8', type: 'hls' }
+    const payload = { url: 'https://cdn.example.com/hls/master.m3u8?sig=old', type: 'hls' }
     const first = await call('POST', '/resources', payload, token)
-    const second = await call('POST', '/resources', payload, token)
+    const second = await call('POST', '/resources', { ...payload, url: 'https://cdn.example.com/hls/master.m3u8?sig=fresh' }, token)
     expect(first.status).toBe(201)
     expect(second.status).toBe(201)
     expect(second.body.id).toBe(first.body.id)
     expect(h.resources.length).toBe(1)
+    expect(decryptText(h.resources[0].urlEncrypted)).toBe('https://cdn.example.com/hls/master.m3u8?sig=fresh')
   })
 })
 
@@ -509,7 +519,7 @@ describe('import via Remote Import pipeline (Phase 03)', () => {
     expect(res.status).toBe(201)
     // Probe used the SAME selected worker — no Direct shortcut.
     expect(hProbe.probeRemoteUrl).toHaveBeenCalledWith(
-      'https://stream.example.com/master.m3u8?tok=1', row.id, undefined, { workerId: 'wk-hls' },
+      'https://stream.example.com/master.m3u8?tok=1', row.id, undefined, { workerId: 'wk-hls', capturedType: 'hls' },
     )
     // sourceType persisted via the hls options → processor routes to the HLS pipeline.
     expect(hImport.createRemoteImport).toHaveBeenCalledWith(expect.objectContaining({
@@ -544,17 +554,17 @@ describe('import via Remote Import pipeline (Phase 03)', () => {
     expect(row.status).toBe('pending')
   })
 
-  it('probe refuting HLS (direct_file) fails without consuming the capture', async () => {
+  it('probe refuting HLS (direct_file) reclassifies and imports the capture', async () => {
     hProbe.probeRemoteUrl.mockImplementation(async () => ({
       sourceType: 'direct_file', hls: null,
       fileName: 'x.bin', mimeType: null, finalUrl: '', originalUrl: '', contentLength: null, supportsRange: false, sourceUrlForFetch: '',
     }))
     const row = await seedResource({ type: 'hls' })
     const res = await call('POST', `/resources/${row.id}/import`, {})
-    expect(res.status).toBe(400)
-    expect(res.body.code).toBe('CAPTURE_NOT_HLS')
-    expect(hImport.createRemoteImport).not.toHaveBeenCalled()
-    expect(row.status).toBe('pending')
+    expect(res.status).toBe(201)
+    expect(hImport.createRemoteImport).toHaveBeenCalledWith(expect.objectContaining({ mimeType: 'video/mp4' }))
+    expect(hImport.createRemoteImport.mock.calls[0][0]).not.toHaveProperty('hls')
+    expect(row.status).toBe('consumed')
   })
 
   it('probe failure (typed AppError) surfaces and leaves the capture retryable', async () => {

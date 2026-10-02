@@ -5,7 +5,7 @@ import crypto from 'node:crypto'
 import { AppError } from '../../../utils/app-error.js'
 import { CloudflareRemoteFetchTransport } from './cloudflare-transport.js'
 import { DirectRemoteFetchTransport } from './direct-transport.js'
-import { serializeRelayRequest, parseRelayRequest, RELAY_PROTOCOL_VERSION, RELAY_SIGNATURE_HEADER } from '../relay-protocol.js'
+import { serializeRelayRequest, parseRelayRequest, RELAY_PROTOCOL_VERSION, RELAY_COOKIE_PROTOCOL_VERSION, RELAY_SIGNATURE_HEADER } from '../relay-protocol.js'
 import { REMOTE_FETCH_WORKER_ERROR_CODES } from '../errors.js'
 
 const validationSpy = vi.hoisted(() => ({
@@ -235,7 +235,7 @@ describe('CloudflareRemoteFetchTransport via mock relay', () => {
           res.end(JSON.stringify({ error: 'invalid payload', reason: 'MISSING_PROTOCOL' }))
           return
         }
-        if (protocolVersion !== RELAY_PROTOCOL_VERSION) {
+        if (protocolVersion !== RELAY_PROTOCOL_VERSION && protocolVersion !== RELAY_COOKIE_PROTOCOL_VERSION) {
           res.writeHead(400, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ error: 'invalid payload', reason: 'INVALID_PROTOCOL' }))
           return
@@ -305,7 +305,7 @@ describe('CloudflareRemoteFetchTransport via mock relay', () => {
             method,
             headers: headers as Record<string, string>,
             body: method === 'GET' || method === 'HEAD' ? undefined : b,
-            redirect: 'follow',
+            redirect: protocolVersion === RELAY_COOKIE_PROTOCOL_VERSION ? 'manual' : 'follow',
           })
           const buf = Buffer.from(await upstreamRes.arrayBuffer())
           const respHeaders: Record<string, string> = {}
@@ -318,7 +318,7 @@ describe('CloudflareRemoteFetchTransport via mock relay', () => {
               headers: respHeaders,
               body: buf.toString('base64'),
               finalUrl: upstreamRes.url,
-              protocolVersion: RELAY_PROTOCOL_VERSION,
+              protocolVersion,
             }),
           )
         } catch {

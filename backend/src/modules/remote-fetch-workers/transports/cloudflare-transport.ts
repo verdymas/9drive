@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { env } from '../../../config/env.js'
 import { AppError } from '../../../utils/app-error.js'
 import { validateRemoteUrl } from '../../remote-imports/ssrf.js'
 import { hopHeaderResolver, type RemoteImportRequestContext } from '../../remote-imports/request-context.js'
@@ -6,6 +7,7 @@ import type { RemoteFetchRequest, RemoteFetchResponse, RemoteFetchTransport } fr
 import {
   RELAY_FETCH_PATH,
   RELAY_PROTOCOL_VERSION,
+  RELAY_COOKIE_PROTOCOL_VERSION,
   RELAY_SIGNATURE_HEADER,
   serializeRelayRequest,
 } from '../relay-protocol.js'
@@ -68,152 +70,168 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
       secret: string
       workerId?: string
       driver?: string
+      sourceUrl?: string
+      requestContext?: RemoteImportRequestContext | null
     },
   ) {}
 
   async request(input: RemoteFetchRequest): Promise<RemoteFetchResponse> {
-    const targetUrl = input.url
-    // URL syntax/policy validation before relaying (scheme, credentials,
-    // literal-IP blocklist). The relay edge — Cloudflare Workers fetch — is
-    // the DNS/IP enforcement point for the relayed hostname, so the backend
-    // must NOT resolve the target here (strict-firewall hosts may be
-    // unresolvable from the backend even though the relay can reach them).
-    await validateRemoteUrl(targetUrl, { resolveDns: false })
-
-    const endpoint = this.opts.endpointUrl.replace(/\/$/, '')
-    const relayUrl = `${endpoint}/fetch`
-    const relayHost = (() => {
-      try {
-        return new URL(endpoint).hostname
-      } catch {
-        return endpoint
-      }
-    })()
-    const targetHost = (() => {
-      try {
-        return new URL(targetUrl).hostname
-      } catch {
-        return ''
-      }
-    })()
-
-    // Safe diagnostics — never log URL query, cookie, or HMAC
-    const upstreamMethod = input.method ?? 'GET'
-    const relayMethod = 'POST'
-    const contentType = 'application/json'
-    console.log(
-      `[remote-import:transport] protocol=${RELAY_PROTOCOL_VERSION} route=worker workerId=${this.opts.workerId ?? 'unknown'} driver=${this.opts.driver ?? 'cloudflare'} relayHost=${relayHost} targetHost=${targetHost} relayMethod=${relayMethod} upstreamMethod=${upstreamMethod} contentType=${contentType}`,
-    )
-
-    const method = upstreamMethod
-    // Header parity with the Direct transport: baseline defaults, then the
-    // caller's headers, then Range, then the request-context for the initial
-    // hop. The same header set is reused verbatim on every retry.
-    const reqHeaders: Record<string, string> = {
-      Accept: '*/*',
-      'User-Agent': '9Drive-RemoteImport/1.0',
-      ...(input.headers ?? {}),
-    }
-    if (input.range) reqHeaders['Range'] = input.range
-    // Merge request-context headers for the initial hop (cookie scoped to source)
-    const rc = (input as any).requestContext as RemoteImportRequestContext | undefined
-    if (rc) {
-      try {
-        const hopHeaders = hopHeaderResolver(targetUrl, rc)?.(new URL(targetUrl))
-        if (hopHeaders) Object.assign(reqHeaders, hopHeaders)
-      } catch {}
-    }
-    // Optional body: omit when not provided (HEAD/GET). Relay expects body?: string, not body:null.
-    const rawBody = (input.body as unknown) as string | undefined | null
-    const hasBody = rawBody !== undefined && rawBody !== null && rawBody !== ''
-    const bodyValue = hasBody ? String(rawBody) : undefined
-    const payload: Record<string, unknown> = {
-      protocolVersion: RELAY_PROTOCOL_VERSION,
-      url: targetUrl,
-      method,
-      headers: reqHeaders,
-      // Streaming mode (v1.1): the relay pipes the upstream response through
-      // unbuffered — large files no longer hit the Worker memory ceiling.
-      // Older relays ignore the key and answer the v1 envelope; the attempt
-      // parser falls back transparently.
-      response: 'stream',
-      ...(bodyValue !== undefined ? { body: bodyValue } : {}),
-    }
-    // Canonical serialization — drifts are caught by Zod (single source of truth: relay-protocol.ts)
-    let payloadText: string
-    try {
-      payloadText = serializeRelayRequest(payload as any)
-    } catch (e) {
-      throw new AppError(
-        REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_RELAY_PROTOCOL_ERROR,
-        REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_RELAY_PROTOCOL_ERROR,
-        400,
-      )
-    }
-    // Safe payload-shape diagnostics — header NAMES/types only, never values.
-    const payloadKeys = Object.keys(payload).sort().join(',')
-    const payloadForLog = payload as any
-    const urlType = typeof payloadForLog.url
-    const methodType = typeof payloadForLog.method
-    const headersType = typeof payloadForLog.headers
-    const headersCount = payloadForLog.headers && typeof payloadForLog.headers === 'object' ? Object.keys(payloadForLog.headers as Record<string, unknown>).length : 0
-    const headerNames = Object.keys(reqHeaders).map((h) => h.toLowerCase()).sort().join(',')
-    const hasRange = headerNames.includes('range')
-    const hasReferer = headerNames.includes('referer')
-    const hasOrigin = headerNames.includes('origin')
-    const hasCookie = headerNames.includes('cookie')
-    const bodyPresent = 'body' in payload
-    const bodyType = typeof (payloadForLog as any).body
-    console.log(
-      `[remote-import:transport] protocol=${RELAY_PROTOCOL_VERSION} route=worker relayMethod=${relayMethod} upstreamMethod=${upstreamMethod} payloadKeys=${payloadKeys} urlType=${urlType} methodType=${methodType} headersType=${headersType} headersCount=${headersCount} headerNames=${headerNames} hasRange=${hasRange} hasReferer=${hasReferer} hasOrigin=${hasOrigin} hasCookie=${hasCookie} bodyPresent=${bodyPresent} bodyType=${bodyType} targetHost=${targetHost}`,
-    )
-    console.log(
-      `[remote-import:transport] protocol=${RELAY_PROTOCOL_VERSION} payloadKeys=${payloadKeys} contentType=${contentType} targetHost=${targetHost} bodyPresent=${bodyPresent}`,
-    )
-
-    const signature = signForRelay(this.opts.secret, relayMethod, RELAY_FETCH_PATH)
-    const retryable = method === 'GET' || method === 'HEAD'
-    const relayId = `workerId=${this.opts.workerId ?? 'unknown'} driver=${this.opts.driver ?? 'cloudflare'} relayHost=${relayHost} targetHost=${targetHost} upstreamMethod=${method}`
-
-    let attempt = 0
+    let targetUrl = input.url
+    const sourceUrl = this.opts.sourceUrl ?? input.sourceUrl ?? input.url
+    const rc = (input.requestContext as RemoteImportRequestContext | undefined) ?? this.opts.requestContext ?? null
+    const cookieSafe = Boolean(rc?.cookie || Object.keys(input.headers ?? {}).some((name) => name.toLowerCase() === 'cookie'))
+    const protocolVersion = cookieSafe ? RELAY_COOKIE_PROTOCOL_VERSION : RELAY_PROTOCOL_VERSION
+    let redirectCount = 0
     for (;;) {
-      attempt += 1
-      const outcome = await this.relayAttempt({
-        relayUrl,
-        payloadText,
-        signature,
-        targetUrl,
-        relayId,
-        attempt,
-        timeoutMs: input.timeoutMs,
-      })
+      // URL syntax/policy validation before relaying (scheme, credentials,
+      // literal-IP blocklist). The relay edge — Cloudflare Workers fetch — is
+      // the DNS/IP enforcement point for the relayed hostname, so the backend
+      // must NOT resolve the target here (strict-firewall hosts may be
+      // unresolvable from the backend even though the relay can reach them).
+      await validateRemoteUrl(targetUrl, { resolveDns: false })
 
-      if (outcome.kind === 'ok') {
-        // Upstream server responded with a transient 5xx THROUGH the relay —
-        // retry the whole idempotent request; after exhaustion return the last
-        // response so the caller maps its status.
-        if (retryable && attempt < MAX_RELAY_ATTEMPTS && RETRYABLE_UPSTREAM_STATUSES.has(outcome.status)) {
-          console.error(`[remote-import:transport] retryable upstream status=${outcome.status} attempt=${attempt} ${relayId}`)
+      const endpoint = this.opts.endpointUrl.replace(/\/$/, '')
+      const relayUrl = `${endpoint}/fetch`
+      const relayHost = (() => {
+        try {
+          return new URL(endpoint).hostname
+        } catch {
+          return endpoint
+        }
+      })()
+      const targetHost = (() => {
+        try {
+          return new URL(targetUrl).hostname
+        } catch {
+          return ''
+        }
+      })()
+
+      // Safe diagnostics — never log URL query, cookie, or HMAC
+      const upstreamMethod = input.method ?? 'GET'
+      const relayMethod = 'POST'
+      const contentType = 'application/json'
+      console.log(
+        `[remote-import:transport] protocol=${protocolVersion} route=worker workerId=${this.opts.workerId ?? 'unknown'} driver=${this.opts.driver ?? 'cloudflare'} relayHost=${relayHost} targetHost=${targetHost} relayMethod=${relayMethod} upstreamMethod=${upstreamMethod} contentType=${contentType}`,
+      )
+
+      const method = upstreamMethod
+      // Header parity with the Direct transport: baseline defaults, then the
+      // caller's headers, then Range, then the request-context for the initial
+      // hop. The same header set is reused verbatim on every retry.
+      const reqHeaders: Record<string, string> = {
+        Accept: '*/*',
+        'User-Agent': '9Drive-RemoteImport/1.0',
+        ...Object.fromEntries(Object.entries(input.headers ?? {}).filter(([name]) => name.toLowerCase() !== 'cookie')),
+      }
+      if (input.range) reqHeaders['Range'] = input.range
+      // Merge request-context headers for the initial hop (cookie scoped to source)
+      if (rc) {
+        try {
+          const hopHeaders = hopHeaderResolver(sourceUrl, rc)?.(new URL(targetUrl))
+          if (hopHeaders) Object.assign(reqHeaders, hopHeaders)
+        } catch {}
+      }
+      // Optional body: omit when not provided (HEAD/GET). Relay expects body?: string, not body:null.
+      const rawBody = (input.body as unknown) as string | undefined | null
+      const hasBody = rawBody !== undefined && rawBody !== null && rawBody !== ''
+      const bodyValue = hasBody ? String(rawBody) : undefined
+      const payload: Record<string, unknown> = {
+        protocolVersion,
+        url: targetUrl,
+        method,
+        headers: reqHeaders,
+        // Streaming mode (v1.1): the relay pipes the upstream response through
+        // unbuffered — large files no longer hit the Worker memory ceiling.
+        // Older relays ignore the key and answer the v1 envelope; the attempt
+        // parser falls back transparently.
+        response: 'stream',
+        ...(bodyValue !== undefined ? { body: bodyValue } : {}),
+      }
+      // Canonical serialization — drifts are caught by Zod (single source of truth: relay-protocol.ts)
+      let payloadText: string
+      try {
+        payloadText = serializeRelayRequest(payload as any)
+      } catch (e) {
+        throw new AppError(
+          REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_RELAY_PROTOCOL_ERROR,
+          REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_RELAY_PROTOCOL_ERROR,
+          400,
+        )
+      }
+      // Safe payload-shape diagnostics — header NAMES/types only, never values.
+      const payloadKeys = Object.keys(payload).sort().join(',')
+      const payloadForLog = payload as any
+      const urlType = typeof payloadForLog.url
+      const methodType = typeof payloadForLog.method
+      const headersType = typeof payloadForLog.headers
+      const headersCount = payloadForLog.headers && typeof payloadForLog.headers === 'object' ? Object.keys(payloadForLog.headers as Record<string, unknown>).length : 0
+      const headerNames = Object.keys(reqHeaders).map((h) => h.toLowerCase()).sort().join(',')
+      const hasRange = headerNames.includes('range')
+      const hasReferer = headerNames.includes('referer')
+      const hasOrigin = headerNames.includes('origin')
+      const hasCookie = headerNames.includes('cookie')
+      const bodyPresent = 'body' in payload
+      const bodyType = typeof (payloadForLog as any).body
+      console.log(
+        `[remote-import:transport] protocol=${protocolVersion} route=worker relayMethod=${relayMethod} upstreamMethod=${upstreamMethod} payloadKeys=${payloadKeys} urlType=${urlType} methodType=${methodType} headersType=${headersType} headersCount=${headersCount} headerNames=${headerNames} hasRange=${hasRange} hasReferer=${hasReferer} hasOrigin=${hasOrigin} hasCookie=${hasCookie} bodyPresent=${bodyPresent} bodyType=${bodyType} targetHost=${targetHost}`,
+      )
+      console.log(
+        `[remote-import:transport] protocol=${protocolVersion} payloadKeys=${payloadKeys} contentType=${contentType} targetHost=${targetHost} bodyPresent=${bodyPresent}`,
+      )
+
+      const signature = signForRelay(this.opts.secret, relayMethod, RELAY_FETCH_PATH)
+      const retryable = method === 'GET' || method === 'HEAD'
+      const relayId = `workerId=${this.opts.workerId ?? 'unknown'} driver=${this.opts.driver ?? 'cloudflare'} relayHost=${relayHost} targetHost=${targetHost} upstreamMethod=${method}`
+
+      let attempt = 0
+      for (;;) {
+        attempt += 1
+        const outcome = await this.relayAttempt({
+          relayUrl,
+          payloadText,
+          signature,
+          targetUrl,
+          relayId,
+          attempt,
+          timeoutMs: input.timeoutMs,
+        })
+
+        if (outcome.kind === 'ok') {
+          if (cookieSafe && outcome.status >= 300 && outcome.status < 400 && outcome.headers.location) {
+            if (outcome.body && typeof outcome.body !== 'string' && 'cancel' in outcome.body) await (outcome.body as ReadableStream<Uint8Array>).cancel().catch(() => undefined)
+            if (redirectCount >= env.REMOTE_IMPORT_MAX_REDIRECTS) throw new AppError('TOO_MANY_REDIRECTS', 'The URL redirected too many times.', 400)
+            targetUrl = new URL(outcome.headers.location, targetUrl).href
+            await validateRemoteUrl(targetUrl, { resolveDns: false })
+            redirectCount += 1
+            break
+          }
+          // Upstream server responded with a transient 5xx THROUGH the relay —
+          // retry the whole idempotent request; after exhaustion return the last
+          // response so the caller maps its status.
+          if (retryable && attempt < MAX_RELAY_ATTEMPTS && RETRYABLE_UPSTREAM_STATUSES.has(outcome.status)) {
+            console.error(`[remote-import:transport] retryable upstream status=${outcome.status} attempt=${attempt} ${relayId}`)
+            await sleep(relayBackoffDelay(attempt))
+            continue
+          }
+          return {
+            status: outcome.status,
+            statusText: outcome.statusText,
+            headers: outcome.headers,
+            body: outcome.body,
+            finalUrl: outcome.finalUrl,
+            redirectCount,
+          } as RemoteFetchResponse & { finalUrl?: string; redirectCount?: number }
+        }
+
+        // Error outcome (code/status/transient already classified).
+        if (retryable && outcome.transient && attempt < MAX_RELAY_ATTEMPTS) {
+          console.error(`[remote-import:transport] retryable ${outcome.code} status=${outcome.status} attempt=${attempt} ${relayId}`)
           await sleep(relayBackoffDelay(attempt))
           continue
         }
-        return {
-          status: outcome.status,
-          statusText: outcome.statusText,
-          headers: outcome.headers,
-          body: outcome.body,
-          finalUrl: outcome.finalUrl,
-          redirectCount: 0,
-        } as RemoteFetchResponse & { finalUrl?: string; redirectCount?: number }
+        throw new AppError(outcome.code, outcome.message, outcome.status)
       }
-
-      // Error outcome (code/status/transient already classified).
-      if (retryable && outcome.transient && attempt < MAX_RELAY_ATTEMPTS) {
-        console.error(`[remote-import:transport] retryable ${outcome.code} status=${outcome.status} attempt=${attempt} ${relayId}`)
-        await sleep(relayBackoffDelay(attempt))
-        continue
-      }
-      throw new AppError(outcome.code, outcome.message, outcome.status)
     }
   }
 
@@ -288,7 +306,7 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
           ? ' — the deployed relay does not match 9Drive\'s relay protocol; delete and re-add the worker to redeploy the current relay.'
           : ''
       console.error(
-        `[remote-import:transport] protocol=${RELAY_PROTOCOL_VERSION} relay protocol error status=400 attempt=${attempt} ${relayId}${reason}`,
+        `[remote-import:transport] relay protocol error status=400 attempt=${attempt} ${relayId}${reason}`,
       )
       return {
         kind: 'error',
