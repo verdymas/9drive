@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { PageHeader } from '@/components/drive/PageHeader'
 import { RemoteImportModal, formatDuration } from '@/components/drive/RemoteImportModal'
+import { RequestContextDialog } from '@/components/drive/RequestContextDialog'
 import { apiFetch, formatBytes, formatDate } from '@/lib/api'
 import {
   accountLabel,
@@ -170,6 +171,7 @@ export function RemoteImportsPage() {
   const [folders, setFolders] = useState<FolderOption[]>([])
   const [workers, setWorkers] = useState<WorkerItem[]>([])
   const [busyId, setBusyId] = useState<string | null>(null)
+  const [contextImport, setContextImport] = useState<RemoteImportItem | null>(null)
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const load = useCallback(async () => {
@@ -359,10 +361,16 @@ export function RemoteImportsPage() {
                         {item.attempt > 1 ? ` · Attempt ${item.attempt}` : ''}
                       </p>
                       {item.requestContext?.attached ? (
-                        <p className="mt-0.5 inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500">
+                        <button
+                          type="button"
+                          className="mt-0.5 inline-flex items-center gap-1.5 rounded-md text-xs font-semibold text-slate-500 underline-offset-2 hover:text-slate-800 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                          onClick={() => setContextImport(item)}
+                          aria-label={`View request context for ${item.fileName}`}
+                        >
                           <Lock className="h-3.5 w-3.5 text-slate-400" />
                           Request context attached
-                        </p>
+                          <span className="font-bold text-blue-600">View</span>
+                        </button>
                       ) : null}
                       {item.workerNameSnapshot ? (
                         <p className="mt-0.5 inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500">
@@ -450,6 +458,12 @@ export function RemoteImportsPage() {
         accounts={accounts}
         folders={folders}
         workers={workers}
+      />
+
+      <RequestContextDialog
+        importId={contextImport?.id ?? null}
+        fileName={contextImport?.fileName ?? null}
+        onClose={() => setContextImport(null)}
       />
     </>
   )

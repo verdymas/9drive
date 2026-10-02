@@ -225,6 +225,29 @@ export function getRemoteImport(id: string) {
   return apiFetch<RemoteImportItem>(`/remote-imports/${id}`)
 }
 
+/**
+ * Owner-only request-context details for a Remote Import (debugging aid).
+ * Kept separate from `RemoteImportItem.requestContext`, which stays
+ * boolean-only. Cookie is masked by default; `revealCookie` fetches the raw
+ * value after an explicit user action. Never cached beyond dialog lifecycle.
+ */
+export type RemoteImportRequestContextDetails = {
+  attached: boolean
+  referer: string | null
+  origin: string | null
+  userAgent: string | null
+  cookie: {
+    attached: boolean
+    masked: string | null
+    raw?: string | null
+  }
+}
+
+export function getRemoteImportRequestContext(id: string, opts?: { revealCookie?: boolean }) {
+  const suffix = opts?.revealCookie ? '?revealCookie=1' : ''
+  return apiFetch<RemoteImportRequestContextDetails>(`/remote-imports/${encodeURIComponent(id)}/request-context${suffix}`)
+}
+
 export function cancelRemoteImport(id: string) {
   return apiFetch<RemoteImportItem>(`/remote-imports/${id}/cancel`, { method: 'POST' })
 }

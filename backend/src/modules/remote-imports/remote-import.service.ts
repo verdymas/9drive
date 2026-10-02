@@ -7,6 +7,7 @@ import { normalizeFinalFileName, sanitizeFileName } from './filename-sanitize.js
 import {
   decryptRequestContext,
   encryptRequestContext,
+  maskRequestCookie,
   serializeRequestContext,
   type RemoteImportRequestContext,
 } from './request-context.js'
@@ -540,4 +541,56 @@ export async function deleteRemoteImport(importId: string, userId: string) {
   await prisma.remoteImport.delete({ where: { id: importId } })
   await createAuditLog(userId, 'IMPORT_URL_DELETE', 'remote_import', importId, { name: row.fileName })
   return row
+}
+
+export type RemoteImportRequestContextDetails = {
+  attached: boolean
+  referer: string | null
+  origin: string | null
+  userAgent: string | null
+  cookie: {
+    attached: boolean
+    masked: string | null
+    /** Raw cookie value — present only when explicitly requested via reveal. */
+    raw?: string | null
+  }
+}
+
+/**
+ * Owner-only request-context details for debugging protected sources.
+ *
+ * Uses `getRemoteImportForUser` so ownership semantics (404 for foreign ids)
+ * match every other Remote Import route. Decrypts with the existing helper,
+ * returns masked cookie by default and the raw cookie only on explicit
+ * `revealCookie`. Never logs decrypted values and never returns encrypted
+ * blobs or unrelated secrets.
+ */
+export async function getRemoteImportRequestContextForUser(
+  importId: string,
+  userId: string,
+  opts?: { revealCookie?: boolean },
+): Promise<RemoteImportRequestContextDetails> {
+  const row = await getRemoteImportForUser(importId, userId)
+  const ctx = decryptRequestContext((row as { requestContextEncrypted?: string | null }).requestContextEncrypted ?? null)
+  if (!ctx) {
+    return {
+      attached: false,
+      referer: null,
+      origin: null,
+      userAgent: null,
+      cookie: { attached: false, masked: null },
+    }
+  }
+  const cookieAttached = Boolean(ctx.cookie)
+  return {
+    attached: true,
+    referer: ctx.referer ?? null,
+    origin: ctx.origin ?? null,
+    userAgent: ctx.userAgent ?? null,
+    cookie: {
+      attached: cookieAttached,
+      masked: cookieAttached ? maskRequestCookie(ctx.cookie) : null,
+      ...(opts?.revealCookie && cookieAttached ? { raw: ctx.cookie ?? null } : {}),
+    },
+  }
 }

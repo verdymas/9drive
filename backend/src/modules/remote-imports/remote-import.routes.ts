@@ -11,6 +11,7 @@ import {
   createRemoteImport,
   deleteRemoteImport,
   getRemoteImportForUser,
+  getRemoteImportRequestContextForUser,
   listRemoteImportsForUser,
   retryRemoteConvert,
   retryRemoteImport,
@@ -226,6 +227,28 @@ remoteImportRouter.get('/:id', requireAuth, async (req: AuthRequest, res, next) 
     const row = await getRemoteImportForUser(String(req.params.id), req.user!.id)
     return res.json(serializeRemoteImport(row))
   } catch (error) {
+    if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
+    return next(error)
+  }
+})
+
+/**
+ * Owner-only request-context details for debugging protected sources.
+ *
+ * List/detail APIs stay boolean-only; decrypted values are exposed only here,
+ * cookie masked by default and raw only with explicit `?revealCookie=1`.
+ * Ownership is enforced by `getRemoteImportForUser` (404 for foreign ids).
+ * Decrypted values are never logged.
+ */
+remoteImportRouter.get('/:id/request-context', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const query = z.object({ revealCookie: z.enum(['1', 'true']).optional() }).parse(req.query)
+    const details = await getRemoteImportRequestContextForUser(String(req.params.id), req.user!.id, {
+      revealCookie: query.revealCookie === '1' || query.revealCookie === 'true',
+    })
+    return res.json(details)
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ code: 'INVALID_REQUEST', message: error.issues[0]?.message ?? 'Invalid request.' })
     if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
     return next(error)
   }
