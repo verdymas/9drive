@@ -6,6 +6,7 @@ const MASKED = '••••••••'
 
 const maskedDetails = {
   attached: true,
+  downloadUrl: 'https://cdn.example.com/file.mkv?token=signed-value',
   referer: 'https://example.com/watch/123',
   origin: 'https://example.com',
   userAgent: 'Mozilla/5.0 test-agent',
@@ -60,9 +61,44 @@ describe('RequestContextDialog', () => {
     expect(apiFetchMock).not.toHaveBeenCalled()
   })
 
+  it('edits the Download URL of a failed import and requeues it', async () => {
+    apiFetchMock.mockImplementation(async (path: string, options?: { method?: string; body?: string }) => {
+      if (typeof path === 'string' && path.endsWith('/download-url') && options?.method === 'PATCH') {
+        return { id: 'import-1', status: 'queued' }
+      }
+      if (typeof path === 'string' && path.includes('/request-context')) {
+        return maskedDetails
+      }
+      throw new Error(`unexpected fetch: ${path}`)
+    })
+    const onUrlSaved = vi.fn()
+    render(<RequestContextDialog importId="import-1" editable onUrlSaved={onUrlSaved} onClose={() => {}} />)
+    expect(await screen.findByText('https://cdn.example.com/file.mkv?token=signed-value')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Download URL' }))
+    fireEvent.change(screen.getByLabelText('New Download URL'), { target: { value: 'https://cdn.example.com/file.mkv?token=fresh' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save & restart' }))
+
+    await waitFor(() => {
+      expect(apiFetchMock).toHaveBeenCalledWith('/remote-imports/import-1/download-url', {
+        method: 'PATCH',
+        body: JSON.stringify({ url: 'https://cdn.example.com/file.mkv?token=fresh' }),
+      })
+    })
+    expect(onUrlSaved).toHaveBeenCalled()
+  })
+
+  it('hides the Edit affordance when the import is not editable', async () => {
+    mockDetailsSequence()
+    render(<RequestContextDialog importId="import-1" onClose={() => {}} />)
+    expect(await screen.findByText('https://cdn.example.com/file.mkv?token=signed-value')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Edit Download URL' })).not.toBeInTheDocument()
+  })
+
   it('renders an empty state for imports with no context', async () => {
     apiFetchMock.mockResolvedValueOnce({
       attached: false,
+      downloadUrl: null,
       referer: null,
       origin: null,
       userAgent: null,

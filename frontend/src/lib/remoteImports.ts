@@ -249,6 +249,18 @@ export function getRemoteImportRequestContext(id: string, opts?: { revealCookie?
   return apiFetch<RemoteImportRequestContextDetails>(`/remote-imports/${encodeURIComponent(id)}/request-context${suffix}`)
 }
 
+/**
+ * Replace the source URL of a failed/cancelled/queued import. The backend
+ * auto-requeues it (full re-run, resume state wiped). HLS selection is
+ * preserved.
+ */
+export function updateRemoteImportDownloadUrl(id: string, url: string) {
+  return apiFetch<RemoteImportItem>(`/remote-imports/${encodeURIComponent(id)}/download-url`, {
+    method: 'PATCH',
+    body: JSON.stringify({ url }),
+  })
+}
+
 export function cancelRemoteImport(id: string) {
   return apiFetch<RemoteImportItem>(`/remote-imports/${id}/cancel`, { method: 'POST' })
 }

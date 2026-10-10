@@ -26,6 +26,8 @@
 - `POST /remote-imports/:id/cancel`
 - `POST /remote-imports/:id/retry`
 - `POST /remote-imports/:id/retry-convert`
+- `GET /remote-imports/:id/request-context`
+- `PATCH /remote-imports/:id/download-url`
 - `DELETE /remote-imports/:id`
 
 ## Input Types
@@ -37,6 +39,9 @@
 
 ## Failure/Retry
 Retry behavior is stage-aware. HLS conversion-specific retry can reuse downloaded/materialized output when safe. Queue/processing reconciliation prevents stuck UI states after a crash or lost queue job.
+
+## Download URL editing
+A failed/cancelled/queued import's source URL is editable from the request-context dialog (`PATCH /:id/download-url`). Signed URLs expire — a fresh URL for the same resource is an update, not a new import. Saving auto-requeues a full re-run: HLS quality/audio selection is preserved (type-sticky), but resume/progress state is wiped and stale temp artifacts removed, so the new URL never resumes the old URL's bytes.
 
 Expected worker-side waits do not consume normal failure attempts or mark the
 import failed. When the per-user gate is full, or temporary-storage admission

@@ -527,6 +527,110 @@ export async function retryRemoteImport(importId: string, userId: string) {
   return enqueueRetry(importId, userId, 'full')
 }
 
+/**
+ * Replace the source URL of a failed/cancelled/queued import and auto-requeue
+ * it (full re-run). The Download URL is editable because signed URLs expire —
+ * the fix is usually a fresh URL for the SAME resource, not a new import.
+ *
+ * Type-sticky: `sourceType`/HLS selection is preserved (the main use case is a
+ * refreshed signed URL for the same playlist). Resume/progress state is wiped:
+ * a new URL must never resume mid-pipeline from the old URL's bytes
+ * (`retryFromStage` cleared, temp parts + HLS scratch removed, stale probe
+ * evidence reset). Same SSRF/worker validation as creation.
+ */
+export async function updateRemoteImportSourceUrl(importId: string, userId: string, sourceUrl: string) {
+  const row = await getRemoteImportForUser(importId, userId)
+  if (row.status !== 'failed' && row.status !== 'cancelled' && row.status !== 'queued') {
+    throw new AppError('REMOTE_IMPORT_NOT_EDITABLE', 'Only failed, cancelled, or queued imports can have their URL edited.', 409)
+  }
+
+  // Same worker guard as a retry: never silently switch to Direct.
+  if (row.workerId) {
+    const worker = await prisma.remoteFetchWorker.findFirst({ where: { id: row.workerId, deletedAt: null } })
+    if (!worker || !worker.isEnabled || !hasDriver(worker.driver)) {
+      throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_UNAVAILABLE, REMOTE_FETCH_WORKER_ERROR_MESSAGES.REMOTE_IMPORT_WORKER_UNAVAILABLE, 409)
+    }
+  }
+
+  // Same URL gate as creation: syntax/policy always, backend DNS only Direct.
+  await validateRemoteUrl(sourceUrl, { resolveDns: !row.workerId })
+
+  const nextAttempt = row.attempt + 1
+  let jobId: string
+  try {
+    jobId = await enqueueRemoteImport(importId, nextAttempt, workloadForRemoteImport(row))
+  } catch (error) {
+    console.error('[remote-import] url-edit enqueue failed for import', importId, error instanceof Error ? error.message : String(error))
+    throw new AppError('REMOTE_IMPORT_QUEUE_ENQUEUE_FAILED', 'The edited import could not be queued. Please try again.', 502)
+  }
+
+  // A queued row may hold a stale waiting job — remove it (mirror cancel) so
+  // the new execution is the only one.
+  await removeRemoteImportJob(importId, row.attempt, workloadForRemoteImport(row)).catch(() => undefined)
+  await removeTempFile(importId)
+  await removeJobDirIfExists(userId, importId)
+
+  // CAS: only one edit may transition the row; a racing retry/edit loses.
+  const updated = await prisma.remoteImport.updateMany({
+    where: { id: importId, status: { in: ['failed', 'cancelled', 'queued'] } },
+    data: {
+      sourceUrlEncrypted: encryptText(sourceUrl),
+      displayUrl: displayUrl(sourceUrl),
+      finalUrlEncrypted: null,
+      status: 'queued',
+      stage: 'waiting',
+      attempt: nextAttempt,
+      jobId,
+      queuedAt: new Date(),
+      retryRequestedAt: new Date(),
+      retryFromStage: null,
+      totalBytes: null,
+      downloadedBytes: 0n,
+      uploadedBytes: 0n,
+      uploadTotalBytes: null,
+      sourceETag: null,
+      sourceLastModified: null,
+      sourceRangeSupported: false,
+      hlsMediaDurationSeconds: null,
+      hlsSegmentCount: null,
+      hlsCompletedSegmentCount: null,
+      remuxProgress: null,
+      outputDurationSeconds: null,
+      outputCodecSummary: null,
+      tempPath: null,
+      resumeSessionEncrypted: null,
+      streamUploadStateEncrypted: null,
+      errorCode: null,
+      errorMessage: null,
+      internalError: null,
+      failedAt: null,
+      cancelledAt: null,
+      completedAt: null,
+      startedAt: null,
+      heartbeatAt: null,
+    },
+  })
+  if (updated.count !== 1) {
+    // Lost the race — the new job is orphaned; remove it so it never runs.
+    await removeRemoteImportJob(importId, nextAttempt, workloadForRemoteImport(row)).catch(() => undefined)
+    throw new AppError('REMOTE_IMPORT_ALREADY_ACTIVE', 'This import changed while saving. Please try again.', 409)
+  }
+
+  const fresh = await prisma.remoteImport.findUniqueOrThrow({
+    where: { id: importId },
+    include: {
+      connectedAccount: { select: { id: true, provider: true, email: true, displayName: true } },
+      worker: { select: { id: true, name: true, driver: true, region: true, status: true, isEnabled: true } },
+    },
+  })
+  try {
+    await createAuditLog(userId, 'IMPORT_URL_EDIT', 'remote_import', importId, { name: row.fileName })
+  } catch {
+    /* audit failures are non-fatal */
+  }
+  return fresh
+}
+
 /** Convert-only retry: re-enqueue the HLS remux WITHOUT wiping the job dir. */
 export async function retryRemoteConvert(importId: string, userId: string) {
   return enqueueRetry(importId, userId, 'convert')

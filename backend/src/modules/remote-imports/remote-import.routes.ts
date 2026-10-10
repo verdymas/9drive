@@ -16,6 +16,7 @@ import {
   retryRemoteConvert,
   retryRemoteImport,
   serializeRemoteImport,
+  updateRemoteImportSourceUrl,
 } from './remote-import.service.js'
 import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './hls/errors.js'
 
@@ -247,6 +248,25 @@ remoteImportRouter.get('/:id/request-context', requireAuth, async (req: AuthRequ
       revealCookie: query.revealCookie === '1' || query.revealCookie === 'true',
     })
     return res.json(details)
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ code: 'INVALID_REQUEST', message: error.issues[0]?.message ?? 'Invalid request.' })
+    if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
+    return next(error)
+  }
+})
+
+/**
+ * Replace the source URL of a failed/cancelled/queued import and auto-requeue
+ * it (full re-run). Signed URLs expire — a fresh URL for the SAME resource is
+ * an update, not a new import. HLS selection is preserved (type-sticky);
+ * resume/progress state is wiped (never resume the old URL's bytes).
+ * Same SSRF validation as creation.
+ */
+remoteImportRouter.patch('/:id/download-url', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const body = z.object({ url: z.string().min(1).max(4096) }).parse(req.body)
+    const row = await updateRemoteImportSourceUrl(String(req.params.id), req.user!.id, body.url)
+    return res.json(serializeRemoteImport(row))
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ code: 'INVALID_REQUEST', message: error.issues[0]?.message ?? 'Invalid request.' })
     if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })

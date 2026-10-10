@@ -109,6 +109,8 @@ all-failed request returns `400 { code, message, failed }`.
 | POST | `/remote-imports` |
 | GET | `/remote-imports` |
 | GET | `/remote-imports/:id` |
+| GET | `/remote-imports/:id/request-context` |
+| PATCH | `/remote-imports/:id/download-url` |
 | POST | `/remote-imports/:id/cancel` |
 | POST | `/remote-imports/:id/retry` |
 | POST | `/remote-imports/:id/retry-convert` |

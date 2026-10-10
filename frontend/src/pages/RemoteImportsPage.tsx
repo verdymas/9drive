@@ -463,6 +463,8 @@ export function RemoteImportsPage() {
       <RequestContextDialog
         importId={contextImport?.id ?? null}
         fileName={contextImport?.fileName ?? null}
+        editable={contextImport != null && (contextImport.status === 'failed' || contextImport.status === 'cancelled' || contextImport.status === 'queued')}
+        onUrlSaved={() => load().catch(() => undefined)}
         onClose={() => setContextImport(null)}
       />
     </>

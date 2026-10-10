@@ -133,7 +133,7 @@ vi.mock('node:fs/promises', () => ({
 }))
 
 // Import AFTER the mocks are registered (vi.mock is hoisted; imports re-order).
-import { retryRemoteConvert, retryRemoteImport } from './remote-import.service.js'
+import { retryRemoteConvert, retryRemoteImport, updateRemoteImportSourceUrl } from './remote-import.service.js'
 
 /** Reset each mock/function then re-apply the defaults. `vi.clearAllMocks`
  *  would be wrong here: queued `*Once` values from a finished test survive a
@@ -503,6 +503,105 @@ describe('retryRemoteConvert', () => {
     await withRow({ status: 'failed', sourceType: 'hls_master', errorCode: 'HLS_REMUX_FAILED', fileId: 'file-9' })
     const result = await retryRemoteConvert('import-1', 'user-1')
     expect(result.retryFromStage).toBe('registering')
+  })
+})
+
+describe('updateRemoteImportSourceUrl', () => {
+  beforeEach(() => {
+    resetMocks()
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null as never)
+  })
+
+  it('saves the new URL encrypted, refreshes displayUrl, and requeues', async () => {
+    await withRow({ status: 'failed', sourceType: null, sourceUrlEncrypted: 'https://old.example/a.mkv', attempt: 1 })
+    await updateRemoteImportSourceUrl('import-1', 'user-1', 'https://cdn.example/b.mkv?token=new')
+    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2, 'direct')
+    const updateMany = h.prismaMock.remoteImport.updateMany as ReturnType<typeof vi.fn>
+    expect(updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'import-1', status: { in: ['failed', 'cancelled', 'queued'] } },
+        data: expect.objectContaining({
+          sourceUrlEncrypted: 'https://cdn.example/b.mkv?token=new',
+          displayUrl: 'https://cdn.example/b.mkv',
+          status: 'queued',
+          stage: 'waiting',
+          attempt: 2,
+          retryFromStage: null,
+          downloadedBytes: 0n,
+          uploadedBytes: 0n,
+          totalBytes: null,
+          errorCode: null,
+          errorMessage: null,
+        }),
+      }),
+    )
+    // Resume/progress state is wiped — never resume the old URL's bytes.
+    expect(updateMany.mock.calls[0][0].data.finalUrlEncrypted).toBeNull()
+    expect(updateMany.mock.calls[0][0].data.resumeSessionEncrypted).toBeNull()
+    expect(updateMany.mock.calls[0][0].data.streamUploadStateEncrypted).toBeNull()
+    expect(updateMany.mock.calls[0][0].data.retryFromStage).toBeNull()
+  })
+
+  it('keeps the HLS selection (type-sticky) but wipes HLS probe progress', async () => {
+    await withRow({
+      status: 'failed',
+      sourceType: 'hls_master',
+      hlsVariantId: 'v-720',
+      hlsVariantBandwidth: 3000000,
+      hlsAudioTrackId: 'a-en',
+      hlsMediaDurationSeconds: 600,
+      hlsSegmentCount: 10,
+    })
+    await updateRemoteImportSourceUrl('import-1', 'user-1', 'https://cdn.example/fresh.m3u8?token=new')
+    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2, 'hls')
+    // No variant/audio/container columns in the update payload — they survive.
+    const payload = (h.prismaMock.remoteImport.updateMany as ReturnType<typeof vi.fn>).mock.calls[0][0].data
+    expect(payload.hlsVariantId).toBeUndefined()
+    expect(payload.hlsAudioTrackId).toBeUndefined()
+    expect(payload.hlsOutputContainer).toBeUndefined()
+    expect(payload.hlsMediaDurationSeconds).toBeNull()
+    expect(payload.hlsSegmentCount).toBeNull()
+    expect(payload.remuxProgress).toBeNull()
+  })
+
+  it('rejects processing/completed imports with 409 (no race with the worker)', async () => {
+    await withRow({ status: 'processing' })
+    await expect(updateRemoteImportSourceUrl('import-1', 'user-1', 'https://cdn.example/x.mkv')).rejects.toMatchObject({
+      code: 'REMOTE_IMPORT_NOT_EDITABLE',
+      status: 409,
+    })
+    expect(h.enqueueSpy).not.toHaveBeenCalled()
+    await withRow({ status: 'completed' })
+    await expect(updateRemoteImportSourceUrl('import-1', 'user-1', 'https://cdn.example/x.mkv')).rejects.toMatchObject({
+      code: 'REMOTE_IMPORT_NOT_EDITABLE',
+    })
+  })
+
+  it('validates the URL through the SSRF gate before touching the row', async () => {
+    ;(h.validateUrlSpy as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new AppError('URL_HOST_BLOCKED', 'Blocked.', 400))
+    await withRow({ status: 'failed' })
+    await expect(updateRemoteImportSourceUrl('import-1', 'user-1', 'http://169.254.169.254/x')).rejects.toMatchObject({
+      code: 'URL_HOST_BLOCKED',
+    })
+    expect(h.enqueueSpy).not.toHaveBeenCalled()
+    expect(h.prismaMock.remoteImport.updateMany as ReturnType<typeof vi.fn>).not.toHaveBeenCalled()
+  })
+
+  it('removes the stale queued job and cleans temp artifacts', async () => {
+    const removeSpy = (await import('./queue.js')).removeRemoteImportJob as ReturnType<typeof vi.fn>
+    await withRow({ status: 'queued', attempt: 3, sourceType: null })
+    await updateRemoteImportSourceUrl('import-1', 'user-1', 'https://cdn.example/fresh.mkv')
+    expect(removeSpy).toHaveBeenCalledWith('import-1', 3, 'direct')
+  })
+
+  it('cleans up the orphaned new job when the CAS loses the race', async () => {
+    const removeSpy = (await import('./queue.js')).removeRemoteImportJob as ReturnType<typeof vi.fn>
+    ;(h.prismaMock.remoteImport.updateMany as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ count: 0 })
+    await withRow({ status: 'failed', attempt: 1, sourceType: null })
+    await expect(updateRemoteImportSourceUrl('import-1', 'user-1', 'https://cdn.example/fresh.mkv')).rejects.toMatchObject({
+      code: 'REMOTE_IMPORT_ALREADY_ACTIVE',
+    })
+    expect(removeSpy).toHaveBeenCalledWith('import-1', 2, 'direct')
   })
 })
 
