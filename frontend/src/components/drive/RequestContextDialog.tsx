@@ -154,6 +154,17 @@ export function RequestContextDialog({ importId, fileName, onClose }: Props) {
         <p className="rounded-xl bg-slate-50 p-3 text-sm font-semibold text-slate-500">No request context attached to this import.</p>
       ) : details ? (
         <div className="grid min-w-0 gap-4">
+          {details.downloadUrl ? (
+            <FieldRow
+              label="Download URL"
+              value={details.downloadUrl}
+              copyLabel="Copy Download URL"
+              copied={copiedKey === 'downloadUrl'}
+              onCopy={() => handleCopy('downloadUrl', details.downloadUrl!)}
+            />
+          ) : (
+            <p className="text-xs font-semibold text-slate-400">Download URL — Not available</p>
+          )}
           {details.referer ? (
             <FieldRow
               label="Referer"

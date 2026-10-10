@@ -233,6 +233,7 @@ export function getRemoteImport(id: string) {
  */
 export type RemoteImportRequestContextDetails = {
   attached: boolean
+  downloadUrl: string | null
   referer: string | null
   origin: string | null
   userAgent: string | null

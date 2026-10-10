@@ -57,6 +57,7 @@ function installMocks() {
     if (typeof path === 'string' && path.includes('/request-context')) {
       return {
         attached: true,
+        downloadUrl: 'https://cdn.example.com/file.mkv?token=signed-value',
         referer: 'https://example.com/watch/123',
         origin: 'https://example.com',
         userAgent: 'Mozilla/5.0 test-agent',
@@ -85,8 +86,10 @@ describe('RemoteImportsPage request-context action', () => {
     expect(apiFetchMock.mock.calls.some(([p]) => typeof p === 'string' && p.includes('/request-context'))).toBe(false)
 
     fireEvent.click(viewButtons[0])
-    expect(await screen.findByText('https://example.com/watch/123')).toBeInTheDocument()
+    expect(await screen.findByText('https://cdn.example.com/file.mkv?token=signed-value')).toBeInTheDocument()
+    expect(screen.getByText('https://example.com/watch/123')).toBeInTheDocument()
     expect(screen.getByText(`session=${MASKED}`)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Copy Download URL' })).toBeInTheDocument()
     expect(apiFetchMock).toHaveBeenCalledWith('/remote-imports/with-ctx/request-context')
   })
 

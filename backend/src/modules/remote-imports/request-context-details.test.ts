@@ -58,10 +58,12 @@ import { getRemoteImportRequestContextForUser, serializeRemoteImport } from './r
 
 const MASKED = '••••••••'
 
-function rowWithContext(ownerId: string, ctx: Record<string, string> | null) {
+function rowWithContext(ownerId: string, ctx: Record<string, string> | null, sourceUrl = 'https://cdn.example.com/file.mkv?token=signed-value') {
   return {
     id: 'import-1',
     userId: ownerId,
+    // Crypto is mocked to identity, so this echoes verbatim as downloadUrl.
+    sourceUrlEncrypted: sourceUrl,
     requestContextEncrypted: ctx ? JSON.stringify(ctx) : null,
     totalBytes: null,
     downloadedBytes: 0n,
@@ -103,6 +105,7 @@ describe('getRemoteImportRequestContextForUser', () => {
     )
     const details = await getRemoteImportRequestContextForUser('import-1', 'user-1')
     expect(details.attached).toBe(true)
+    expect(details.downloadUrl).toBe('https://cdn.example.com/file.mkv?token=signed-value')
     expect(details.referer).toBe('https://example.com/watch/123')
     expect(details.origin).toBe('https://example.com')
     expect(details.userAgent).toBe('Mozilla/5.0 test')
@@ -138,11 +141,20 @@ describe('getRemoteImportRequestContextForUser', () => {
     const details = await getRemoteImportRequestContextForUser('import-1', 'user-1')
     expect(details).toEqual({
       attached: false,
+      downloadUrl: 'https://cdn.example.com/file.mkv?token=signed-value',
       referer: null,
       origin: null,
       userAgent: null,
       cookie: { attached: false, masked: null },
     })
+  })
+
+  it('missing source blob yields a null downloadUrl instead of throwing', async () => {
+    const row = { ...rowWithContext('user-1', { referer: 'https://example.com/watch/123' }), sourceUrlEncrypted: null }
+    h.findFirst.mockResolvedValueOnce(row)
+    const details = await getRemoteImportRequestContextForUser('import-1', 'user-1')
+    expect(details.attached).toBe(true)
+    expect(details.downloadUrl).toBeNull()
   })
 
   it('normal list/detail serialization stays boolean-only with no blobs', async () => {

@@ -2,7 +2,7 @@ import { env } from '../../config/env.js'
 import { prisma } from '../../config/prisma.js'
 import { AppError } from '../../utils/app-error.js'
 import { createAuditLog } from '../../utils/audit.js'
-import { encryptText } from '../../utils/crypto.js'
+import { decryptText, encryptText } from '../../utils/crypto.js'
 import { normalizeFinalFileName, sanitizeFileName } from './filename-sanitize.js'
 import {
   decryptRequestContext,
@@ -545,6 +545,8 @@ export async function deleteRemoteImport(importId: string, userId: string) {
 
 export type RemoteImportRequestContextDetails = {
   attached: boolean
+  /** Decrypted full source URL (incl. signed query) — owner-only, this endpoint only. */
+  downloadUrl: string | null
   referer: string | null
   origin: string | null
   userAgent: string | null
@@ -571,10 +573,20 @@ export async function getRemoteImportRequestContextForUser(
   opts?: { revealCookie?: boolean },
 ): Promise<RemoteImportRequestContextDetails> {
   const row = await getRemoteImportForUser(importId, userId)
+  const sourceEncrypted = (row as { sourceUrlEncrypted?: string | null }).sourceUrlEncrypted ?? null
+  let downloadUrl: string | null = null
+  if (sourceEncrypted) {
+    try {
+      downloadUrl = decryptText(sourceEncrypted)
+    } catch {
+      downloadUrl = null
+    }
+  }
   const ctx = decryptRequestContext((row as { requestContextEncrypted?: string | null }).requestContextEncrypted ?? null)
   if (!ctx) {
     return {
       attached: false,
+      downloadUrl,
       referer: null,
       origin: null,
       userAgent: null,
@@ -584,6 +596,7 @@ export async function getRemoteImportRequestContextForUser(
   const cookieAttached = Boolean(ctx.cookie)
   return {
     attached: true,
+    downloadUrl,
     referer: ctx.referer ?? null,
     origin: ctx.origin ?? null,
     userAgent: ctx.userAgent ?? null,
