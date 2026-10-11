@@ -42,6 +42,8 @@ export type RemoteFetchRequest = {
   sourceUrl?: string
   maxBytes?: number
   timeoutMs?: number
+  /** Opaque correlation id threaded to the relay as `traceId` for log matching. Never secrets. */
+  traceId?: string
 }
 
 /** A relay fetch response (reserved for the next phase's transport). */

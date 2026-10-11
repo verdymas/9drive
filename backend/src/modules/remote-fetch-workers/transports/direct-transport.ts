@@ -84,11 +84,17 @@ export class DirectRemoteFetchTransport implements RemoteFetchTransport {
       }
       if (range) headers['Range'] = range
 
-      // Log safe diagnostics — header NAMES only, never values
+      // Log safe diagnostics — header NAMES only, never values.
+      // traceId is logged when the caller threads one (probe correlationId);
+      // direct has no relay hop, so relayHttpStatus/upstreamStatus are the same
+      // source answer logged by the fetcher response line.
       try {
         const targetHost = url.hostname
         const forwardedHeaderNames = Object.keys(headers).map((h) => h.toLowerCase()).sort().join(',')
-        console.log(`[remote-import:transport] route=direct targetHost=${targetHost} method=${method} redirectCount=${redirectCount} forwardedHeaderNames=${forwardedHeaderNames}`)
+        const traceId = typeof (input as RemoteFetchRequest).traceId === 'string' ? (input as RemoteFetchRequest).traceId : 'none'
+        const pathLen = url.pathname.length
+        const queryKeys = [...url.searchParams.keys()].sort().join('+') || 'none'
+        console.log(`[remote-import:transport] route=direct traceId=${traceId} targetHost=${targetHost} method=${method} redirectCount=${redirectCount} forwardedHeaderNames=${forwardedHeaderNames} pathLen=${pathLen} queryKeys=${queryKeys}`)
       } catch {}
 
       const res = await request(url.href, {

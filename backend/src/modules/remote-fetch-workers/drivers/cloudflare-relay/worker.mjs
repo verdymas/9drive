@@ -101,8 +101,22 @@ async function handleFetch(request) {
   } catch {
     return json({ error: 'invalid payload', reason: 'INVALID_JSON' }, 400);
   }
-  const { method, url, headers, body, protocolVersion, response: responseMode } = payload || {};
+  const { method, url, headers, body, protocolVersion, response: responseMode, traceId: rawTraceId } = payload || {};
   const STREAMING = responseMode === 'stream';
+  // Opaque correlation id (diagnostics-only, never affects routing). Lenient:
+  // an absent/invalid traceId never fails the relay — it is only echoed in logs.
+  const traceId = typeof rawTraceId === 'string' && rawTraceId.length >= 1 && rawTraceId.length <= 128 ? rawTraceId : 'none';
+  // Safe destination shape — param NAMES only, never values (signed URLs stay secret).
+  function urlShapeForLog(rawUrl) {
+    try {
+      const u = new URL(rawUrl);
+      const keys = [...u.searchParams.keys()].sort().join('+') || 'none';
+      const count = [...u.searchParams.keys()].length;
+      return `pathLen=${u.pathname.length} queryCount=${count} queryKeys=${keys} hasFragment=${Boolean(u.hash)} urlLen=${String(rawUrl).length}`;
+    } catch {
+      return `pathLen=unknown queryCount=unknown queryKeys=unknown hasFragment=unknown urlLen=${String(rawUrl).length}`;
+    }
+  }
   // Canonical 9drive-relay-v1 contract — keep in sync with backend/src/modules/remote-fetch-workers/relay-protocol.ts
   // Validation with safe reason codes — never echo URL, headers values, or body content.
   if (protocolVersion === undefined || protocolVersion === null) {
@@ -140,6 +154,7 @@ async function handleFetch(request) {
   // Safe diagnostics — never log URL query, headers values, or body
   let targetHostForLog = '';
   let hasRange = false;
+  let upstreamHeaderNamesForLog = '';
   try {
     targetHostForLog = new URL(url).hostname;
     const payloadKeys = payload ? Object.keys(payload).sort().join(',') : '';
@@ -150,7 +165,8 @@ async function handleFetch(request) {
     hasRange = headers && typeof headers === 'object'
       ? Object.keys(headers).some((k) => String(k).toLowerCase() === 'range')
       : false;
-    console.log(`[relay] protocol=${protocolVersion} upstreamMethod=${method} targetHost=${targetHostForLog} payloadKeys=${payloadKeys} contentType=${request.headers.get('content-type')} bodyPresent=${bodyPresent} bodyType=${bodyType} headersCount=${headersCount} headersType=${headersType} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)}`);
+    const shape = urlShapeForLog(url);
+    console.log(`[relay] protocol=${protocolVersion} traceId=${traceId} upstreamMethod=${method} targetHost=${targetHostForLog} payloadKeys=${payloadKeys} contentType=${request.headers.get('content-type')} bodyPresent=${bodyPresent} bodyType=${bodyType} headersCount=${headersCount} headersType=${headersType} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)} ${shape}`);
   } catch {}
   let target;
   try {
@@ -173,6 +189,13 @@ async function handleFetch(request) {
       outHeaders.set(key, value);
     }
   }
+  // Actual upstream header NAMES after allowlist filtering (never values) —
+  // what the Worker asked fetch() to forward. Note: the edge runtime may still
+  // normalize forbidden headers (e.g. Sec-Fetch-Mode no-cors→cors) and adds its
+  // own CF-Worker/CF-Connecting-IP headers on the wire — invisible here.
+  try {
+    upstreamHeaderNamesForLog = [...outHeaders.keys()].map((k) => String(k).toLowerCase()).sort().join(',');
+  } catch {}
 
   try {
     const upstream = await fetch(target.href, {
@@ -182,6 +205,16 @@ async function handleFetch(request) {
       redirect: protocolVersion === COOKIE_PROTOCOL_VERSION ? 'manual' : 'follow',
     });
 
+    // Success diagnostics distinguish the relay (always HTTP 200 here) from
+    // the UPSTREAM answer. Never log query values, header values, or bodies —
+    // only hosts, status, redirect shape, and header NAMES.
+    try {
+      const finalHost = (() => { try { return new URL(upstream.url).hostname; } catch { return ''; } })();
+      const redirected = Boolean(upstream.url) && upstream.url !== target.href;
+      const sameHost = finalHost === targetHostForLog;
+      const shape = urlShapeForLog(url);
+      console.log(`[relay] event=upstream_response traceId=${traceId} upstreamMethod=${method} targetHost=${targetHostForLog} finalHost=${finalHost || 'unknown'} sameHost=${sameHost} redirected=${redirected} upstreamStatus=${upstream.status} relayHttpStatus=200 responseMode=${STREAMING ? 'stream' : 'envelope'} upstreamHeaderNames=${upstreamHeaderNamesForLog} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)} ${shape}`);
+    } catch {}
     // Streaming mode (v1.1): pipe the upstream response through UNBUFFERED —
     // the Worker never holds the whole body in memory, so large files no
     // longer hit the runtime memory ceiling (RESOURCE_LIMIT). Metadata rides
@@ -243,7 +276,7 @@ async function handleFetch(request) {
         }
       }
       const kind = classifyUpstreamError(message, causeCode);
-      console.log(`[relay] event=upstream_fetch_failed upstreamMethod=${method} targetHost=${targetHostForLog} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)} errorName=${errorName}${causeCode ? ` cause=${causeCode}` : ''} kind=${kind}`);
+      console.log(`[relay] event=upstream_fetch_failed traceId=${traceId} upstreamMethod=${method} targetHost=${targetHostForLog} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)} upstreamHeaderNames=${upstreamHeaderNamesForLog} errorName=${errorName}${causeCode ? ` cause=${causeCode}` : ''} kind=${kind}`);
       return json({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION', reason: errorName, kind, ...(causeCode ? { cause: causeCode } : {}) }, 502);
     } catch {}
     return json({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION', reason: errorName }, 502);

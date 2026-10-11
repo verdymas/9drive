@@ -634,7 +634,9 @@ describe('CloudflareRemoteFetchTransport via mock relay', () => {
     expect(captured.protocolVersion).toBe(RELAY_PROTOCOL_VERSION)
     // The transport opts into streaming mode; the parser accepts the key.
     expect(captured.response).toBe('stream')
-    expect(Object.keys(captured).sort()).toEqual(['headers', 'method', 'protocolVersion', 'response', 'url'])
+    // traceId is diagnostics-only and always present on transport payloads.
+    expect(Object.keys(captured).sort()).toEqual(['headers', 'method', 'protocolVersion', 'response', 'traceId', 'url'])
+    expect(typeof captured.traceId).toBe('string')
     // Verify via canonical parser — must be accepted
     expect(() => parseRelayRequest(JSON.stringify(captured))).not.toThrow()
     // Also GET

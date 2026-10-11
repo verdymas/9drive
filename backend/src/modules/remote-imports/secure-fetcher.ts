@@ -30,32 +30,43 @@ export class SecureRemoteFetcher {
         return ''
       }
     })()
+    const traceId = typeof (input as RemoteFetchRequest).traceId === 'string' ? (input as RemoteFetchRequest).traceId : 'none'
     if (this.diagnostics.route === 'direct') {
-      console.log(`[remote-import:fetcher] route=direct targetHost=${targetHost} method=${input.method ?? 'GET'}`)
+      console.log(`[remote-import:fetcher] route=direct traceId=${traceId} targetHost=${targetHost} method=${input.method ?? 'GET'}`)
     } else {
       console.log(
-        `[remote-import:fetcher] route=worker workerId=${this.diagnostics.workerId ?? ''} driver=${this.diagnostics.driver ?? ''} relayHost=${this.diagnostics.relayHost ?? ''} targetHost=${targetHost} method=${input.method ?? 'GET'}`,
+        `[remote-import:fetcher] route=worker traceId=${traceId} workerId=${this.diagnostics.workerId ?? ''} driver=${this.diagnostics.driver ?? ''} relayHost=${this.diagnostics.relayHost ?? ''} targetHost=${targetHost} method=${input.method ?? 'GET'}`,
       )
     }
     const res = await this.transport.request(input)
-    // Log safe outcome
-    console.log(`[remote-import:fetcher] response route=${this.diagnostics.route} targetHost=${targetHost} status=${res.status}`)
+    // Log safe outcome — upstream answer, not relay health. The transport logs
+    // relayHttpStatus vs upstreamStatus separately for worker routes.
+    const finalHost = (() => {
+      try {
+        const f = (res as { finalUrl?: string }).finalUrl
+        return f ? new URL(f).hostname : targetHost
+      } catch {
+        return targetHost
+      }
+    })()
+    const redirectCount = (res as { redirectCount?: number }).redirectCount ?? 0
+    console.log(`[remote-import:fetcher] response route=${this.diagnostics.route} traceId=${traceId} targetHost=${targetHost} finalHost=${finalHost} redirectCount=${redirectCount} status=${res.status}`)
     return res as RemoteFetchResponse & { finalUrl?: string; redirectCount?: number }
   }
 
   /** Convenience for HEAD probe */
-  async head(url: string, opts: { headers?: Record<string, string>; requestContext?: RemoteImportRequestContext | null; sourceUrl?: string } = {}): Promise<RemoteFetchResponse & { finalUrl?: string }> {
-    return this.fetch({ method: 'HEAD', url, headers: opts.headers, requestContext: opts.requestContext as any, sourceUrl: opts.sourceUrl, maxBytes: 0 } as any)
+  async head(url: string, opts: { headers?: Record<string, string>; requestContext?: RemoteImportRequestContext | null; sourceUrl?: string; traceId?: string } = {}): Promise<RemoteFetchResponse & { finalUrl?: string }> {
+    return this.fetch({ method: 'HEAD', url, headers: opts.headers, requestContext: opts.requestContext as any, sourceUrl: opts.sourceUrl, maxBytes: 0, traceId: opts.traceId } as any)
   }
 
   /** Convenience for ranged GET (bytes=0-0) */
-  async rangedGet(url: string, opts: { headers?: Record<string, string>; requestContext?: RemoteImportRequestContext | null; sourceUrl?: string } = {}): Promise<RemoteFetchResponse & { finalUrl?: string }> {
-    return this.fetch({ method: 'GET', url, headers: opts.headers, range: 'bytes=0-0', requestContext: opts.requestContext as any, sourceUrl: opts.sourceUrl } as any)
+  async rangedGet(url: string, opts: { headers?: Record<string, string>; requestContext?: RemoteImportRequestContext | null; sourceUrl?: string; traceId?: string } = {}): Promise<RemoteFetchResponse & { finalUrl?: string }> {
+    return this.fetch({ method: 'GET', url, headers: opts.headers, range: 'bytes=0-0', requestContext: opts.requestContext as any, sourceUrl: opts.sourceUrl, traceId: opts.traceId } as any)
   }
 
   /** Bounded GET for manifests (string body) */
-  async boundedGet(url: string, opts: { headers?: Record<string, string>; maxBytes?: number; signal?: AbortSignal; requestContext?: RemoteImportRequestContext | null; sourceUrl?: string } = {}): Promise<{ status: number; headers: Record<string, string>; body: string; finalUrl: string }> {
-    const res = await this.fetch({ method: 'GET', url, headers: opts.headers, maxBytes: opts.maxBytes, requestContext: opts.requestContext as any, sourceUrl: opts.sourceUrl, timeoutMs: opts.signal ? 10000 : undefined } as any)
+  async boundedGet(url: string, opts: { headers?: Record<string, string>; maxBytes?: number; signal?: AbortSignal; requestContext?: RemoteImportRequestContext | null; sourceUrl?: string; traceId?: string } = {}): Promise<{ status: number; headers: Record<string, string>; body: string; finalUrl: string }> {
+    const res = await this.fetch({ method: 'GET', url, headers: opts.headers, maxBytes: opts.maxBytes, requestContext: opts.requestContext as any, sourceUrl: opts.sourceUrl, timeoutMs: opts.signal ? 10000 : undefined, traceId: opts.traceId } as any)
     // Collect body as string (manifests are small)
     let body = ''
     if (typeof res.body === 'string') {

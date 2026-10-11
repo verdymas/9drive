@@ -34,6 +34,9 @@ export const RelayFetchRequestSchema = z.object({
   headers: z.record(z.string(), z.string()),
   body: z.string().optional(),
   response: z.enum(['stream']).optional(),
+  // Opaque correlation id for matching backend ↔ relay logs. Diagnostics-only:
+  // never affects routing, never logged with URL/header/body values.
+  traceId: z.string().min(1).max(128).optional(),
 }).superRefine((request, ctx) => {
   if (request.protocolVersion === RELAY_PROTOCOL_VERSION && Object.keys(request.headers).some((name) => name.toLowerCase() === 'cookie')) {
     ctx.addIssue({ code: 'custom', path: ['protocolVersion'], message: 'Cookie requires the Cookie-safe relay protocol.' })
@@ -119,7 +122,7 @@ export function getRelayParseReason(rawJson: unknown, result: ReturnType<typeof 
       return RELAY_PARSE_REASONS.INVALID_METHOD
     }
     if (path === 'headers') return RELAY_PARSE_REASONS.INVALID_HEADERS
-    if (path === 'body' || path === 'response') return RELAY_PARSE_REASONS.INVALID_BODY_TYPE
+    if (path === 'body' || path === 'response' || path === 'traceId') return RELAY_PARSE_REASONS.INVALID_BODY_TYPE
     return RELAY_PARSE_REASONS.INVALID_BODY_TYPE
   }
   return RELAY_PARSE_REASONS.INVALID_BODY_TYPE

@@ -44,6 +44,31 @@ function signForRelay(secret: string, method: string, path: string): string {
 }
 
 /**
+ * Safe destination shape for logs — path length + query PARAM NAMES only.
+ * Never logs query values, fragments, or full URLs (signed URLs stay secret).
+ */
+function urlShapeForLog(rawUrl: string): string {
+  try {
+    const u = new URL(rawUrl)
+    const pathLen = u.pathname.length
+    const keys = [...u.searchParams.keys()].sort().join('+')
+    const queryCount = [...u.searchParams.keys()].length
+    const hasFragment = u.hash ? true : false
+    return `pathLen=${pathLen} queryCount=${queryCount} queryKeys=${keys || 'none'} hasFragment=${hasFragment} urlLen=${rawUrl.length}`
+  } catch {
+    return `pathLen=unknown queryCount=unknown queryKeys=unknown hasFragment=unknown urlLen=${rawUrl.length}`
+  }
+}
+
+function hostOfForLog(rawUrl: string): string {
+  try {
+    return new URL(rawUrl).hostname
+  } catch {
+    return ''
+  }
+}
+
+/**
  * Cloudflare relay transport: forwards the request through the 9Drive Worker relay.
  * The relay is POST /fetch with HMAC; it returns {status, headers, body:base64}.
  * All bytes go via the relay — 9Drive never contacts the source directly.
@@ -81,6 +106,13 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
     const rc = (input.requestContext as RemoteImportRequestContext | undefined) ?? this.opts.requestContext ?? null
     const cookieSafe = Boolean(rc?.cookie || Object.keys(input.headers ?? {}).some((name) => name.toLowerCase() === 'cookie'))
     const protocolVersion = cookieSafe ? RELAY_COOKIE_PROTOCOL_VERSION : RELAY_PROTOCOL_VERSION
+    // Opaque correlation id shared with the relay (`traceId` payload field) so
+    // backend transport logs and Worker logs can be matched. Prefer the
+    // caller's traceId (probe correlationId) when provided; otherwise generate
+    // one. Preserved across retries and redirect hops of this request.
+    const traceId = typeof input.traceId === 'string' && input.traceId.length > 0 && input.traceId.length <= 128
+      ? input.traceId
+      : crypto.randomUUID()
     let redirectCount = 0
     for (;;) {
       // URL syntax/policy validation before relaying (scheme, credentials,
@@ -111,8 +143,9 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
       const upstreamMethod = input.method ?? 'GET'
       const relayMethod = 'POST'
       const contentType = 'application/json'
+      const urlShape = urlShapeForLog(targetUrl)
       console.log(
-        `[remote-import:transport] protocol=${protocolVersion} route=worker workerId=${this.opts.workerId ?? 'unknown'} driver=${this.opts.driver ?? 'cloudflare'} relayHost=${relayHost} targetHost=${targetHost} relayMethod=${relayMethod} upstreamMethod=${upstreamMethod} contentType=${contentType}`,
+        `[remote-import:transport] protocol=${protocolVersion} route=worker traceId=${traceId} workerId=${this.opts.workerId ?? 'unknown'} driver=${this.opts.driver ?? 'cloudflare'} relayHost=${relayHost} targetHost=${targetHost} relayMethod=${relayMethod} upstreamMethod=${upstreamMethod} contentType=${contentType} redirectCount=${redirectCount} ${urlShape}`,
       )
 
       const method = upstreamMethod
@@ -155,6 +188,7 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
         // Older relays ignore the key and answer the v1 envelope; the attempt
         // parser falls back transparently.
         response: 'stream',
+        traceId,
         ...(bodyValue !== undefined ? { body: bodyValue } : {}),
       }
       // Canonical serialization — drifts are caught by Zod (single source of truth: relay-protocol.ts)
@@ -183,15 +217,15 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
       const bodyPresent = 'body' in payload
       const bodyType = typeof (payloadForLog as any).body
       console.log(
-        `[remote-import:transport] protocol=${protocolVersion} route=worker relayMethod=${relayMethod} upstreamMethod=${upstreamMethod} payloadKeys=${payloadKeys} urlType=${urlType} methodType=${methodType} headersType=${headersType} headersCount=${headersCount} headerNames=${headerNames} forwardedHeaderNames=${headerNames} hasRange=${hasRange} hasReferer=${hasReferer} hasOrigin=${hasOrigin} hasCookie=${hasCookie} bodyPresent=${bodyPresent} bodyType=${bodyType} targetHost=${targetHost}`,
+        `[remote-import:transport] protocol=${protocolVersion} route=worker traceId=${traceId} relayMethod=${relayMethod} upstreamMethod=${upstreamMethod} payloadKeys=${payloadKeys} urlType=${urlType} methodType=${methodType} headersType=${headersType} headersCount=${headersCount} headerNames=${headerNames} forwardedHeaderNames=${headerNames} hasRange=${hasRange} hasReferer=${hasReferer} hasOrigin=${hasOrigin} hasCookie=${hasCookie} bodyPresent=${bodyPresent} bodyType=${bodyType} targetHost=${targetHost} redirectCount=${redirectCount} ${urlShape}`,
       )
       console.log(
-        `[remote-import:transport] protocol=${protocolVersion} payloadKeys=${payloadKeys} contentType=${contentType} targetHost=${targetHost} bodyPresent=${bodyPresent}`,
+        `[remote-import:transport] protocol=${protocolVersion} traceId=${traceId} payloadKeys=${payloadKeys} contentType=${contentType} targetHost=${targetHost} bodyPresent=${bodyPresent} redirectCount=${redirectCount} ${urlShape}`,
       )
 
       const signature = signForRelay(this.opts.secret, relayMethod, RELAY_FETCH_PATH)
       const retryable = method === 'GET' || method === 'HEAD'
-      const relayId = `workerId=${this.opts.workerId ?? 'unknown'} driver=${this.opts.driver ?? 'cloudflare'} relayHost=${relayHost} targetHost=${targetHost} upstreamMethod=${method}`
+      const relayId = `traceId=${traceId} workerId=${this.opts.workerId ?? 'unknown'} driver=${this.opts.driver ?? 'cloudflare'} relayHost=${relayHost} targetHost=${targetHost} upstreamMethod=${method}`
 
       let attempt = 0
       for (;;) {
@@ -204,6 +238,7 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
           relayId,
           attempt,
           timeoutMs: input.timeoutMs,
+          traceId,
         })
 
         if (outcome.kind === 'ok') {
@@ -219,10 +254,16 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
           // retry the whole idempotent request; after exhaustion return the last
           // response so the caller maps its status.
           if (retryable && attempt < MAX_RELAY_ATTEMPTS && RETRYABLE_UPSTREAM_STATUSES.has(outcome.status)) {
-            console.error(`[remote-import:transport] retryable upstream status=${outcome.status} attempt=${attempt} ${relayId}`)
+            console.error(`[remote-import:transport] retryable upstreamStatus=${outcome.status} attempt=${attempt} ${relayId}`)
             await sleep(relayBackoffDelay(attempt))
             continue
           }
+          // Success log distinguishes relay health from upstream answer: a
+          // relay-level failure never reaches here (it throws as 502/400) —
+          // `upstreamStatus` is the source answer (206/404 included).
+          console.log(
+            `[remote-import:transport] response route=worker traceId=${traceId} upstreamStatus=${outcome.status} finalHost=${hostOfForLog(outcome.finalUrl)} redirectCount=${redirectCount} attempt=${attempt} ${relayId}`,
+          )
           return {
             status: outcome.status,
             statusText: outcome.statusText,
@@ -253,11 +294,12 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
     relayId: string
     attempt: number
     timeoutMs?: number
+    traceId?: string
   }): Promise<
     | { kind: 'ok'; status: number; statusText: string; headers: Record<string, string>; body: AsyncIterable<Uint8Array> | string; finalUrl: string }
     | { kind: 'error'; code: string; message: string; status: number; transient: boolean }
   > {
-    const { relayUrl, payloadText, signature, targetUrl, relayId, attempt, timeoutMs } = opts
+    const { relayUrl, payloadText, signature, targetUrl, relayId, attempt, timeoutMs, traceId } = opts
 
     let response: Response
     try {
@@ -349,6 +391,12 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
         if (key.toLowerCase().startsWith('x-9drive-')) return
         respHeaders[key.toLowerCase()] = value
       })
+      const finalUrl = finalUrlHeader ? decodeURI(finalUrlHeader) : targetUrl
+      // Distinguish relay health (HTTP 200) from the upstream answer carried
+      // in the metadata header — a 404 here is the SOURCE, not the relay.
+      console.log(
+        `[remote-import:transport] relayHttpStatus=${response.status} upstreamStatus=${Number.isFinite(upstreamStatus) ? upstreamStatus : 200} route=worker traceId=${traceId ?? 'unknown'} targetHost=${hostOfForLog(targetUrl)} finalHost=${hostOfForLog(finalUrl)} attempt=${attempt} ${relayId}`,
+      )
       return {
         kind: 'ok',
         status: Number.isFinite(upstreamStatus) ? upstreamStatus : 200,
@@ -357,7 +405,7 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
         // The relay body IS the upstream stream — handed to the caller as-is,
         // never buffered here.
         body: response.body as unknown as AsyncIterable<Uint8Array>,
-        finalUrl: finalUrlHeader ? decodeURI(finalUrlHeader) : targetUrl,
+        finalUrl,
       }
     }
 
@@ -441,13 +489,19 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
 
     // The relay follows redirects internally and reports the final URL;
     // older deployments without `finalUrl` fall back to the requested URL.
+    const finalUrl = typeof data.finalUrl === 'string' && data.finalUrl ? data.finalUrl : targetUrl
+    // Envelope path: relay HTTP 200 carries the upstream answer in JSON.
+    // Log both so a 404 is never mistaken for a relay failure.
+    console.log(
+      `[remote-import:transport] relayHttpStatus=${response.status} upstreamStatus=${status} route=worker traceId=${traceId ?? 'unknown'} targetHost=${hostOfForLog(targetUrl)} finalHost=${hostOfForLog(finalUrl)} attempt=${attempt} ${relayId}`,
+    )
     return {
       kind: 'ok',
       status,
       statusText: data.statusText ?? String(status),
       headers: respHeaders,
       body,
-      finalUrl: typeof data.finalUrl === 'string' && data.finalUrl ? data.finalUrl : targetUrl,
+      finalUrl,
     }
   }
 }
