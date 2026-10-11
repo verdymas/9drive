@@ -125,13 +125,45 @@ describe('encrypt / decrypt round-trip', () => {
 describe('serializeRequestContext (booleans only — spec §19)', () => {
   it('never serializes values, only attached booleans', () => {
     const out = serializeRequestContext({ referer: 'https://site.example/', cookie: 'session=valid' })
-    expect(out).toEqual({ attached: true, referer: true, origin: false, userAgent: false, cookie: true })
+    expect(out).toEqual({
+      attached: true,
+      referer: true,
+      origin: false,
+      userAgent: false,
+      cookie: true,
+      accept: false,
+      acceptEncoding: false,
+      acceptLanguage: false,
+      secChUa: false,
+      secChUaMobile: false,
+      secChUaPlatform: false,
+      secFetchSite: false,
+      secFetchMode: false,
+      secFetchDest: false,
+      secFetchStorageAccess: false,
+    })
     expect(JSON.stringify(out)).not.toContain('session=valid')
     expect(JSON.stringify(out)).not.toContain('https://site.example/')
   })
 
   it('returns the empty summary for null', () => {
-    expect(serializeRequestContext(null)).toEqual({ attached: false, referer: false, origin: false, userAgent: false, cookie: false })
+    expect(serializeRequestContext(null)).toEqual({
+      attached: false,
+      referer: false,
+      origin: false,
+      userAgent: false,
+      cookie: false,
+      accept: false,
+      acceptEncoding: false,
+      acceptLanguage: false,
+      secChUa: false,
+      secChUaMobile: false,
+      secChUaPlatform: false,
+      secFetchSite: false,
+      secFetchMode: false,
+      secFetchDest: false,
+      secFetchStorageAccess: false,
+    })
   })
 })
 

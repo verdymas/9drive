@@ -61,21 +61,34 @@ export class DirectRemoteFetchTransport implements RemoteFetchTransport {
 
     for (let redirects = 0; redirects < MAX_REDIRECTS() + 1; redirects += 1) {
       const { url, dispatcher } = await prepareHop(currentUrl)
+      // Merge order: defaults → captured context → explicit operation headers
+      // → generated Range. Captured values fill gaps but never override the
+      // operation's explicit headers, and a captured Range can never override
+      // the generated probe/download Range (computeHopHeaders never emits it;
+      // the generated value is applied last defensively).
+      let hopHeaders: Record<string, string> | undefined
+      if (requestContext) {
+        // Per-hop header resolver ensures cookie scope is re-checked each hop
+        hopHeaders = hopHeaderResolver(sourceUrl, requestContext)?.(url)
+        if (hopHeaders) {
+          for (const name of Object.keys(hopHeaders)) {
+            if (name.toLowerCase() === 'range') delete hopHeaders[name]
+          }
+        }
+      }
       const headers: Record<string, string> = {
         Accept: '*/*',
         'User-Agent': '9Drive-RemoteImport/1.0',
+        ...(hopHeaders ?? {}),
         ...baseHeaders,
       }
-      if (requestContext) {
-        // Per-hop header resolver ensures cookie scope is re-checked each hop
-        const hopHeaders = hopHeaderResolver(sourceUrl, requestContext)?.(url)
-        if (hopHeaders) Object.assign(headers, hopHeaders)
-      }
+      if (range) headers['Range'] = range
 
-      // Log safe diagnostics
+      // Log safe diagnostics — header NAMES only, never values
       try {
         const targetHost = url.hostname
-        console.log(`[remote-import:transport] route=direct targetHost=${targetHost} method=${method} redirectCount=${redirectCount}`)
+        const forwardedHeaderNames = Object.keys(headers).map((h) => h.toLowerCase()).sort().join(',')
+        console.log(`[remote-import:transport] route=direct targetHost=${targetHost} method=${method} redirectCount=${redirectCount} forwardedHeaderNames=${forwardedHeaderNames}`)
       } catch {}
 
       const res = await request(url.href, {

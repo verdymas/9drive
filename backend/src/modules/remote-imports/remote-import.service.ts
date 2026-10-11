@@ -536,7 +536,7 @@ export type UpdateRemoteImportSourceInput = {
    * `null` clears the field, omitted keys are preserved. Omit the whole
    * object to keep the current context (URL-only edit).
    */
-  requestContext?: Partial<Record<'referer' | 'origin' | 'userAgent' | 'cookie', string | null>> | null
+  requestContext?: Partial<Record<keyof RemoteImportRequestContext, string | null>> | null
   /**
    * New network route. `null` switches to Direct, a worker id switches to
    * that worker. Omit to keep the current route.
@@ -720,6 +720,16 @@ export type RemoteImportRequestContextDetails = {
   referer: string | null
   origin: string | null
   userAgent: string | null
+  accept: string | null
+  acceptEncoding: string | null
+  acceptLanguage: string | null
+  secChUa: string | null
+  secChUaMobile: string | null
+  secChUaPlatform: string | null
+  secFetchSite: string | null
+  secFetchMode: string | null
+  secFetchDest: string | null
+  secFetchStorageAccess: string | null
   cookie: {
     attached: boolean
     masked: string | null
@@ -760,6 +770,16 @@ export async function getRemoteImportRequestContextForUser(
       referer: null,
       origin: null,
       userAgent: null,
+      accept: null,
+      acceptEncoding: null,
+      acceptLanguage: null,
+      secChUa: null,
+      secChUaMobile: null,
+      secChUaPlatform: null,
+      secFetchSite: null,
+      secFetchMode: null,
+      secFetchDest: null,
+      secFetchStorageAccess: null,
       cookie: { attached: false, masked: null },
     }
   }
@@ -770,6 +790,16 @@ export async function getRemoteImportRequestContextForUser(
     referer: ctx.referer ?? null,
     origin: ctx.origin ?? null,
     userAgent: ctx.userAgent ?? null,
+    accept: ctx.accept ?? null,
+    acceptEncoding: ctx.acceptEncoding ?? null,
+    acceptLanguage: ctx.acceptLanguage ?? null,
+    secChUa: ctx.secChUa ?? null,
+    secChUaMobile: ctx.secChUaMobile ?? null,
+    secChUaPlatform: ctx.secChUaPlatform ?? null,
+    secFetchSite: ctx.secFetchSite ?? null,
+    secFetchMode: ctx.secFetchMode ?? null,
+    secFetchDest: ctx.secFetchDest ?? null,
+    secFetchStorageAccess: ctx.secFetchStorageAccess ?? null,
     cookie: {
       attached: cookieAttached,
       masked: cookieAttached ? maskRequestCookie(ctx.cookie) : null,

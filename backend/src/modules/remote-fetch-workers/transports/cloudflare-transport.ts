@@ -117,21 +117,30 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
 
       const method = upstreamMethod
       // Header parity with the Direct transport: baseline defaults, then the
-      // caller's headers, then Range, then the request-context for the initial
-      // hop. The same header set is reused verbatim on every retry.
-      const reqHeaders: Record<string, string> = {
-        Accept: '*/*',
-        'User-Agent': '9Drive-RemoteImport/1.0',
-        ...Object.fromEntries(Object.entries(input.headers ?? {}).filter(([name]) => name.toLowerCase() !== 'cookie')),
-      }
-      if (input.range) reqHeaders['Range'] = input.range
+      // captured request-context, then the caller's explicit headers, then the
+      // generated Range last. Captured values fill gaps but never override the
+      // operation's explicit headers, and a captured Range can never override
+      // the generated probe/download Range. The same header set is reused
+      // verbatim on every retry.
+      let hopHeaders: Record<string, string> | undefined
       // Merge request-context headers for the initial hop (cookie scoped to source)
       if (rc) {
         try {
-          const hopHeaders = hopHeaderResolver(sourceUrl, rc)?.(new URL(targetUrl))
-          if (hopHeaders) Object.assign(reqHeaders, hopHeaders)
+          hopHeaders = hopHeaderResolver(sourceUrl, rc)?.(new URL(targetUrl))
+          if (hopHeaders) {
+            for (const name of Object.keys(hopHeaders)) {
+              if (name.toLowerCase() === 'range') delete hopHeaders[name]
+            }
+          }
         } catch {}
       }
+      const reqHeaders: Record<string, string> = {
+        Accept: '*/*',
+        'User-Agent': '9Drive-RemoteImport/1.0',
+        ...(hopHeaders ?? {}),
+        ...Object.fromEntries(Object.entries(input.headers ?? {}).filter(([name]) => name.toLowerCase() !== 'cookie')),
+      }
+      if (input.range) reqHeaders['Range'] = input.range
       // Optional body: omit when not provided (HEAD/GET). Relay expects body?: string, not body:null.
       const rawBody = (input.body as unknown) as string | undefined | null
       const hasBody = rawBody !== undefined && rawBody !== null && rawBody !== ''
@@ -174,7 +183,7 @@ export class CloudflareRemoteFetchTransport implements RemoteFetchTransport {
       const bodyPresent = 'body' in payload
       const bodyType = typeof (payloadForLog as any).body
       console.log(
-        `[remote-import:transport] protocol=${protocolVersion} route=worker relayMethod=${relayMethod} upstreamMethod=${upstreamMethod} payloadKeys=${payloadKeys} urlType=${urlType} methodType=${methodType} headersType=${headersType} headersCount=${headersCount} headerNames=${headerNames} hasRange=${hasRange} hasReferer=${hasReferer} hasOrigin=${hasOrigin} hasCookie=${hasCookie} bodyPresent=${bodyPresent} bodyType=${bodyType} targetHost=${targetHost}`,
+        `[remote-import:transport] protocol=${protocolVersion} route=worker relayMethod=${relayMethod} upstreamMethod=${upstreamMethod} payloadKeys=${payloadKeys} urlType=${urlType} methodType=${methodType} headersType=${headersType} headersCount=${headersCount} headerNames=${headerNames} forwardedHeaderNames=${headerNames} hasRange=${hasRange} hasReferer=${hasReferer} hasOrigin=${hasOrigin} hasCookie=${hasCookie} bodyPresent=${bodyPresent} bodyType=${bodyType} targetHost=${targetHost}`,
       )
       console.log(
         `[remote-import:transport] protocol=${protocolVersion} payloadKeys=${payloadKeys} contentType=${contentType} targetHost=${targetHost} bodyPresent=${bodyPresent}`,

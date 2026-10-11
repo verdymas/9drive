@@ -127,16 +127,26 @@ chrome.webRequest.onHeadersReceived.addListener(
     if (!isTypeAllowed(cls.type, cfg.captureFilters)) return // capture filter disabled this type
 
     const pageUrl = details.originUrl ?? details.initiator ?? null
-    // Cookie and User-Agent come only from this exact media request.
+    // Request context comes only from this exact media request (matched by
+    // requestId). Captured values win; the page URL is only a Referer fallback.
+    // Origin is never synthesized — absent stays absent.
     const safeContext = {}
-    if (observedContext?.cookie) safeContext.cookie = observedContext.cookie
-    if (observedContext?.userAgent) safeContext.userAgent = observedContext.userAgent
-    if (pageUrl) {
+    if (observedContext) {
+      for (const key of [
+        'cookie', 'userAgent', 'referer', 'origin', 'accept', 'acceptEncoding',
+        'acceptLanguage', 'secChUa', 'secChUaMobile', 'secChUaPlatform',
+        'secFetchSite', 'secFetchMode', 'secFetchDest', 'secFetchStorageAccess',
+      ]) {
+        if (typeof observedContext[key] === 'string' && observedContext[key].length > 0) {
+          safeContext[key] = observedContext[key]
+        }
+      }
+    }
+    if (!safeContext.referer && pageUrl) {
       try {
         const p = new URL(pageUrl)
         if (p.protocol === 'http:' || p.protocol === 'https:') {
           safeContext.referer = p.href
-          safeContext.origin = `${p.protocol}//${p.host}`
         }
       } catch { /* non-http initiator */ }
     }

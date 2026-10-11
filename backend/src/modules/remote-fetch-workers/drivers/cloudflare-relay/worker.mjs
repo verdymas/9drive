@@ -24,6 +24,26 @@ const COOKIE_PROTOCOL_VERSION = '9drive-relay-v2-cookie';
 const SIGNATURE_HEADER = 'x-9drive-signature';
 const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST']);
 const BLOCKED_SCHEMES = new Set(['javascript:', 'file:', 'ftp:', 'data:']);
+// Explicit upstream-header allowlist (lowercase) — mirrors the backend
+// request-context allowlist. Transport-controlled, hop-by-hop and credential
+// headers are never forwarded to the source.
+const ALLOWED_UPSTREAM_HEADERS = new Set([
+  'referer',
+  'origin',
+  'user-agent',
+  'cookie',
+  'accept',
+  'accept-encoding',
+  'accept-language',
+  'sec-ch-ua',
+  'sec-ch-ua-mobile',
+  'sec-ch-ua-platform',
+  'sec-fetch-site',
+  'sec-fetch-mode',
+  'sec-fetch-dest',
+  'sec-fetch-storage-access',
+  'range',
+]);
 
 // Constant-time-ish comparison; not a signature of anything sensitive beyond
 // the shared secret, but avoids early-exit timing hints.
@@ -147,6 +167,9 @@ async function handleFetch(request) {
     for (const [key, value] of Object.entries(headers)) {
       if (typeof value !== 'string') continue;
       if (key.includes('\r') || key.includes('\n') || value.includes('\r') || value.includes('\n')) continue;
+      // Enforce the allowlist: arbitrary, transport-controlled, hop-by-hop
+      // and Authorization headers are stripped, never forwarded.
+      if (!ALLOWED_UPSTREAM_HEADERS.has(String(key).toLowerCase())) continue;
       outHeaders.set(key, value);
     }
   }

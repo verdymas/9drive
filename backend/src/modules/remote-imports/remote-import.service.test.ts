@@ -220,6 +220,16 @@ describe('serializeRemoteImport', () => {
       origin: false,
       userAgent: false,
       cookie: true,
+      accept: false,
+      acceptEncoding: false,
+      acceptLanguage: false,
+      secChUa: false,
+      secChUaMobile: false,
+      secChUaPlatform: false,
+      secFetchSite: false,
+      secFetchMode: false,
+      secFetchDest: false,
+      secFetchStorageAccess: false,
     })
     const wire = JSON.stringify(serialized)
     expect(wire).not.toContain('session=valid')
@@ -235,6 +245,16 @@ describe('serializeRemoteImport', () => {
       origin: false,
       userAgent: false,
       cookie: false,
+      accept: false,
+      acceptEncoding: false,
+      acceptLanguage: false,
+      secChUa: false,
+      secChUaMobile: false,
+      secChUaPlatform: false,
+      secFetchSite: false,
+      secFetchMode: false,
+      secFetchDest: false,
+      secFetchStorageAccess: false,
     })
   })
 

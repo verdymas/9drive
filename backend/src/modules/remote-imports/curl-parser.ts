@@ -2,14 +2,16 @@
  * Pure cURL command parser for Remote Import ("Paste as cURL").
  *
  * SAFETY: this module NEVER executes anything — no child_process, no eval, no
- * shell, no request. It is a byte-level tokenizer that extracts exactly the 5
- * supported values (URL + Referer/Origin/User-Agent/Cookie) and rejects
+ * shell, no request. It is a byte-level tokenizer that extracts exactly the
+ * supported values (URL + the allowlisted request-context headers) and rejects
  * everything else. The backend is authoritative: the frontend may preview, but
  * only this parser's output is ever used to fetch (spec §19).
  *
  * Support (spec §3):
  *   curl 'URL' | curl "URL" | curl URL
- *   -H/--header 'Name: value'   (only the 4 supported names)
+ *   -H/--header 'Name: value'   (only allowlisted names: referer, origin,
+ *     user-agent, cookie, accept, accept-encoding, accept-language,
+ *     sec-ch-ua headers, sec-fetch headers)
  *   -A/--user-agent 'value'
  *   -b/--cookie 'value'
  *   -L/--location (accepted; the fetcher already follows redirects)
@@ -46,8 +48,23 @@ type Arg = { value: string; quoted: boolean }
 /** Shell-composition detection for UNQUOTED tokens (spec §3). */
 const SHELL_COMPOSITION = /[;&|<>{}]|\$\(|`/
 
-/** The 4 supported header names (case-insensitive). */
-const SUPPORTED_HEADER_NAMES = new Set(['referer', 'origin', 'user-agent', 'cookie'])
+/** Allowlisted header names (case-insensitive) — mirrors request-context.ts. */
+const SUPPORTED_HEADER_NAMES = new Set([
+  'referer',
+  'origin',
+  'user-agent',
+  'cookie',
+  'accept',
+  'accept-encoding',
+  'accept-language',
+  'sec-ch-ua',
+  'sec-ch-ua-mobile',
+  'sec-ch-ua-platform',
+  'sec-fetch-site',
+  'sec-fetch-mode',
+  'sec-fetch-dest',
+  'sec-fetch-storage-access',
+])
 
 /**
  * Tokenize a cURL command into logical argv entries, honoring single quotes,
@@ -227,6 +244,16 @@ export function parseCurl(input: string): ParsedCurlRemoteImport {
       else if (name === 'origin') requestContext.origin = value
       else if (name === 'user-agent') requestContext.userAgent = value
       else if (name === 'cookie') requestContext.cookie = value
+      else if (name === 'accept') requestContext.accept = value
+      else if (name === 'accept-encoding') requestContext.acceptEncoding = value
+      else if (name === 'accept-language') requestContext.acceptLanguage = value
+      else if (name === 'sec-ch-ua') requestContext.secChUa = value
+      else if (name === 'sec-ch-ua-mobile') requestContext.secChUaMobile = value
+      else if (name === 'sec-ch-ua-platform') requestContext.secChUaPlatform = value
+      else if (name === 'sec-fetch-site') requestContext.secFetchSite = value
+      else if (name === 'sec-fetch-mode') requestContext.secFetchMode = value
+      else if (name === 'sec-fetch-dest') requestContext.secFetchDest = value
+      else if (name === 'sec-fetch-storage-access') requestContext.secFetchStorageAccess = value
       continue
     }
     if (token === '-A' || token === '--user-agent') {

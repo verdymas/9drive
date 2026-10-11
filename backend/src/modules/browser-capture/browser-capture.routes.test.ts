@@ -275,7 +275,23 @@ describe('captured resource submission + validation', () => {
       requestContext: { cookie: 'session=private-value', referer: 'https://x.example.com/' },
     }, token)
     expect(res.status).toBe(201)
-    expect(res.body.requestContext).toEqual({ attached: true, referer: true, origin: false, userAgent: false, cookie: true })
+    expect(res.body.requestContext).toEqual({
+      attached: true,
+      referer: true,
+      origin: false,
+      userAgent: false,
+      cookie: true,
+      accept: false,
+      acceptEncoding: false,
+      acceptLanguage: false,
+      secChUa: false,
+      secChUaMobile: false,
+      secChUaPlatform: false,
+      secFetchSite: false,
+      secFetchMode: false,
+      secFetchDest: false,
+      secFetchStorageAccess: false,
+    })
     expect(JSON.stringify(res.body)).not.toContain('private-value')
     expect(h.resources[0].requestContextEncrypted).not.toContain('private-value')
     const ok = await call('POST', '/resources', {
@@ -285,7 +301,23 @@ describe('captured resource submission + validation', () => {
     }, token)
     expect(ok.status).toBe(201)
     expect(ok.body.id).toBe(res.body.id)
-    expect(ok.body.requestContext).toEqual({ attached: true, referer: true, origin: false, userAgent: true, cookie: false })
+    expect(ok.body.requestContext).toEqual({
+      attached: true,
+      referer: true,
+      origin: false,
+      userAgent: true,
+      cookie: false,
+      accept: false,
+      acceptEncoding: false,
+      acceptLanguage: false,
+      secChUa: false,
+      secChUaMobile: false,
+      secChUaPlatform: false,
+      secFetchSite: false,
+      secFetchMode: false,
+      secFetchDest: false,
+      secFetchStorageAccess: false,
+    })
     expect(JSON.stringify(ok.body)).not.toContain('private-value')
     expect(h.resources[0].requestContextEncrypted).not.toContain('private-value')
     const listed = await call('GET', '/resources', undefined, token)

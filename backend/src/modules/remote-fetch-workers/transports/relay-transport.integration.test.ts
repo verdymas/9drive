@@ -35,6 +35,16 @@ vi.mock('../../remote-imports/request-context.js', async (importOriginal) => {
         if (ctx.userAgent) headers['User-Agent'] = ctx.userAgent
         if (ctx.cookie) headers['Cookie'] = ctx.cookie
         if (ctx.origin) headers['Origin'] = ctx.origin
+        if (ctx.accept) headers['Accept'] = ctx.accept
+        if (ctx.acceptEncoding) headers['Accept-Encoding'] = ctx.acceptEncoding
+        if (ctx.acceptLanguage) headers['Accept-Language'] = ctx.acceptLanguage
+        if (ctx.secChUa) headers['Sec-CH-UA'] = ctx.secChUa
+        if (ctx.secChUaMobile) headers['Sec-CH-UA-Mobile'] = ctx.secChUaMobile
+        if (ctx.secChUaPlatform) headers['Sec-CH-UA-Platform'] = ctx.secChUaPlatform
+        if (ctx.secFetchSite) headers['Sec-Fetch-Site'] = ctx.secFetchSite
+        if (ctx.secFetchMode) headers['Sec-Fetch-Mode'] = ctx.secFetchMode
+        if (ctx.secFetchDest) headers['Sec-Fetch-Dest'] = ctx.secFetchDest
+        if (ctx.secFetchStorageAccess) headers['Sec-Fetch-Storage-Access'] = ctx.secFetchStorageAccess
         return Object.keys(headers).length > 0 ? headers : undefined
       }
     },

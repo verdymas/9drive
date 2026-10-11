@@ -34,6 +34,16 @@ const requestContextSchema = z
     origin: z.string().max(2048).optional(),
     userAgent: z.string().max(2048).optional(),
     cookie: z.string().max(env.REMOTE_IMPORT_REQUEST_CONTEXT_MAX_COOKIE_BYTES).optional(),
+    accept: z.string().max(1024).optional(),
+    acceptEncoding: z.string().max(512).optional(),
+    acceptLanguage: z.string().max(1024).optional(),
+    secChUa: z.string().max(1024).optional(),
+    secChUaMobile: z.string().max(8).optional(),
+    secChUaPlatform: z.string().max(128).optional(),
+    secFetchSite: z.string().max(32).optional(),
+    secFetchMode: z.string().max(32).optional(),
+    secFetchDest: z.string().max(32).optional(),
+    secFetchStorageAccess: z.string().max(32).optional(),
   })
   .strict()
   .optional()
@@ -278,6 +288,16 @@ remoteImportRouter.patch('/:id/download-url', requireAuth, async (req: AuthReque
           origin: z.string().max(2048).nullable().optional(),
           userAgent: z.string().max(2048).nullable().optional(),
           cookie: z.string().max(env.REMOTE_IMPORT_REQUEST_CONTEXT_MAX_COOKIE_BYTES).nullable().optional(),
+          accept: z.string().max(1024).nullable().optional(),
+          acceptEncoding: z.string().max(512).nullable().optional(),
+          acceptLanguage: z.string().max(1024).nullable().optional(),
+          secChUa: z.string().max(1024).nullable().optional(),
+          secChUaMobile: z.string().max(8).nullable().optional(),
+          secChUaPlatform: z.string().max(128).nullable().optional(),
+          secFetchSite: z.string().max(32).nullable().optional(),
+          secFetchMode: z.string().max(32).nullable().optional(),
+          secFetchDest: z.string().max(32).nullable().optional(),
+          secFetchStorageAccess: z.string().max(32).nullable().optional(),
         })
         .strict()
         .optional(),

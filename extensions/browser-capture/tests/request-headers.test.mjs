@@ -15,6 +15,55 @@ test('matches request id and redirect URL without mixing concurrent requests', (
   assert.equal(tracker.snapshot('a', 'https://a.example/final'), null)
 })
 
+test('captures the browser-equivalence allowlist from the matching requestId', () => {
+  const tracker = new RequestHeaderTracker()
+  const headers = [
+    { name: 'sec-ch-ua-platform', value: '"Windows"' },
+    { name: 'User-Agent', value: 'Mozilla/5.0 Chrome/155' },
+    { name: 'sec-ch-ua', value: '"Google Chrome";v="155"' },
+    { name: 'sec-ch-ua-mobile', value: '?0' },
+    { name: 'Sec-Fetch-Site', value: 'cross-site' },
+    { name: 'Sec-Fetch-Mode', value: 'no-cors' },
+    { name: 'Sec-Fetch-Dest', value: 'video' },
+    { name: 'Sec-Fetch-Storage-Access', value: 'active' },
+    { name: 'Referer', value: 'https://site.example/post/1.html' },
+    { name: 'Accept-Encoding', value: 'identity' },
+    { name: 'Accept-Language', value: 'en-US,en;q=0.9' },
+    { name: 'Cookie', value: 'session=abc' },
+  ]
+  tracker.record('req-1', 'https://media.example/video.mp4', headers)
+  assert.deepEqual(tracker.snapshot('req-1', 'https://media.example/video.mp4'), {
+    secChUaPlatform: '"Windows"',
+    userAgent: 'Mozilla/5.0 Chrome/155',
+    secChUa: '"Google Chrome";v="155"',
+    secChUaMobile: '?0',
+    secFetchSite: 'cross-site',
+    secFetchMode: 'no-cors',
+    secFetchDest: 'video',
+    secFetchStorageAccess: 'active',
+    referer: 'https://site.example/post/1.html',
+    acceptEncoding: 'identity',
+    acceptLanguage: 'en-US,en;q=0.9',
+    cookie: 'session=abc',
+  })
+  // Another requestId never sees these headers.
+  assert.equal(tracker.snapshot('req-2', 'https://media.example/video.mp4'), null)
+})
+
+test('strips transport-controlled, authorization and range headers', () => {
+  const tracker = new RequestHeaderTracker()
+  tracker.record('req-1', 'https://media.example/video.mp4', [
+    { name: 'Connection', value: 'keep-alive' },
+    { name: 'Host', value: 'media.example' },
+    { name: 'Content-Length', value: '123' },
+    { name: 'Authorization', value: 'Bearer secret' },
+    { name: 'Range', value: 'bytes=5-10' },
+    { name: 'X-Custom', value: 'evil' },
+    { name: 'User-Agent', value: 'Browser' },
+  ])
+  assert.deepEqual(tracker.snapshot('req-1', 'https://media.example/video.mp4'), { userAgent: 'Browser' })
+})
+
 test('missing Cookie, expiry, and capacity pruning', () => {
   let now = 0
   const tracker = new RequestHeaderTracker({ now: () => now, ttlMs: 10, maxEntries: 2 })

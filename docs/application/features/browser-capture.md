@@ -46,6 +46,6 @@ The backend build runs `scripts/zip-extension.mjs` so the extension artifact can
 
 ## Authenticated requests
 
-The extension observes Cookie and User-Agent on the matching media request through `webRequest` with `extraHeaders`. Cookie stays in short-lived service-worker memory and goes only in the device-authenticated submission. It is absent from local captures, popup messages, and logs. A failed offline submission loses that context; capture the request again after reconnecting.
+The extension observes the allowlisted request headers (Cookie, User-Agent, Referer, Origin, Accept, Accept-Encoding, Accept-Language, Sec-CH-UA*, Sec-Fetch-*) on the matching media request (correlated by `requestId`) through `webRequest` with `extraHeaders`. Transport-controlled, hop-by-hop, Authorization, and Range headers are never captured. Cookie stays in short-lived service-worker memory and goes only in the device-authenticated submission. It is absent from local captures, popup messages, and logs. A failed offline submission loses that context; capture the request again after reconnecting. The captured Referer wins over the page-URL fallback, and Origin is never synthesized when the browser did not send one.
 
 The API validates the allowlisted request context and stores it encrypted for Remote Import. Resource and import responses report header presence as booleans. Cookie is forwarded only to the exact origin of the original import URL, including its scheme and port.
