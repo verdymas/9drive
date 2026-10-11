@@ -387,6 +387,35 @@ export function RequestContextDialog({ importId, fileName, editable, currentWork
               ) : null}
             </div>
           )}
+          {/* Browser-equivalence headers captured from the original request.
+              View-only: attached values with copy, never editable — completed
+              imports must not mutate, and failed/cancelled/queued editing
+              stays on the core fields above. Omitted when none are attached. */}
+          {(
+            [
+              { label: 'Accept', value: details.accept, key: 'accept' },
+              { label: 'Accept-Encoding', value: details.acceptEncoding, key: 'acceptEncoding' },
+              { label: 'Accept-Language', value: details.acceptLanguage, key: 'acceptLanguage' },
+              { label: 'Sec-CH-UA', value: details.secChUa, key: 'secChUa' },
+              { label: 'Sec-CH-UA-Mobile', value: details.secChUaMobile, key: 'secChUaMobile' },
+              { label: 'Sec-CH-UA-Platform', value: details.secChUaPlatform, key: 'secChUaPlatform' },
+              { label: 'Sec-Fetch-Site', value: details.secFetchSite, key: 'secFetchSite' },
+              { label: 'Sec-Fetch-Mode', value: details.secFetchMode, key: 'secFetchMode' },
+              { label: 'Sec-Fetch-Dest', value: details.secFetchDest, key: 'secFetchDest' },
+              { label: 'Sec-Fetch-Storage-Access', value: details.secFetchStorageAccess, key: 'secFetchStorageAccess' },
+            ] as Array<{ label: string; value: string | null | undefined; key: string }>
+          )
+            .filter((h) => h.value != null && h.value !== '')
+            .map((h) => (
+              <FieldRow
+                key={h.key}
+                label={h.label}
+                value={h.value ?? ''}
+                copyLabel={`Copy ${h.label}`}
+                copied={copiedKey === h.key}
+                onCopy={() => handleCopy(h.key, h.value ?? '')}
+              />
+            ))}
           <div className="min-w-0">
             <div className="flex min-w-0 items-center justify-between gap-2">
               <p className="inline-flex items-center gap-1.5 text-xs font-bold uppercase tracking-wide text-slate-500">

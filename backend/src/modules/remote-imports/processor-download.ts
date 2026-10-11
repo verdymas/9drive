@@ -25,7 +25,7 @@ export async function downloadSourceToTemp(
   let totalBytes = 0n
 
   if (fetcher) {
-    const response = await fetcher.fetch({ method: 'GET', url: startUrl, requestContext: context.requestContext as any } as any)
+    const response = await fetcher.fetch({ method: 'GET', url: startUrl, requestContext: context.requestContext as any, traceId: context.importId } as any)
     const rawLength = response.headers['content-length']
     if (rawLength) contentLength = BigInt(rawLength)
     supportsRange = response.headers['accept-ranges'] === 'bytes' || response.status === 206

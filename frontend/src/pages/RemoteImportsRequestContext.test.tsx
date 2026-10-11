@@ -101,6 +101,16 @@ function installMocks() {
         referer: 'https://example.com/watch/123',
         origin: 'https://example.com',
         userAgent: 'Mozilla/5.0 test-agent',
+        accept: null,
+        acceptEncoding: 'identity',
+        acceptLanguage: 'en-US,en;q=0.9',
+        secChUa: '"Google Chrome";v="155"',
+        secChUaMobile: '?0',
+        secChUaPlatform: '"Windows"',
+        secFetchSite: 'cross-site',
+        secFetchMode: 'no-cors',
+        secFetchDest: 'video',
+        secFetchStorageAccess: 'active',
         cookie: { attached: currentCookieMasked != null, masked: currentCookieMasked },
       }
     }
@@ -133,6 +143,28 @@ describe('RemoteImportsPage request-context action', () => {
     // Completed imports are not editable — no Edit affordance.
     expect(screen.queryByRole('button', { name: 'Edit Download URL' })).not.toBeInTheDocument()
     expect(apiFetchMock).toHaveBeenCalledWith('/remote-imports/with-ctx/request-context')
+  })
+
+  it('completed dialog shows attached browser headers view-only with copy', async () => {
+    installMocks()
+    const { RemoteImportsPage } = await import('@/pages/RemoteImportsPage')
+    render(<RemoteImportsPage />)
+
+    const viewButtons = await screen.findAllByRole('button', { name: /View request context for protected\.mkv/ })
+    fireEvent.click(viewButtons[0])
+
+    // Attached browser-equivalence values are visible with copy affordances.
+    expect(await screen.findByText('video')).toBeInTheDocument()
+    expect(screen.getByText('"Windows"')).toBeInTheDocument()
+    expect(screen.getByText('en-US,en;q=0.9')).toBeInTheDocument()
+    expect(screen.getByText('identity')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Copy Sec-Fetch-Dest' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Copy Sec-CH-UA-Platform' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Copy Accept-Language' })).toBeInTheDocument()
+    // View-only: no edit affordances for the new headers on a completed import.
+    expect(screen.queryByRole('button', { name: 'Edit Sec-Fetch-Dest' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Add Sec-Fetch-Dest' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Edit Download URL' })).not.toBeInTheDocument()
   })
 
   it('failed imports expose Edit and saving requeues with the new URL', async () => {

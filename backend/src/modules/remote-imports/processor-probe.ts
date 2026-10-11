@@ -13,7 +13,7 @@ export type ProbeFetcher = {
 
 /** Probe a source with a one-byte range and enforce the configured size cap. */
 export async function probeSource(
-  context: Pick<RemoteImportProcessorContext, 'sourceUrl' | 'requestContext' | 'maxBytes'>,
+  context: Pick<RemoteImportProcessorContext, 'sourceUrl' | 'requestContext' | 'maxBytes' | 'importId'>,
   fetcher: ProbeFetcher,
 ): Promise<ProbeResult> {
   const response = await fetcher.fetch({
@@ -22,6 +22,7 @@ export async function probeSource(
     headers: { Range: 'bytes=0-0' },
     range: 'bytes=0-0',
     requestContext: context.requestContext as any,
+    traceId: (context as { importId?: string }).importId,
   })
   const contentRange = response.headers['content-range']
   const rangeMatch = /^bytes 0-0\/(\d+)$/.exec(contentRange ?? '')

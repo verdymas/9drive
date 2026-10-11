@@ -104,7 +104,8 @@ export type RequestContextInput = {
 
 /**
  * Boolean-only summary of an attached request context (spec §19, §36). Values
- * are never serialized — only which fields are attached.
+ * are never serialized — only which fields are attached. Extended flags stay
+ * optional so older payloads and test fixtures without them still typecheck.
  */
 export type RequestContextSummary = {
   attached: boolean
@@ -112,6 +113,16 @@ export type RequestContextSummary = {
   origin: boolean
   userAgent: boolean
   cookie: boolean
+  accept?: boolean
+  acceptEncoding?: boolean
+  acceptLanguage?: boolean
+  secChUa?: boolean
+  secChUaMobile?: boolean
+  secChUaPlatform?: boolean
+  secFetchSite?: boolean
+  secFetchMode?: boolean
+  secFetchDest?: boolean
+  secFetchStorageAccess?: boolean
 }
 
 /** Result of the backend-authoritative cURL parse (booleans only, §19). */
@@ -237,6 +248,17 @@ export type RemoteImportRequestContextDetails = {
   referer: string | null
   origin: string | null
   userAgent: string | null
+  /** Browser-equivalence headers (view-only; never editable in the dialog). */
+  accept?: string | null
+  acceptEncoding?: string | null
+  acceptLanguage?: string | null
+  secChUa?: string | null
+  secChUaMobile?: string | null
+  secChUaPlatform?: string | null
+  secFetchSite?: string | null
+  secFetchMode?: string | null
+  secFetchDest?: string | null
+  secFetchStorageAccess?: string | null
   cookie: {
     attached: boolean
     masked: string | null
