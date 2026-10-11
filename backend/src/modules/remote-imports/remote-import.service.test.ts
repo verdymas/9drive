@@ -577,6 +577,147 @@ describe('updateRemoteImportSourceUrl', () => {
     })
   })
 
+  it('merges a single context field, preserving the rest', async () => {
+    // Crypto is identity-mocked: the stored blob is the JSON itself.
+    await withRow({
+      status: 'failed',
+      sourceType: null,
+      sourceUrlEncrypted: 'https://cdn.example/a.mkv',
+      requestContextEncrypted: JSON.stringify({ referer: 'https://old.example/1', cookie: 'session=old' }),
+    })
+    await updateRemoteImportSourceUrl('import-1', 'user-1', { requestContext: { cookie: 'session=new' } })
+    const payload = (h.prismaMock.remoteImport.updateMany as ReturnType<typeof vi.fn>).mock.calls[0][0].data
+    expect(JSON.parse(payload.requestContextEncrypted)).toEqual({
+      referer: 'https://old.example/1',
+      cookie: 'session=new',
+    })
+    // Context-only edit keeps the URL blob untouched.
+    expect(payload.sourceUrlEncrypted).toBe('https://cdn.example/a.mkv')
+    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2, 'direct')
+  })
+
+  it('null clears a context field (remove semantics)', async () => {
+    await withRow({
+      status: 'failed',
+      sourceType: null,
+      sourceUrlEncrypted: 'https://cdn.example/a.mkv',
+      requestContextEncrypted: JSON.stringify({ referer: 'https://old.example/1', cookie: 'session=old' }),
+    })
+    await updateRemoteImportSourceUrl('import-1', 'user-1', { requestContext: { referer: null } })
+    const payload = (h.prismaMock.remoteImport.updateMany as ReturnType<typeof vi.fn>).mock.calls[0][0].data
+    expect(JSON.parse(payload.requestContextEncrypted)).toEqual({ cookie: 'session=old' })
+  })
+
+  it('clearing the last context field stores null (becomes context-less)', async () => {
+    await withRow({
+      status: 'failed',
+      sourceType: null,
+      sourceUrlEncrypted: 'https://cdn.example/a.mkv',
+      requestContextEncrypted: JSON.stringify({ cookie: 'session=old' }),
+    })
+    await updateRemoteImportSourceUrl('import-1', 'user-1', { requestContext: { cookie: null } })
+    const payload = (h.prismaMock.remoteImport.updateMany as ReturnType<typeof vi.fn>).mock.calls[0][0].data
+    expect(payload.requestContextEncrypted).toBeNull()
+  })
+
+  it('rejects header injection in a context edit (same validation as creation)', async () => {
+    await withRow({ status: 'failed', sourceType: null, sourceUrlEncrypted: 'https://cdn.example/a.mkv' })
+    await expect(
+      updateRemoteImportSourceUrl('import-1', 'user-1', { requestContext: { referer: 'https://x.example/\r\nEvil: 1' } }),
+    ).rejects.toMatchObject({ code: 'REMOTE_IMPORT_REQUEST_CONTEXT_INVALID' })
+    expect(h.enqueueSpy).not.toHaveBeenCalled()
+  })
+
+  it('rejects an empty patch (neither URL, context, nor route)', async () => {
+    await withRow({ status: 'failed', sourceType: null })
+    await expect(updateRemoteImportSourceUrl('import-1', 'user-1', {})).rejects.toMatchObject({
+      code: 'INVALID_REQUEST',
+    })
+    expect(h.enqueueSpy).not.toHaveBeenCalled()
+  })
+
+  it('switches Direct → worker: validates the worker, snapshots the name, skips backend DNS', async () => {
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'worker-A',
+      name: 'Cloudflare SG #1',
+      driver: 'cloudflare',
+      isEnabled: true,
+    })
+    await withRow({ status: 'failed', sourceType: null, sourceUrlEncrypted: 'https://cdn.example/a.mkv', workerId: null })
+    await updateRemoteImportSourceUrl('import-1', 'user-1', { workerId: 'worker-A' })
+    const payload = (h.prismaMock.remoteImport.updateMany as ReturnType<typeof vi.fn>).mock.calls[0][0].data
+    expect(payload.workerId).toBe('worker-A')
+    expect(payload.workerNameSnapshot).toBe('Cloudflare SG #1')
+    // Relay mode: backend DNS is skipped for the (unchanged) URL.
+    expect(h.validateUrlSpy).toHaveBeenCalledWith('https://cdn.example/a.mkv', { resolveDns: false })
+    expect(h.enqueueSpy).toHaveBeenCalledWith('import-1', 2, 'direct')
+  })
+
+  it('switches worker → Direct: clears the id and snapshot, restores backend DNS', async () => {
+    await withRow({
+      status: 'failed',
+      sourceType: null,
+      sourceUrlEncrypted: 'https://cdn.example/a.mkv',
+      workerId: 'worker-A',
+      workerNameSnapshot: 'Cloudflare SG #1',
+    })
+    await updateRemoteImportSourceUrl('import-1', 'user-1', { workerId: null })
+    const payload = (h.prismaMock.remoteImport.updateMany as ReturnType<typeof vi.fn>).mock.calls[0][0].data
+    expect(payload.workerId).toBeNull()
+    expect(payload.workerNameSnapshot).toBeNull()
+    expect(h.validateUrlSpy).toHaveBeenCalledWith('https://cdn.example/a.mkv', { resolveDns: true })
+  })
+
+  it('rejects switching to a deleted/disabled/unsupported worker (no silent fallback)', async () => {
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue(null)
+    await withRow({ status: 'failed', sourceType: null, workerId: null })
+    await expect(updateRemoteImportSourceUrl('import-1', 'user-1', { workerId: 'worker-gone' })).rejects.toMatchObject({
+      code: 'REMOTE_IMPORT_WORKER_INVALID',
+      status: 400,
+    })
+    expect(h.enqueueSpy).not.toHaveBeenCalled()
+
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'worker-off',
+      name: 'Off',
+      driver: 'cloudflare',
+      isEnabled: false,
+    })
+    await withRow({ status: 'failed', sourceType: null, workerId: null })
+    await expect(updateRemoteImportSourceUrl('import-1', 'user-1', { workerId: 'worker-off' })).rejects.toMatchObject({
+      code: 'REMOTE_IMPORT_WORKER_DISABLED',
+    })
+
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'worker-fut',
+      name: 'Future',
+      driver: 'vercel',
+      isEnabled: true,
+    })
+    await withRow({ status: 'failed', sourceType: null, workerId: null })
+    await expect(updateRemoteImportSourceUrl('import-1', 'user-1', { workerId: 'worker-fut' })).rejects.toMatchObject({
+      code: 'REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED',
+    })
+  })
+
+  it('URL + worker can change together (DNS follows the new route)', async () => {
+    ;(h.prismaMock.remoteFetchWorker.findFirst as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'worker-A',
+      name: 'Cloudflare SG #1',
+      driver: 'cloudflare',
+      isEnabled: true,
+    })
+    await withRow({ status: 'failed', sourceType: null, workerId: null })
+    await updateRemoteImportSourceUrl('import-1', 'user-1', {
+      sourceUrl: 'https://firewalled.internal/stream',
+      workerId: 'worker-A',
+    })
+    expect(h.validateUrlSpy).toHaveBeenCalledWith('https://firewalled.internal/stream', { resolveDns: false })
+    const payload = (h.prismaMock.remoteImport.updateMany as ReturnType<typeof vi.fn>).mock.calls[0][0].data
+    expect(payload.sourceUrlEncrypted).toBe('https://firewalled.internal/stream')
+    expect(payload.workerId).toBe('worker-A')
+  })
+
   it('validates the URL through the SSRF gate before touching the row', async () => {
     ;(h.validateUrlSpy as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new AppError('URL_HOST_BLOCKED', 'Blocked.', 400))
     await withRow({ status: 'failed' })

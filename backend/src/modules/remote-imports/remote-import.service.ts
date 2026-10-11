@@ -9,6 +9,7 @@ import {
   encryptRequestContext,
   maskRequestCookie,
   serializeRequestContext,
+  validateRequestContext,
   type RemoteImportRequestContext,
 } from './request-context.js'
 import { enqueueRemoteImport, removeRemoteImportJob, remoteImportJobId, workloadForRemoteImport } from './queue.js'
@@ -527,33 +528,95 @@ export async function retryRemoteImport(importId: string, userId: string) {
   return enqueueRetry(importId, userId, 'full')
 }
 
+export type UpdateRemoteImportSourceInput = {
+  /** New source URL. Omit to keep the current URL (context-only edit). */
+  sourceUrl?: string
+  /**
+   * Request-context patch with merge semantics: present keys are replaced,
+   * `null` clears the field, omitted keys are preserved. Omit the whole
+   * object to keep the current context (URL-only edit).
+   */
+  requestContext?: Partial<Record<'referer' | 'origin' | 'userAgent' | 'cookie', string | null>> | null
+  /**
+   * New network route. `null` switches to Direct, a worker id switches to
+   * that worker. Omit to keep the current route.
+   */
+  workerId?: string | null
+}
+
 /**
- * Replace the source URL of a failed/cancelled/queued import and auto-requeue
- * it (full re-run). The Download URL is editable because signed URLs expire —
- * the fix is usually a fresh URL for the SAME resource, not a new import.
+ * Edit the source URL, request context, and/or network route of a
+ * failed/cancelled/queued import and auto-requeue it (full re-run). Signed
+ * URLs and session cookies expire — a fresh value for the SAME resource is an
+ * update, not a new import.
  *
- * Type-sticky: `sourceType`/HLS selection is preserved (the main use case is a
- * refreshed signed URL for the same playlist). Resume/progress state is wiped:
- * a new URL must never resume mid-pipeline from the old URL's bytes
+ * Type-sticky: `sourceType`/HLS selection is preserved (the main use case is
+ * refreshed credentials for the same playlist). Resume/progress state is wiped:
+ * new credentials must never resume mid-pipeline from the old URL's bytes
  * (`retryFromStage` cleared, temp parts + HLS scratch removed, stale probe
- * evidence reset). Same SSRF/worker validation as creation.
+ * evidence reset). Same SSRF/worker validation as creation. At least one of
+ * `sourceUrl` / `requestContext` / `workerId` is required.
  */
-export async function updateRemoteImportSourceUrl(importId: string, userId: string, sourceUrl: string) {
+export async function updateRemoteImportSourceUrl(importId: string, userId: string, input: string | UpdateRemoteImportSourceInput) {
+  const patch: UpdateRemoteImportSourceInput = typeof input === 'string' ? { sourceUrl: input } : input
   const row = await getRemoteImportForUser(importId, userId)
   if (row.status !== 'failed' && row.status !== 'cancelled' && row.status !== 'queued') {
-    throw new AppError('REMOTE_IMPORT_NOT_EDITABLE', 'Only failed, cancelled, or queued imports can have their URL edited.', 409)
+    throw new AppError('REMOTE_IMPORT_NOT_EDITABLE', 'Only failed, cancelled, or queued imports can be edited.', 409)
+  }
+  if (patch.sourceUrl == null && patch.requestContext == null && !('workerId' in patch)) {
+    throw new AppError('INVALID_REQUEST', 'Provide a URL, a request context, a network route, or a combination.', 400)
   }
 
-  // Same worker guard as a retry: never silently switch to Direct.
-  if (row.workerId) {
+  // Resolve the NEW route first: validation + DNS routing both follow it.
+  // A worker switch is validated like creation (missing/disabled/unsupported
+  // → clear error; never a silent fallback). `null` = Direct (always valid).
+  const nextWorkerId = 'workerId' in patch ? (patch.workerId ?? null) : row.workerId
+  let workerNameSnapshot = row.workerNameSnapshot
+  if ('workerId' in patch) {
+    if (nextWorkerId) {
+      const worker = await prisma.remoteFetchWorker.findFirst({ where: { id: nextWorkerId, deletedAt: null } })
+      if (!worker) throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_INVALID, 'The selected network worker does not exist.', 400)
+      if (!worker.isEnabled) throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_DISABLED, 'The selected network worker is disabled.', 400)
+      if (!hasDriver(worker.driver)) throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED, 'The selected network worker uses an unsupported service.', 400)
+      workerNameSnapshot = worker.name
+    } else {
+      workerNameSnapshot = null
+    }
+  } else if (row.workerId) {
+    // Route unchanged but worker-backed: same guard as a retry — never run
+    // against a worker that has since been deleted/disabled/unsupported.
     const worker = await prisma.remoteFetchWorker.findFirst({ where: { id: row.workerId, deletedAt: null } })
     if (!worker || !worker.isEnabled || !hasDriver(worker.driver)) {
       throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_UNAVAILABLE, REMOTE_FETCH_WORKER_ERROR_MESSAGES.REMOTE_IMPORT_WORKER_UNAVAILABLE, 409)
     }
   }
 
-  // Same URL gate as creation: syntax/policy always, backend DNS only Direct.
-  await validateRemoteUrl(sourceUrl, { resolveDns: !row.workerId })
+  if (!env.REMOTE_IMPORT_REQUEST_CONTEXT_ENABLED && patch.requestContext != null && Object.keys(patch.requestContext).length > 0) {
+    throw new AppError('REMOTE_IMPORT_REQUEST_CONTEXT_INVALID', 'Request context support is disabled.', 403)
+  }
+
+  // Same URL gate as creation: syntax/policy always, backend DNS only when
+  // the NEW route is Direct. A credentials-only edit re-validates the CURRENT
+  // url (decrypted); the retry would hit it seconds later, so fail fast with
+  // a clear error instead.
+  const nextSourceUrl = patch.sourceUrl ?? decryptText((row as { sourceUrlEncrypted: string }).sourceUrlEncrypted)
+  await validateRemoteUrl(nextSourceUrl, { resolveDns: !nextWorkerId })
+
+  // Merge semantics: start from the decrypted current context, apply the
+  // patch (null clears), then run the same authoritative validation as
+  // creation (CR/LF rejection + per-field caps + origin normalization).
+  const currentCtx = decryptRequestContext((row as { requestContextEncrypted?: string | null }).requestContextEncrypted ?? null) ?? {}
+  const mergedRaw: Record<string, string | null | undefined> = { ...currentCtx }
+  if (patch.requestContext != null) {
+    for (const [key, value] of Object.entries(patch.requestContext)) {
+      mergedRaw[key] = value
+    }
+  }
+  const merged: RemoteImportRequestContext = {}
+  for (const [key, value] of Object.entries(mergedRaw)) {
+    if (value != null && String(value).trim() !== '') merged[key as keyof RemoteImportRequestContext] = String(value)
+  }
+  const validatedCtx = validateRequestContext(merged)
 
   const nextAttempt = row.attempt + 1
   let jobId: string
@@ -574,8 +637,11 @@ export async function updateRemoteImportSourceUrl(importId: string, userId: stri
   const updated = await prisma.remoteImport.updateMany({
     where: { id: importId, status: { in: ['failed', 'cancelled', 'queued'] } },
     data: {
-      sourceUrlEncrypted: encryptText(sourceUrl),
-      displayUrl: displayUrl(sourceUrl),
+      sourceUrlEncrypted: encryptText(nextSourceUrl),
+      requestContextEncrypted: validatedCtx ? encryptRequestContext(validatedCtx) : null,
+      displayUrl: displayUrl(nextSourceUrl),
+      workerId: nextWorkerId,
+      workerNameSnapshot,
       finalUrlEncrypted: null,
       status: 'queued',
       stage: 'waiting',

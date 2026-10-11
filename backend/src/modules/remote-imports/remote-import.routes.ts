@@ -17,6 +17,7 @@ import {
   retryRemoteImport,
   serializeRemoteImport,
   updateRemoteImportSourceUrl,
+  type UpdateRemoteImportSourceInput,
 } from './remote-import.service.js'
 import { HLS_ERROR_CODES, HLS_ERROR_MESSAGES } from './hls/errors.js'
 
@@ -256,16 +257,38 @@ remoteImportRouter.get('/:id/request-context', requireAuth, async (req: AuthRequ
 })
 
 /**
- * Replace the source URL of a failed/cancelled/queued import and auto-requeue
- * it (full re-run). Signed URLs expire — a fresh URL for the SAME resource is
- * an update, not a new import. HLS selection is preserved (type-sticky);
- * resume/progress state is wiped (never resume the old URL's bytes).
+ * Edit the source URL, request context, and/or network route of a
+ * failed/cancelled/queued import and auto-requeue it (full re-run). Signed
+ * URLs and session cookies expire — fresh values for the SAME resource are an
+ * update, not a new import. HLS selection is preserved (type-sticky);
+ * resume/progress state is wiped (never resume the old credentials' bytes).
  * Same SSRF validation as creation.
+ *
+ * `requestContext` uses merge semantics: present keys replace, `null` clears,
+ * omitted keys are preserved. `workerId: null` switches to Direct; omit to
+ * keep the current route. Unknown keys are rejected.
  */
 remoteImportRouter.patch('/:id/download-url', requireAuth, async (req: AuthRequest, res, next) => {
   try {
-    const body = z.object({ url: z.string().min(1).max(4096) }).parse(req.body)
-    const row = await updateRemoteImportSourceUrl(String(req.params.id), req.user!.id, body.url)
+    const body = z.object({
+      url: z.string().min(1).max(4096).optional(),
+      requestContext: z
+        .object({
+          referer: z.string().max(4096).nullable().optional(),
+          origin: z.string().max(2048).nullable().optional(),
+          userAgent: z.string().max(2048).nullable().optional(),
+          cookie: z.string().max(env.REMOTE_IMPORT_REQUEST_CONTEXT_MAX_COOKIE_BYTES).nullable().optional(),
+        })
+        .strict()
+        .optional(),
+      workerId: z.string().nullable().optional(),
+    }).parse(req.body)
+    const patch: UpdateRemoteImportSourceInput = {
+      sourceUrl: body.url,
+      requestContext: body.requestContext ?? undefined,
+    }
+    if ('workerId' in body) patch.workerId = body.workerId ?? null
+    const row = await updateRemoteImportSourceUrl(String(req.params.id), req.user!.id, patch)
     return res.json(serializeRemoteImport(row))
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ code: 'INVALID_REQUEST', message: error.issues[0]?.message ?? 'Invalid request.' })

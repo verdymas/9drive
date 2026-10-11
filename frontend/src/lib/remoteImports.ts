@@ -249,15 +249,30 @@ export function getRemoteImportRequestContext(id: string, opts?: { revealCookie?
   return apiFetch<RemoteImportRequestContextDetails>(`/remote-imports/${encodeURIComponent(id)}/request-context${suffix}`)
 }
 
+export type UpdateRemoteImportSourcePatch = {
+  url?: string
+  /**
+   * Merge semantics: present keys replace, `null` clears, omitted keys are
+   * preserved.
+   */
+  requestContext?: Partial<Record<'referer' | 'origin' | 'userAgent' | 'cookie', string | null>>
+  /**
+   * New network route. `null` switches to Direct; omit to keep the current
+   * route.
+   */
+  workerId?: string | null
+}
+
 /**
- * Replace the source URL of a failed/cancelled/queued import. The backend
- * auto-requeues it (full re-run, resume state wiped). HLS selection is
- * preserved.
+ * Edit the source URL, request context, and/or network route of a
+ * failed/cancelled/queued import. The backend auto-requeues it (full re-run,
+ * resume state wiped). HLS selection is preserved.
  */
-export function updateRemoteImportDownloadUrl(id: string, url: string) {
+export function updateRemoteImportDownloadUrl(id: string, patch: string | UpdateRemoteImportSourcePatch) {
+  const body = typeof patch === 'string' ? { url: patch } : patch
   return apiFetch<RemoteImportItem>(`/remote-imports/${encodeURIComponent(id)}/download-url`, {
     method: 'PATCH',
-    body: JSON.stringify({ url }),
+    body: JSON.stringify(body),
   })
 }
 

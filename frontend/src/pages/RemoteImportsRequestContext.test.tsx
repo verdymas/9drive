@@ -45,6 +45,15 @@ const failedCtx = {
   stage: 'finished',
   errorMessage: 'The download link expired.',
 }
+const failedNoCtx = {
+  ...withCtx,
+  id: 'failed-no-ctx',
+  fileName: 'nocreds.bin',
+  status: 'failed',
+  stage: 'finished',
+  errorMessage: 'The source needs a cookie.',
+  requestContext: { attached: false, referer: false, origin: false, userAgent: false, cookie: false },
+}
 
 const apiFetchMock = vi.fn()
 
@@ -61,26 +70,42 @@ afterEach(() => {
 })
 
 let currentDownloadUrl = 'https://cdn.example.com/file.mkv?token=signed-value'
+let currentCookieMasked: string | null = `session=${MASKED}`
 
 function installMocks() {
   currentDownloadUrl = 'https://cdn.example.com/file.mkv?token=signed-value'
+  currentCookieMasked = `session=${MASKED}`
   apiFetchMock.mockImplementation(async (path: string, options?: { method?: string; body?: string }) => {
     if (typeof path === 'string' && path.endsWith('/download-url') && options?.method === 'PATCH') {
-      currentDownloadUrl = JSON.parse(options.body ?? '{}').url
+      const body = JSON.parse(options.body ?? '{}')
+      if (body.url) currentDownloadUrl = body.url
+      if (body.requestContext && 'cookie' in body.requestContext) {
+        currentCookieMasked = body.requestContext.cookie ? `session=${MASKED}` : null
+      }
       return { ...failedCtx, status: 'queued', stage: 'waiting', attempt: 2 }
     }
     if (typeof path === 'string' && path.includes('/request-context')) {
+      if (path.includes('failed-no-ctx')) {
+        return {
+          attached: false,
+          downloadUrl: currentDownloadUrl,
+          referer: null,
+          origin: null,
+          userAgent: null,
+          cookie: { attached: false, masked: null },
+        }
+      }
       return {
         attached: true,
         downloadUrl: currentDownloadUrl,
         referer: 'https://example.com/watch/123',
         origin: 'https://example.com',
         userAgent: 'Mozilla/5.0 test-agent',
-        cookie: { attached: true, masked: `session=${MASKED}` },
+        cookie: { attached: currentCookieMasked != null, masked: currentCookieMasked },
       }
     }
     if (typeof path === 'string' && path.startsWith('/remote-imports')) {
-      return { items: [withCtx, plain, failedCtx], cursor: null }
+      return { items: [withCtx, plain, failedCtx, failedNoCtx], cursor: null }
     }
     if (typeof path === 'string' && path.startsWith('/connected-accounts')) return { accounts: [] }
     if (typeof path === 'string' && path.startsWith('/folders')) return { folders: [] }
@@ -135,6 +160,29 @@ describe('RemoteImportsPage request-context action', () => {
     expect(await screen.findByText('https://cdn.example.com/file.mkv?token=fresh')).toBeInTheDocument()
   })
 
+  it('failed imports can edit the cookie (merge patch, other fields untouched)', async () => {
+    installMocks()
+    const { RemoteImportsPage } = await import('@/pages/RemoteImportsPage')
+    render(<RemoteImportsPage />)
+
+    const viewButtons = await screen.findAllByRole('button', { name: /View request context for expired\.mkv/ })
+    fireEvent.click(viewButtons[0])
+    await screen.findByText(`session=${MASKED}`)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Cookie' }))
+    // Cookie is never prefilled — the secret is not echoed into the editor.
+    expect(screen.getByLabelText('New Cookie')).toHaveValue('')
+    fireEvent.change(screen.getByLabelText('New Cookie'), { target: { value: 'session=fresh' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save & restart' }))
+
+    await waitFor(() => {
+      expect(apiFetchMock).toHaveBeenCalledWith('/remote-imports/failed-ctx/download-url', {
+        method: 'PATCH',
+        body: JSON.stringify({ requestContext: { cookie: 'session=fresh' } }),
+      })
+    })
+  })
+
   it('shows a save error without closing when the PATCH fails', async () => {
     installMocks()
     apiFetchMock.mockImplementation(async (path: string) => {
@@ -172,16 +220,26 @@ describe('RemoteImportsPage request-context action', () => {
     expect(screen.getByLabelText('New Download URL')).toBeInTheDocument()
   })
 
-  it('rows without attached context expose no details action', async () => {
+  it('completed rows without context expose no action; failed rows offer Add', async () => {
     installMocks()
     const { RemoteImportsPage } = await import('@/pages/RemoteImportsPage')
     render(<RemoteImportsPage />)
 
     await screen.findByText('plain.bin')
     expect(screen.queryByRole('button', { name: /View request context for plain\.bin/ })).not.toBeInTheDocument()
-    // One View action per context-attached row (withCtx + failedCtx), none for plain.
+    expect(screen.queryByRole('button', { name: /Edit download details for plain\.bin/ })).not.toBeInTheDocument()
+    // withCtx + failedCtx → View; failedNoCtx → Add ("No request context" row).
+    // None for completed plain.
     await waitFor(() => {
       expect(screen.getAllByText('View')).toHaveLength(2)
     })
+    expect(screen.getByText('No request context')).toBeInTheDocument()
+    const addButtons = await screen.findAllByRole('button', { name: /Edit download details for nocreds\.bin/ })
+    expect(addButtons).toHaveLength(1)
+
+    // The Add entry opens the same dialog with per-field Add affordances.
+    fireEvent.click(addButtons[0])
+    expect(await screen.findByText('No request context attached to this import.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Add Cookie' })).toBeInTheDocument()
   })
 })

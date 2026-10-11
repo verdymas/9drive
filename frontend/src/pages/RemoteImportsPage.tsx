@@ -371,6 +371,17 @@ export function RemoteImportsPage() {
                           Request context attached
                           <span className="font-bold text-blue-600">View</span>
                         </button>
+                      ) : retryable ? (
+                        <button
+                          type="button"
+                          className="mt-0.5 inline-flex items-center gap-1.5 rounded-md text-xs font-semibold text-slate-500 underline-offset-2 hover:text-slate-800 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                          onClick={() => setContextImport(item)}
+                          aria-label={`Edit download details for ${item.fileName}`}
+                        >
+                          <Lock className="h-3.5 w-3.5 text-slate-400" />
+                          No request context
+                          <span className="font-bold text-blue-600">Add</span>
+                        </button>
                       ) : null}
                       {item.workerNameSnapshot ? (
                         <p className="mt-0.5 inline-flex items-center gap-1.5 text-xs font-semibold text-slate-500">
@@ -464,7 +475,9 @@ export function RemoteImportsPage() {
         importId={contextImport?.id ?? null}
         fileName={contextImport?.fileName ?? null}
         editable={contextImport != null && (contextImport.status === 'failed' || contextImport.status === 'cancelled' || contextImport.status === 'queued')}
-        onUrlSaved={() => load().catch(() => undefined)}
+        currentWorkerId={contextImport?.workerId ?? null}
+        workers={workers}
+        onSaved={() => load().catch(() => undefined)}
         onClose={() => setContextImport(null)}
       />
     </>
