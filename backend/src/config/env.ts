@@ -140,6 +140,37 @@ const envSchema = z.object({
   // Browser Capture (extension device + captured resources).
   BROWSER_CAPTURE_ENABLED: z.coerce.boolean().default(true),
   BROWSER_CAPTURE_EXTENSION_DIR: z.string().optional(),
+  // ── Server Browser (remote Chromium sessions, Stage 1 MVP) ───────────────
+  // Master switch. When false, session creation is refused with a safe 503 —
+  // no container is ever launched. Enabling requires the Docker CLI + socket
+  // in the backend container (see docker-compose.yml) and the pinned browser
+  // image pulled on the host.
+  SERVER_BROWSER_ENABLED: booleanEnv(false),
+  // Pinned, non-rolling KasmVNC Chromium image for per-session containers.
+  SERVER_BROWSER_IMAGE: z.string().min(1).default('kasmweb/chromium:1.19.0'),
+  // Isolated Docker network for browser containers (`internal: true`; the
+  // only egress is the Squid forward proxy below).
+  SERVER_BROWSER_NETWORK: z.string().min(1).default('9drive_browser_net'),
+  // Proxy URL injected as HTTP(S)_PROXY into browser containers. The proxy
+  // (pinned ubuntu/squid) denies loopback/private/link-local/metadata.
+  SERVER_BROWSER_EGRESS_PROXY_URL: z.string().min(1).default('http://browser-egress-proxy:3128'),
+  // KasmVNC web UI port inside browser containers. The backend gateway proxies
+  // ONLY this port; Chromium DevTools (9222) is never mapped or proxied.
+  SERVER_BROWSER_DISPLAY_PORT: z.coerce.number().int().min(1).max(65535).default(6901),
+  // VNC password for browser containers. Empty lets the image default apply;
+  // set a value in production. Never logged.
+  SERVER_BROWSER_VNC_PASSWORD: z.string().optional(),
+  SERVER_BROWSER_MAX_SESSIONS_PER_USER: z.coerce.number().int().min(1).max(10).default(1),
+  SERVER_BROWSER_MAX_SESSIONS_TOTAL: z.coerce.number().int().min(1).max(50).default(5),
+  SERVER_BROWSER_SESSION_TTL_MINUTES: z.coerce.number().int().min(5).max(1440).default(60),
+  SERVER_BROWSER_STARTUP_TIMEOUT_SECONDS: z.coerce.number().int().min(15).max(600).default(120),
+  SERVER_BROWSER_SWEEP_INTERVAL_SECONDS: z.coerce.number().int().min(15).max(3600).default(60),
+  // Lifetime of a one-time display token minted for the iframe gateway.
+  SERVER_BROWSER_VIEW_TOKEN_TTL_SECONDS: z.coerce.number().int().min(60).max(3600).default(300),
+  // Per-container resource bounds passed to `docker run`.
+  SERVER_BROWSER_CONTAINER_MEMORY: z.string().min(1).default('2g'),
+  SERVER_BROWSER_CONTAINER_CPUS: z.string().min(1).default('2'),
+  SERVER_BROWSER_CONTAINER_PIDS_LIMIT: z.coerce.number().int().min(64).max(4096).default(256),
   // Telegram Drive storage provider.
   // Per-file document size cap for Telegram uploads (Telegram free accounts
   // allow documents up to ~2 GiB; premium up to 4 GiB). Enforced in placement.

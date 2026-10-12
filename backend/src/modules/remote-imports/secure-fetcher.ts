@@ -3,8 +3,21 @@ import { AppError } from '../../utils/app-error.js'
 import { decryptText } from '../../utils/crypto.js'
 import { hasDriver, resolveDriver } from '../remote-fetch-workers/driver-registry.js'
 import { buildDirectTransport, buildTransportForWorker } from '../remote-fetch-workers/transport.js'
+import { urlFingerprintForLog } from '../remote-fetch-workers/relay-protocol.js'
 import type { RemoteFetchTransport, RemoteFetchRequest, RemoteFetchResponse } from '../remote-fetch-workers/types.js'
 import type { RemoteImportRequestContext } from './request-context.js'
+
+function opOf(traceId: string): string {
+  return traceId.includes(':') ? traceId.slice(traceId.lastIndexOf(':') + 1).slice(0, 32) || 'fetch' : 'fetch'
+}
+
+function urlFpOf(rawUrl: string): string {
+  try {
+    return urlFingerprintForLog(rawUrl)
+  } catch {
+    return 'unknown'
+  }
+}
 
 /**
  * SecureRemoteFetcher: generic abstraction over Direct vs relay transports.
@@ -30,17 +43,22 @@ export class SecureRemoteFetcher {
         return ''
       }
     })()
-    const traceId = typeof (input as RemoteFetchRequest).traceId === 'string' ? (input as RemoteFetchRequest).traceId : 'none'
+    const rawTrace: unknown = (input as RemoteFetchRequest).traceId
+    const traceId: string = typeof rawTrace === 'string' ? rawTrace : 'none'
+    const op = opOf(traceId)
+    const urlFp = urlFpOf(typeof input.url === 'string' ? input.url : '')
     if (this.diagnostics.route === 'direct') {
-      console.log(`[remote-import:fetcher] route=direct traceId=${traceId} targetHost=${targetHost} method=${input.method ?? 'GET'}`)
+      console.log(`[remote-import:fetcher] route=direct traceId=${traceId} op=${op} targetHost=${targetHost} urlFp=${urlFp} method=${input.method ?? 'GET'}`)
     } else {
       console.log(
-        `[remote-import:fetcher] route=worker traceId=${traceId} workerId=${this.diagnostics.workerId ?? ''} driver=${this.diagnostics.driver ?? ''} relayHost=${this.diagnostics.relayHost ?? ''} targetHost=${targetHost} method=${input.method ?? 'GET'}`,
+        `[remote-import:fetcher] route=worker traceId=${traceId} op=${op} workerId=${this.diagnostics.workerId ?? ''} driver=${this.diagnostics.driver ?? ''} relayHost=${this.diagnostics.relayHost ?? ''} targetHost=${targetHost} urlFp=${urlFp} method=${input.method ?? 'GET'}`,
       )
     }
     const res = await this.transport.request(input)
     // Log safe outcome — upstream answer, not relay health. The transport logs
-    // relayHttpStatus vs upstreamStatus separately for worker routes.
+    // relayHttpStatus vs upstreamStatus separately for worker routes; this line
+    // carries the decoded upstream status plus the fingerprint so the fetcher
+    // and transport lines join on traceId+urlFp.
     const finalHost = (() => {
       try {
         const f = (res as { finalUrl?: string }).finalUrl
@@ -50,7 +68,15 @@ export class SecureRemoteFetcher {
       }
     })()
     const redirectCount = (res as { redirectCount?: number }).redirectCount ?? 0
-    console.log(`[remote-import:fetcher] response route=${this.diagnostics.route} traceId=${traceId} targetHost=${targetHost} finalHost=${finalHost} redirectCount=${redirectCount} status=${res.status}`)
+    const finalUrlFp = (() => {
+      try {
+        const f = (res as { finalUrl?: string }).finalUrl
+        return f ? urlFpOf(f) : urlFp
+      } catch {
+        return urlFp
+      }
+    })()
+    console.log(`[remote-import:fetcher] response route=${this.diagnostics.route} traceId=${traceId} op=${op} targetHost=${targetHost} urlFp=${urlFp} finalHost=${finalHost} finalUrlFp=${finalUrlFp} redirectCount=${redirectCount} status=${res.status}`)
     return res as RemoteFetchResponse & { finalUrl?: string; redirectCount?: number }
   }
 
@@ -88,8 +114,8 @@ export class SecureRemoteFetcher {
   }
 
   /** Download a resource to a local file via transport */
-  async downloadToFile(url: string, targetPath: string, opts: { maxBytes?: bigint; signal?: AbortSignal; requestContext?: RemoteImportRequestContext | null; sourceUrl?: string; kind?: string } = {}): Promise<bigint> {
-    const res = await this.fetch({ method: 'GET', url, requestContext: opts.requestContext as any, sourceUrl: opts.sourceUrl } as any)
+  async downloadToFile(url: string, targetPath: string, opts: { maxBytes?: bigint; signal?: AbortSignal; requestContext?: RemoteImportRequestContext | null; sourceUrl?: string; kind?: string; traceId?: string } = {}): Promise<bigint> {
+    const res = await this.fetch({ method: 'GET', url, requestContext: opts.requestContext as any, sourceUrl: opts.sourceUrl, traceId: (opts as { traceId?: string }).traceId } as any)
     if (res.status === 401 || res.status === 403) {
       if (opts.requestContext) {
         throw new AppError('REMOTE_SOURCE_ACCESS_EXPIRED', 'The source access has expired. Please capture a fresh request.', res.status)
@@ -97,6 +123,13 @@ export class SecureRemoteFetcher {
       throw new AppError('HLS_AUTHENTICATED_SOURCE_UNSUPPORTED', 'Authenticated sources require a request context.', 400)
     }
     if (res.status >= 400) {
+      // Final error classification: for worker routes the transport already
+      // logged relayHttpStatus vs upstreamStatus — this status IS the decoded
+      // upstream answer (a relay-level failure throws WORKER_* instead and
+      // never reaches here). The job stays on its selected route; no Direct
+      // retry is attempted.
+      const traceId = typeof (opts as { traceId?: string }).traceId === 'string' ? String((opts as { traceId?: string }).traceId) : 'none'
+      console.error(`[remote-import:fetcher] download_http_error route=${this.diagnostics.route} traceId=${traceId} op=${opOf(traceId)} workerId=${this.diagnostics.workerId ?? ''} upstreamStatus=${res.status} code=DOWNLOAD_HTTP_ERROR`)
       throw new AppError('DOWNLOAD_HTTP_ERROR', `Remote server responded ${res.status}.`, 502)
     }
     // Stream to file — handle both string and iterable bodies
@@ -144,6 +177,9 @@ export async function createSecureFetcherForWorkerId(
 ): Promise<SecureRemoteFetcher> {
   if (!workerId) {
     const transport = buildDirectTransport({ requestContext: opts.requestContext, sourceUrl: opts.sourceUrl })
+    // Route decision: explicit Direct selection (workerId null). One line per
+    // job/probe so a later Direct request can be attributed to its own job.
+    console.log(`[remote-import:route] route=direct workerId=none driver=none relayHost=none`)
     return new SecureRemoteFetcher(transport, { route: 'direct' })
   }
 
@@ -184,6 +220,9 @@ export async function createSecureFetcherForWorkerId(
     anyTransport.opts.sourceUrl = opts.sourceUrl
     anyTransport.opts.requestContext = opts.requestContext
   }
+  // Route decision: Worker-selected jobs must remain on Worker for every
+  // subsequent probe/download/range/retry of this job. No automatic fallback.
+  console.log(`[remote-import:route] route=worker workerId=${worker.id} driver=${worker.driver} relayHost=${relayHost}`)
   return new SecureRemoteFetcher(transport, { route: 'worker', workerId: worker.id, driver: worker.driver, relayHost })
 }
 
@@ -222,5 +261,6 @@ export function createSecureFetcherForWorker(
     anyTransport.opts.sourceUrl = opts.sourceUrl
     anyTransport.opts.requestContext = opts.requestContext
   }
+  console.log(`[remote-import:route] route=worker workerId=${worker.id} driver=${worker.driver} relayHost=${relayHost}`)
   return new SecureRemoteFetcher(transport, { route: 'worker', workerId: worker.id, driver: worker.driver, relayHost })
 }

@@ -150,6 +150,40 @@ Sources of truth: `backend/src/config/env.ts`, `docker-compose.yml`, and fronten
 - `BROWSER_CAPTURE_ENABLED`
 - `BROWSER_CAPTURE_EXTENSION_DIR`
 
+## Server Browser (Remote Chromium)
+
+Disabled by default. See `docs/application/features/server-browser.md`.
+
+- `SERVER_BROWSER_ENABLED` — defaults to `false`. When false, session creation
+  is refused with `503 BROWSER_UNAVAILABLE` and no container is ever launched.
+- `SERVER_BROWSER_IMAGE` — pinned per-session browser image; default
+  `kasmweb/chromium:1.19.0`. Never use a floating `latest` tag.
+- `SERVER_BROWSER_NETWORK` — isolated Docker network (`internal: true`);
+  default `9drive_browser_net`.
+- `SERVER_BROWSER_EGRESS_PROXY_URL` — sole browser egress (Squid); default
+  `http://browser-egress-proxy:3128`.
+- `SERVER_BROWSER_DISPLAY_PORT` — KasmVNC UI port inside containers; default
+  `6901`. The gateway proxies only this port — never DevTools `9222`.
+- `SERVER_BROWSER_VNC_PASSWORD` — fixed VNC password injected into browser
+  containers. When empty (default), the backend generates a per-session secret
+  and reveals it once in the session-creation response (an empty Kasm password
+  is unusable from browser login dialogs, so sessions never launch without
+  one). Never logged. Requires the Docker socket mounted in the backend container (see
+  `docker-compose.yml`); the socket is never mounted into browser containers.
+- `SERVER_BROWSER_MAX_SESSIONS_PER_USER` — default `1`, allowed range `1`–`10`.
+- `SERVER_BROWSER_MAX_SESSIONS_TOTAL` — default `5`, allowed range `1`–`50`.
+- `SERVER_BROWSER_SESSION_TTL_MINUTES` — session lifetime; default `60`,
+  allowed range `5`–`1440`.
+- `SERVER_BROWSER_STARTUP_TIMEOUT_SECONDS` — hung startups fail after this;
+  default `120`, allowed range `15`–`600`.
+- `SERVER_BROWSER_SWEEP_INTERVAL_SECONDS` — expiry/crash sweeper cadence;
+  default `60`, allowed range `15`–`3600`.
+- `SERVER_BROWSER_VIEW_TOKEN_TTL_SECONDS` — one-time iframe display token
+  lifetime; default `300`, allowed range `60`–`3600`.
+- `SERVER_BROWSER_CONTAINER_MEMORY` / `SERVER_BROWSER_CONTAINER_CPUS` /
+  `SERVER_BROWSER_CONTAINER_PIDS_LIMIT` — per-container bounds; defaults
+  `2g` / `2` / `256`.
+
 ## Telegram
 
 - `TELEGRAM_MAX_FILE_BYTES`

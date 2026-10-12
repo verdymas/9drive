@@ -1,4 +1,5 @@
 import { AppError } from '../../utils/app-error.js'
+import { opTraceId } from '../remote-fetch-workers/relay-protocol.js'
 import type { RemoteImportProcessorContext } from './processor-context.js'
 
 export type ProbeResult = {
@@ -16,13 +17,14 @@ export async function probeSource(
   context: Pick<RemoteImportProcessorContext, 'sourceUrl' | 'requestContext' | 'maxBytes' | 'importId'>,
   fetcher: ProbeFetcher,
 ): Promise<ProbeResult> {
+  const baseId = (context as { importId?: string }).importId
   const response = await fetcher.fetch({
     method: 'GET',
     url: context.sourceUrl,
     headers: { Range: 'bytes=0-0' },
     range: 'bytes=0-0',
     requestContext: context.requestContext as any,
-    traceId: (context as { importId?: string }).importId,
+    traceId: opTraceId(baseId, 'probe-range'),
   })
   const contentRange = response.headers['content-range']
   const rangeMatch = /^bytes 0-0\/(\d+)$/.exec(contentRange ?? '')

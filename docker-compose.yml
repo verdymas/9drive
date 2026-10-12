@@ -132,11 +132,58 @@ services:
       # ── Telegram Stream (internal byte-range service) ──────────────────
       TELEGRAM_STREAM_NODE_URL: ${TELEGRAM_STREAM_NODE_URL:-http://telegram-stream:8081}
       TELEGRAM_STREAM_INTERNAL_SECRET: ${TELEGRAM_STREAM_INTERNAL_SECRET:-Uxw7qgqZ7j6IqFIy5TT6knce2SY0_nTuZz_pcqbW2hk}
+      # ── Server Browser (remote Chromium sessions, Stage 1 MVP) ──────────
+      # Disabled by default. To enable: set SERVER_BROWSER_ENABLED=true,
+      # uncomment the Docker socket volume below (the backend needs it to
+      # launch per-session browser containers — the socket is NEVER mounted
+      # into browser containers themselves), and pull the pinned image:
+      # `docker pull kasmweb/chromium:1.19.0`.
+      SERVER_BROWSER_ENABLED: ${SERVER_BROWSER_ENABLED:-false}
+      SERVER_BROWSER_IMAGE: ${SERVER_BROWSER_IMAGE:-kasmweb/chromium:1.19.0}
+      SERVER_BROWSER_NETWORK: ${SERVER_BROWSER_NETWORK:-9drive_browser_net}
+      SERVER_BROWSER_EGRESS_PROXY_URL: ${SERVER_BROWSER_EGRESS_PROXY_URL:-http://browser-egress-proxy:3128}
+      SERVER_BROWSER_DISPLAY_PORT: ${SERVER_BROWSER_DISPLAY_PORT:-6901}
+      SERVER_BROWSER_VNC_PASSWORD: ${SERVER_BROWSER_VNC_PASSWORD:-}
+      SERVER_BROWSER_MAX_SESSIONS_PER_USER: ${SERVER_BROWSER_MAX_SESSIONS_PER_USER:-1}
+      SERVER_BROWSER_MAX_SESSIONS_TOTAL: ${SERVER_BROWSER_MAX_SESSIONS_TOTAL:-5}
+      SERVER_BROWSER_SESSION_TTL_MINUTES: ${SERVER_BROWSER_SESSION_TTL_MINUTES:-60}
+      SERVER_BROWSER_STARTUP_TIMEOUT_SECONDS: ${SERVER_BROWSER_STARTUP_TIMEOUT_SECONDS:-120}
+      SERVER_BROWSER_SWEEP_INTERVAL_SECONDS: ${SERVER_BROWSER_SWEEP_INTERVAL_SECONDS:-60}
+      SERVER_BROWSER_VIEW_TOKEN_TTL_SECONDS: ${SERVER_BROWSER_VIEW_TOKEN_TTL_SECONDS:-300}
+      SERVER_BROWSER_CONTAINER_MEMORY: ${SERVER_BROWSER_CONTAINER_MEMORY:-2g}
+      SERVER_BROWSER_CONTAINER_CPUS: ${SERVER_BROWSER_CONTAINER_CPUS:-2}
+      SERVER_BROWSER_CONTAINER_PIDS_LIMIT: ${SERVER_BROWSER_CONTAINER_PIDS_LIMIT:-256}
     volumes:
       - remote_import_tmp:/data/remote-import-tmp
       - upload_tmp:/data/upload-tmp
+      # REQUIRED when SERVER_BROWSER_ENABLED=true (the backend launches
+      # per-session browser containers through this socket — fixed `docker`
+      # argv only). The socket is NEVER mounted into browser containers.
+      # Leave commented (and the feature disabled) when not in use.
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - default
+      - browser_net
     ports:
       - "4000:4000"
+
+  # ── Server Browser egress proxy (Stage 1 MVP) ──────────────────────────
+  # Sole internet egress for the isolated `browser_net`. Browser containers
+  # have no other route out; Squid denies loopback/private/link-local/cloud-
+  # metadata destinations and allows only HTTP + CONNECT-to-443 (see
+  # services/browser-egress/squid.conf). Internal-only: no host port.
+  browser-egress-proxy:
+    image: ubuntu/squid:5.2-22.04_beta
+    restart: unless-stopped
+    expose:
+      - "3128"
+    volumes:
+      - ./services/browser-egress/squid.conf:/etc/squid/squid.conf:ro
+    networks:
+      - default
+      - browser_net
+    mem_limit: 256m
+    cpus: 0.5
 
   telegram-stream:
     build:
@@ -300,3 +347,14 @@ volumes:
   mysql_data:
   remote_import_tmp:
   upload_tmp:
+
+# Isolated network for per-session browser containers. `internal: true` means
+# no direct internet route — all browser egress flows through the
+# `browser-egress-proxy` service above. The backend joins this network (in
+# addition to `default`) so its authenticated gateway can reach the
+# browser containers' display port; nothing on `browser_net` is published
+# to the host.
+networks:
+  browser_net:
+    name: 9drive_browser_net
+    internal: true

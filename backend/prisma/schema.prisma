@@ -38,6 +38,7 @@ model User {
   browserDevicePairings  BrowserDevicePairing[]
   browserDevices         BrowserDevice[]
   capturedResources      CapturedResource[]
+  serverBrowserSessions  ServerBrowserSession[]
 
   @@map("users")
 }
@@ -726,6 +727,40 @@ model CapturedResource {
   @@index([browserDeviceId, status])
   @@index([status, expiresAt])
   @@map("captured_resources")
+}
+
+// ── Server Browser (Stage 1 MVP): one row per remote Chromium session. The
+// row is the persistent session metadata (owner, lifecycle state, timestamps);
+// the live browser runs in a per-session KasmVNC Chromium container managed by
+// the backend through the Docker CLI. View tokens are one-time, hashed at rest
+// (same pattern as file preview tokens) and grant ONLY display access to the
+// owning session — never bearer credentials.
+model ServerBrowserSession {
+  id                 String    @id @default(uuid()) @db.Char(36)
+  userId             String    @map("user_id") @db.Char(36)
+  // starting | ready | stopped | expired | failed
+  status             String    @default("starting") @db.VarChar(16)
+  // Docker container name (`9drive-browser-<short>`) for cleanup/correlation.
+  // Null when no container was ever launched (e.g. provider unavailable).
+  containerName      String?   @map("container_name") @db.VarChar(191)
+  // Last-known container IP on the isolated browser network. Resolved at
+  // display time via `docker inspect`; cached here for diagnostics only.
+  containerIp        String?   @map("container_ip") @db.VarChar(64)
+  // Hashed one-time display token for the iframe gateway (raw token is shown
+  // once at mint time and never stored).
+  viewTokenHash      String?   @map("view_token_hash") @db.VarChar(255)
+  viewTokenExpiresAt DateTime? @map("view_token_expires_at")
+  lastError          String?   @map("last_error") @db.Text
+  expiresAt          DateTime  @map("expires_at")
+  endedAt            DateTime? @map("ended_at")
+  lastSeenAt         DateTime? @map("last_seen_at")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+  user               User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status, createdAt])
+  @@index([status, expiresAt])
+  @@map("server_browser_sessions")
 }
 
 // ── Remote Fetch Worker: a remote network relay used by 9Drive to fetch

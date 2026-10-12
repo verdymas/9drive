@@ -132,7 +132,6 @@ all-failed request returns `400 { code, message, failed }`.
 ## Browser Capture
 
 Dashboard/device authentication differs by endpoint; inspect `browser-capture.routes.ts` before changing the authentication boundary.
-
 | Method | Path |
 |---|---|
 | POST | `/browser-capture/devices/pairing` |
@@ -150,6 +149,23 @@ Dashboard/device authentication differs by endpoint; inspect `browser-capture.ro
 | GET | `/browser-capture/extension.zip` |
 | GET | `/browser-capture/import-options` |
 | POST | `/browser-capture/resources/:id/import` |
+
+## Server Browser (Remote Chromium)
+
+All `/server-browser/sessions*` control routes use bearer authentication and
+enforce session ownership. The display gateway is public-by-token (short-lived
+one-time view token, preview-token pattern) — the app access token never
+travels in a URL. See `docs/application/features/server-browser.md`.
+
+| Method | Path |
+|---|---|
+| POST | `/server-browser/sessions` |
+| GET | `/server-browser/sessions` |
+| GET | `/server-browser/sessions/:id` |
+| DELETE | `/server-browser/sessions/:id` |
+| POST | `/server-browser/sessions/:id/view-token` |
+| GET | `/server-browser/sessions/:id/display/*` (display token) |
+| WS | `/server-browser/sessions/:id/display/*` (display token, KasmVNC relay) |
 
 ## Telegram
 

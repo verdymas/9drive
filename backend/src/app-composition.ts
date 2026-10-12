@@ -43,7 +43,7 @@ function applySharedMiddleware(app: Express) {
 }
 
 export async function createControlPlaneApp(): Promise<Express> {
-  const [{ authRouter }, { providerConfigRouter }, { connectedAccountRouter }, { telegramRouter }, { telegramSyncRouter }, { telegramSecurityRouter }, { storageRouter }, { uploadRouter }, { folderRouter }, { inviteRouter }, { apiKeyRouter }, { publicApiRouter }, { auditLogRouter }, { systemRouter }, { createSmbRouter }, { remoteImportRouter }, { syncRouter }, { browserCaptureRouter }, { remoteFetchWorkerRouter }] =
+  const [{ authRouter }, { providerConfigRouter }, { connectedAccountRouter }, { telegramRouter }, { telegramSyncRouter }, { telegramSecurityRouter }, { storageRouter }, { uploadRouter }, { folderRouter }, { inviteRouter }, { apiKeyRouter }, { publicApiRouter }, { auditLogRouter }, { systemRouter }, { createSmbRouter }, { remoteImportRouter }, { syncRouter }, { browserCaptureRouter }, { serverBrowserRouter }, { remoteFetchWorkerRouter }] =
     await Promise.all([
       import('./modules/auth/auth.routes.js'),
       import('./modules/provider-configs/provider-config.routes.js'),
@@ -63,6 +63,7 @@ export async function createControlPlaneApp(): Promise<Express> {
       import('./modules/remote-imports/remote-import.routes.js'),
       import('./modules/sync/sync.routes.js'),
       import('./modules/browser-capture/browser-capture.routes.js'),
+      import('./modules/server-browser/server-browser.routes.js'),
       // Import registers the installed worker drivers (cloudflare) into the
       // registry before any route handler can resolve them.
       import('./modules/remote-fetch-workers/index.js'),
@@ -102,6 +103,7 @@ export async function createControlPlaneApp(): Promise<Express> {
   app.use('/workers', remoteFetchWorkerRouter)
   app.use('/sync', syncRouter)
   app.use('/browser-capture', browserCaptureRouter)
+  app.use('/server-browser', serverBrowserRouter)
   app.use(
     '/smb',
     createSmbRouter({

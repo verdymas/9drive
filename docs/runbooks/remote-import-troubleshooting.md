@@ -42,6 +42,34 @@ correlated with worker activity without exposing the source URL or credentials.
 - Protected source: check request-context/cookie scope and whether the feature is enabled.
 - Remote-worker mode: test the worker through `/workers/:id/test` and inspect status/capabilities.
 
+## 4a. Worker-relay 404 correlation (`traceId` / `urlFp`)
+
+Each transport operation carries an op-scoped `traceId` (`<jobId>:<op>`, e.g.
+`3565f20e…:download`, `…:probe-range`, `…:stream-<off>-<len>`) in the relay
+payload. Backend (`[remote-import:transport]`, `[remote-import:fetcher]`,
+`[remote-import:route]`) and Worker (`[relay]`) logs join on `traceId`.
+`urlFp` (12-hex sha256 of the canonical href, computed identically both
+sides) proves backend ↔ Worker URL identity without exposing signed URLs;
+only hosts, `queryKeys`, header NAMES, and safe `reason`/`kind` codes are
+logged — never query values, cookies, or bodies.
+
+- `validation_rejected … relayHttpStatus=400 upstreamStatus=none
+  fetchExecuted=false` → Worker validation (endpoint/payload/URL policy
+  stage). Backend maps to `WORKER_RELAY_PROTOCOL_ERROR`.
+- `upstream_response … upstreamStatus=404 relayHttpStatus=200
+  fetchExecuted=true` → the SOURCE answered 404 through a healthy relay.
+  Backend surfaces `DOWNLOAD_HTTP_ERROR` with that upstream status.
+- `upstream_fetch_failed … relayHttpStatus=502 upstreamStatus=none
+  kind=DNS_FAILURE|TLS_ERROR|CONNECT_FAILURE|TIMEOUT|…` → no upstream
+  response exists; backend maps to `WORKER_UPSTREAM_FETCH_FAILED`, never 404.
+- Relay endpoint `handler=not-found … relayHttpStatus=404
+  fetchExecuted=false` → wrong path/method; backend maps to
+  `WORKER_UNHEALTHY`, never to an upstream 404.
+- A Worker-selected job logs `[remote-import:route] route=worker …` once and
+  stays on Worker for probe/download/range/retries. A `route=direct` line
+  after a Worker error is a separate job/operation (check its own `traceId`),
+  not a fallback — there is no automatic Worker→Direct fallback.
+
 For an eligible stream-through import, a source that ignores a requested range
 falls back to the temporary-spool path before transfer starts. Do not manually
 edit `stream_upload_state_encrypted`; it is encrypted, server-only recovery

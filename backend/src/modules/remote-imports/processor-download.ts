@@ -1,9 +1,26 @@
 import { AppError } from '../../utils/app-error.js'
+import { opTraceId } from '../remote-fetch-workers/relay-protocol.js'
 import { hopHeaderResolver } from './request-context.js'
 import { createTempPartFile, appendStreamToTemp } from './temp-storage.js'
 import { followRemoteUrl } from './url-downloader.js'
 import { STAGES, type RemoteImportProcessorContext } from './processor-context.js'
 import type { SecureRemoteFetcher } from './secure-fetcher.js'
+
+/**
+ * Guard: a job that selected a Worker must never silently use the Direct
+ * `followRemoteUrl` path. Callers must pass the job's fetcher; a missing
+ * fetcher for a worker-backed job is a programming error, not a fallback.
+ */
+function assertFetcherForWorkerJob(context: RemoteImportProcessorContext, fetcher?: SecureRemoteFetcher | null): void {
+  const workerId = (context.record as { workerId?: string | null } | undefined)?.workerId ?? null
+  if (workerId && !fetcher) {
+    throw new AppError(
+      'WORKER_TRANSPORT_NOT_IMPLEMENTED',
+      'Relay transport for this worker is not implemented yet. Switch this import to Direct or choose a different worker.',
+      501,
+    )
+  }
+}
 
 export type DownloadedSource = {
   finalUrl: string
@@ -24,8 +41,9 @@ export async function downloadSourceToTemp(
   let finalUrl = startUrl
   let totalBytes = 0n
 
+  assertFetcherForWorkerJob(context, fetcher ?? null)
   if (fetcher) {
-    const response = await fetcher.fetch({ method: 'GET', url: startUrl, requestContext: context.requestContext as any, traceId: context.importId } as any)
+    const response = await fetcher.fetch({ method: 'GET', url: startUrl, requestContext: context.requestContext as any, traceId: opTraceId(context.importId, 'download') } as any)
     const rawLength = response.headers['content-length']
     if (rawLength) contentLength = BigInt(rawLength)
     supportsRange = response.headers['accept-ranges'] === 'bytes' || response.status === 206

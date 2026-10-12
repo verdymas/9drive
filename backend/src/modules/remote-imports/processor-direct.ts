@@ -1,5 +1,6 @@
 import { prisma } from '../../config/prisma.js'
 import { env } from '../../config/env.js'
+import { opTraceId } from '../remote-fetch-workers/relay-protocol.js'
 import { AppError } from '../../utils/app-error.js'
 import { decryptText, encryptText } from '../../utils/crypto.js'
 import { getAuthedGoogleClient, syncGoogleQuota } from '../google/google.service.js'
@@ -82,7 +83,7 @@ export async function tryGoogleStreamThrough<TRecord extends ProcessorRecord>(in
     totalBytes: contentLength,
     chunkBytes: BigInt(env.REMOTE_IMPORT_STREAM_THROUGH_CHUNK_BYTES),
     state: readGoogleStreamState(context.record.streamUploadStateEncrypted),
-    readChunk: (offset, length) => readVerifiedRange(input.fetcher as any, sourceUrl, offset, length, contentLength, context.requestContext),
+    readChunk: (offset, length) => readVerifiedRange(input.fetcher as any, sourceUrl, offset, length, contentLength, context.requestContext, opTraceId(context.importId, `stream-${offset}-${length}`)),
     assertNotCancelled: () => context.assertNotCancelled(),
     saveState: async (state) => {
       await prisma.remoteImport.update({ where: { id: context.importId }, data: { streamUploadStateEncrypted: encryptText(JSON.stringify(state)) } })
@@ -136,7 +137,7 @@ export async function tryS3StreamThrough<TRecord extends ProcessorRecord>(input:
       await context.assertNotCancelled()
       const chunkBytes = BigInt(env.REMOTE_IMPORT_STREAM_THROUGH_CHUNK_BYTES)
       const length = contentLength - offset > chunkBytes ? chunkBytes : contentLength - offset
-      const chunk = await readVerifiedRange(input.fetcher as any, sourceUrl, offset, length, contentLength, context.requestContext)
+      const chunk = await readVerifiedRange(input.fetcher as any, sourceUrl, offset, length, contentLength, context.requestContext, opTraceId(context.importId, `stream-${offset}-${length}`))
       const eTag = await uploadS3MultipartPart(config, state.key, state.uploadId, partNumber, chunk)
       state.parts.push({ partNumber, eTag, size: length.toString() })
       offset += length

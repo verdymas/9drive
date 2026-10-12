@@ -5,6 +5,7 @@ import { AppError } from '../../../utils/app-error.js'
 import { resolveAndValidateHost, validateRemoteUrl } from '../../remote-imports/ssrf.js'
 import { hopHeaderResolver, type RemoteImportRequestContext } from '../../remote-imports/request-context.js'
 import type { RemoteFetchRequest, RemoteFetchResponse, RemoteFetchTransport } from '../types.js'
+import { urlFingerprintForLog } from '../relay-protocol.js'
 
 function pinnedLookup(validatedIp: string) {
   return (
@@ -91,10 +92,13 @@ export class DirectRemoteFetchTransport implements RemoteFetchTransport {
       try {
         const targetHost = url.hostname
         const forwardedHeaderNames = Object.keys(headers).map((h) => h.toLowerCase()).sort().join(',')
-        const traceId = typeof (input as RemoteFetchRequest).traceId === 'string' ? (input as RemoteFetchRequest).traceId : 'none'
+        const rawTrace: unknown = (input as RemoteFetchRequest).traceId
+        const traceId: string = typeof rawTrace === 'string' ? rawTrace : 'none'
+        const op = traceId.includes(':') ? traceId.slice(traceId.lastIndexOf(':') + 1).slice(0, 32) : 'fetch'
         const pathLen = url.pathname.length
         const queryKeys = [...url.searchParams.keys()].sort().join('+') || 'none'
-        console.log(`[remote-import:transport] route=direct traceId=${traceId} targetHost=${targetHost} method=${method} redirectCount=${redirectCount} forwardedHeaderNames=${forwardedHeaderNames} pathLen=${pathLen} queryKeys=${queryKeys}`)
+        const urlFp = urlFingerprintForLog(url.href)
+        console.log(`[remote-import:transport] route=direct traceId=${traceId} op=${op} targetHost=${targetHost} urlFp=${urlFp} method=${method} redirectCount=${redirectCount} forwardedHeaderNames=${forwardedHeaderNames} pathLen=${pathLen} queryKeys=${queryKeys}`)
       } catch {}
 
       const res = await request(url.href, {

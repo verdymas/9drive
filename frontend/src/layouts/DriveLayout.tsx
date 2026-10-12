@@ -10,6 +10,7 @@ import {
   History,
   LogOut,
   Menu,
+  Monitor,
   Moon,
   MoreVertical,
   Search,
@@ -56,6 +57,10 @@ const storageMenu = [
   { label: 'SMB', icon: Server, href: '/smb' },
   { label: 'Remote Imports', icon: CloudDownload, href: '/remote-imports' },
   { label: 'Workers', icon: Waypoints, href: '/workers' },
+]
+
+const toolsMenu = [
+  { label: 'Server Browser', icon: Monitor, href: '/server-browser' },
 ]
 
 function SystemInfoDropdown({ storage }: { storage: any }) {
@@ -189,6 +194,14 @@ function Sidebar({ onNavigate, user, storage, breakdown, onLogout }: { onNavigat
             {item.label}
           </button>
         ) : (
+          <NavLink key={item.label} to={item.href} onClick={onNavigate} className={({ isActive }) => cn('inline-flex h-9 items-center gap-2.5 rounded-xl px-3.5 text-[13px] font-bold transition-all border border-transparent', isActive ? 'bg-blue-600/10 text-blue-600 border-blue-600/10 shadow-sm' : 'text-slate-600 hover:bg-slate-200/50 hover:text-slate-900')}>
+            <item.icon className="h-4 w-4" />
+            {item.label}
+          </NavLink>
+        ))}
+
+        <p className="mt-3 mb-1 px-3.5 text-[10px] font-extrabold uppercase tracking-widest text-slate-400">Tools</p>
+        {toolsMenu.map((item) => (
           <NavLink key={item.label} to={item.href} onClick={onNavigate} className={({ isActive }) => cn('inline-flex h-9 items-center gap-2.5 rounded-xl px-3.5 text-[13px] font-bold transition-all border border-transparent', isActive ? 'bg-blue-600/10 text-blue-600 border-blue-600/10 shadow-sm' : 'text-slate-600 hover:bg-slate-200/50 hover:text-slate-900')}>
             <item.icon className="h-4 w-4" />
             {item.label}

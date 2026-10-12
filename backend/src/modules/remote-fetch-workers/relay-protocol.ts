@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto'
 import { z } from 'zod'
 
 /**
@@ -126,6 +127,42 @@ export function getRelayParseReason(rawJson: unknown, result: ReturnType<typeof 
     return RELAY_PARSE_REASONS.INVALID_BODY_TYPE
   }
   return RELAY_PARSE_REASONS.INVALID_BODY_TYPE
+}
+
+/**
+ * Short cryptographic fingerprint of the canonical target URL for log
+ * correlation. The canonical form is `new URL(raw).href` — the worker
+ * computes the same value from `target.href` — so fingerprints can be
+ * compared only when canonicalization is identical on both sides. The hash
+ * never exposes path/query values.
+ */
+export function urlFingerprintForLog(rawUrl: string): string {
+  try {
+    const canonical = new URL(rawUrl).href
+    return createHash('sha256').update(canonical, 'utf8').digest('hex').slice(0, 12)
+  } catch {
+    return createHash('sha256').update(String(rawUrl), 'utf8').digest('hex').slice(0, 12)
+  }
+}
+
+/**
+ * Build an operation-scoped correlation id: `<base>:<op>`.
+ * The base is typically the import/job id or probe correlation id. When no
+ * usable base exists a random UUID is used. The result is always ≤128 chars
+ * so it satisfies the relay `traceId` schema. Callers pass the returned
+ * value as `traceId`; the relay echoes it in logs but never forwards it
+ * upstream.
+ */
+export function opTraceId(base: string | null | undefined, op: string): string {
+  const cleanOp = String(op || 'fetch')
+    .replace(/[^a-zA-Z0-9_-]+/g, '-')
+    .slice(0, 32) || 'fetch'
+  const cleanBase = typeof base === 'string' ? base.replace(/\s+/g, '').slice(0, 80) : ''
+  if (cleanBase) {
+    if (cleanBase.includes(`:${cleanOp}`)) return cleanBase.slice(0, 128)
+    return `${cleanBase}:${cleanOp}`.slice(0, 128)
+  }
+  return `${randomUUID()}:${cleanOp}`.slice(0, 128)
 }
 
 /**

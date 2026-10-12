@@ -41,6 +41,7 @@ type RangeFetcher = {
     headers: { Range: string }
     range: string
     requestContext?: unknown
+    traceId?: string
   }): Promise<{
     status: number
     headers: Record<string, string | undefined>
@@ -64,11 +65,12 @@ export async function readVerifiedRange(
   length: bigint,
   totalBytes: bigint,
   requestContext?: unknown,
+  traceId?: string,
 ): Promise<Buffer> {
   if (offset < 0n || length <= 0n || offset + length > totalBytes) throw rangeFailure()
   const end = offset + length - 1n
   const range = `bytes=${offset}-${end}`
-  const response = await fetcher.fetch({ method: 'GET', url: sourceUrl, headers: { Range: range }, range, requestContext })
+  const response = await fetcher.fetch({ method: 'GET', url: sourceUrl, headers: { Range: range }, range, requestContext, ...(traceId ? { traceId } : {}) })
   const expected = `bytes ${offset}-${end}/${totalBytes}`
   if (response.status !== 206 || response.headers['content-range'] !== expected) {
     const body = response.body

@@ -12,7 +12,10 @@ RUN npm ci
 # spawns FFmpeg (only the worker does), but both services share this image and
 # `verifyFfmpegAvailable` bails with FFMPEG_NOT_AVAILABLE if the binaries are
 # missing — installing them here keeps the worker image self-contained.
-RUN apk add --no-cache ffmpeg
+# docker-cli lets the optional Server Browser feature (`SERVER_BROWSER_ENABLED`)
+# launch per-session KasmVNC Chromium containers via the mounted socket. It is
+# unused (and the socket must stay unmounted) when the feature is disabled.
+RUN apk add --no-cache ffmpeg docker-cli
 
 COPY backend/tsconfig.json ./
 COPY backend/src ./src

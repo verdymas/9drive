@@ -37,4 +37,44 @@ describe('downloadSourceToTemp', () => {
 
     await expect(downloadSourceToTemp(context as any, fetcher as any)).rejects.toMatchObject({ code: 'DOWNLOAD_TOO_LARGE' })
   })
+
+  it('worker-backed job without a fetcher fails closed (never silent Direct)', async () => {
+    const context = {
+      importId: 'import-worker-1',
+      record: { workerId: 'w-1' },
+      maxBytes: 100n,
+      sourceUrl: 'https://example.test/file',
+      updateStage: vi.fn(async () => undefined),
+      throttledProgressUpdater: vi.fn(() => vi.fn(async () => undefined)),
+    }
+    await expect(downloadSourceToTemp(context as any, null)).rejects.toMatchObject({
+      code: 'WORKER_TRANSPORT_NOT_IMPLEMENTED',
+    })
+    await expect(downloadSourceToTemp(context as any, undefined)).rejects.toMatchObject({
+      code: 'WORKER_TRANSPORT_NOT_IMPLEMENTED',
+    })
+  })
+
+  it('threads an op-scoped traceId (importId:download) to the fetcher', async () => {
+    const context = {
+      importId: 'import-op-1',
+      record: { workerId: 'w-1' },
+      maxBytes: 100n,
+      sourceUrl: 'https://example.test/file',
+      updateStage: vi.fn(async () => undefined),
+      throttledProgressUpdater: vi.fn(() => vi.fn(async () => undefined)),
+    }
+    const fetcher = {
+      fetch: vi.fn(async () => ({
+        status: 200,
+        headers: {},
+        finalUrl: 'https://example.test/file',
+        body: (async function* () {})(),
+      })),
+    }
+    await downloadSourceToTemp(context as any, fetcher as any)
+    expect(fetcher.fetch).toHaveBeenCalledTimes(1)
+    const input = fetcher.fetch.mock.calls[0][0] as { traceId?: string }
+    expect(input.traceId).toBe('import-op-1:download')
+  })
 })

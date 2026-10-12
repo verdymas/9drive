@@ -79,6 +79,26 @@ function json(body, status = 200) {
   });
 }
 
+// Short cryptographic fingerprint of the canonical target URL for
+// backend ↔ Worker correlation. Canonical form is `new URL(raw).href` —
+// identical to the backend `urlFingerprintForLog` — so fingerprints match
+// only when canonicalization is identical. The hash never exposes
+// path/query values.
+async function urlFpForLog(rawUrl) {
+  try {
+    const canonical = new URL(rawUrl).href;
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 12);
+  } catch {
+    try {
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(rawUrl)));
+      return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 12);
+    } catch {
+      return 'unknown';
+    }
+  }
+}
+
 function handleHealth() {
   return json({
     service: SERVICE_IDENTITY,
@@ -99,6 +119,9 @@ async function handleFetch(request) {
   try {
     payload = await request.json();
   } catch {
+    // No parseable payload — traceId unknown. Stage is validation; no
+    // upstream fetch was attempted and no upstream status exists.
+    try { console.log(`[relay] event=validation_rejected stage=validation handler=fetch traceId=none reason=INVALID_JSON relayHttpStatus=400 upstreamStatus=none fetchExecuted=false`); } catch {}
     return json({ error: 'invalid payload', reason: 'INVALID_JSON' }, 400);
   }
   const { method, url, headers, body, protocolVersion, response: responseMode, traceId: rawTraceId } = payload || {};
@@ -106,6 +129,13 @@ async function handleFetch(request) {
   // Opaque correlation id (diagnostics-only, never affects routing). Lenient:
   // an absent/invalid traceId never fails the relay — it is only echoed in logs.
   const traceId = typeof rawTraceId === 'string' && rawTraceId.length >= 1 && rawTraceId.length <= 128 ? rawTraceId : 'none';
+  // Log + return a validation rejection. Safe: reason code only, never URL /
+  // header values / body. relayHttpStatus is the Worker answer; upstream was
+  // never contacted (fetchExecuted=false, upstreamStatus=none).
+  async function reject(reason) {
+    try { console.log(`[relay] event=validation_rejected stage=validation handler=fetch traceId=${traceId} reason=${reason} relayHttpStatus=400 upstreamStatus=none fetchExecuted=false protocolVersion=${typeof protocolVersion === 'string' ? protocolVersion : 'none'}`); } catch {}
+    return json({ error: 'invalid payload', reason }, 400);
+  }
   // Safe destination shape — param NAMES only, never values (signed URLs stay secret).
   function urlShapeForLog(rawUrl) {
     try {
@@ -120,38 +150,39 @@ async function handleFetch(request) {
   // Canonical 9drive-relay-v1 contract — keep in sync with backend/src/modules/remote-fetch-workers/relay-protocol.ts
   // Validation with safe reason codes — never echo URL, headers values, or body content.
   if (protocolVersion === undefined || protocolVersion === null) {
-    return json({ error: 'invalid payload', reason: 'MISSING_PROTOCOL' }, 400);
+    return reject('MISSING_PROTOCOL');
   }
   if (protocolVersion !== PROTOCOL_VERSION && protocolVersion !== COOKIE_PROTOCOL_VERSION) {
-    return json({ error: 'invalid payload', reason: 'INVALID_PROTOCOL' }, 400);
+    return reject('INVALID_PROTOCOL');
   }
   if (method === undefined || method === null) {
-    return json({ error: 'invalid payload', reason: 'MISSING_METHOD' }, 400);
+    return reject('MISSING_METHOD');
   }
   if (typeof method !== 'string') {
-    return json({ error: 'invalid payload', reason: 'INVALID_METHOD' }, 400);
+    return reject('INVALID_METHOD');
   }
   if (!ALLOWED_METHODS.has(method)) {
-    return json({ error: 'invalid payload', reason: 'UNSUPPORTED_METHOD' }, 400);
+    return reject('UNSUPPORTED_METHOD');
   }
   if (url === undefined || url === null) {
-    return json({ error: 'invalid payload', reason: 'MISSING_URL' }, 400);
+    return reject('MISSING_URL');
   }
   if (typeof url !== 'string') {
-    return json({ error: 'invalid payload', reason: 'INVALID_URL' }, 400);
+    return reject('INVALID_URL');
   }
   if (headers !== undefined && headers !== null && (typeof headers !== 'object' || Array.isArray(headers))) {
-    return json({ error: 'invalid payload', reason: 'INVALID_HEADERS' }, 400);
+    return reject('INVALID_HEADERS');
   }
   const hasCookie = headers && Object.keys(headers).some((key) => key.toLowerCase() === 'cookie');
   if (hasCookie && protocolVersion !== COOKIE_PROTOCOL_VERSION) {
-    return json({ error: 'invalid payload', reason: 'INVALID_PROTOCOL' }, 400);
+    return reject('INVALID_PROTOCOL');
   }
   // Body is optional: when present must be string (not null, not number). HEAD/GET should omit it.
   if (body !== undefined && typeof body !== 'string') {
-    return json({ error: 'invalid payload', reason: 'INVALID_BODY_TYPE' }, 400);
+    return reject('INVALID_BODY_TYPE');
   }
-  // Safe diagnostics — never log URL query, headers values, or body
+  // Safe diagnostics — never log URL query, headers values, or body.
+  // `urlFp` matches the backend fingerprint (sha256 of canonical href).
   let targetHostForLog = '';
   let hasRange = false;
   let upstreamHeaderNamesForLog = '';
@@ -166,16 +197,17 @@ async function handleFetch(request) {
       ? Object.keys(headers).some((k) => String(k).toLowerCase() === 'range')
       : false;
     const shape = urlShapeForLog(url);
-    console.log(`[relay] protocol=${protocolVersion} traceId=${traceId} upstreamMethod=${method} targetHost=${targetHostForLog} payloadKeys=${payloadKeys} contentType=${request.headers.get('content-type')} bodyPresent=${bodyPresent} bodyType=${bodyType} headersCount=${headersCount} headersType=${headersType} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)} ${shape}`);
+    const urlFp = await urlFpForLog(url);
+    console.log(`[relay] event=request_received stage=validation handler=fetch traceId=${traceId} protocol=${protocolVersion} upstreamMethod=${method} targetHost=${targetHostForLog} urlFp=${urlFp} payloadKeys=${payloadKeys} contentType=${request.headers.get('content-type')} bodyPresent=${bodyPresent} bodyType=${bodyType} headersCount=${headersCount} headersType=${headersType} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)} fetchExecuted=false ${shape}`);
   } catch {}
   let target;
   try {
     target = new URL(url);
   } catch {
-    return json({ error: 'invalid payload', reason: 'INVALID_URL' }, 400);
+    return reject('INVALID_URL');
   }
   if (BLOCKED_SCHEMES.has(target.protocol) || (target.protocol !== 'http:' && target.protocol !== 'https:')) {
-    return json({ error: 'invalid payload', reason: 'INVALID_URL' }, 400);
+    return reject('INVALID_URL');
   }
 
   const outHeaders = new Headers();
@@ -196,6 +228,14 @@ async function handleFetch(request) {
   try {
     upstreamHeaderNamesForLog = [...outHeaders.keys()].map((k) => String(k).toLowerCase()).sort().join(',');
   } catch {}
+  // Immediately before upstream fetch(): validation accepted, fetch is about
+  // to execute. fetchExecuted=false here; the post-fetch line flips it true.
+  try {
+    const urlFp = await urlFpForLog(target.href);
+    const shape = urlShapeForLog(url);
+    console.log(`[relay] event=validation_accepted stage=pre-fetch handler=fetch traceId=${traceId} protocol=${protocolVersion} upstreamMethod=${method} targetHost=${targetHostForLog} urlFp=${urlFp} upstreamHeaderNames=${upstreamHeaderNamesForLog || 'none'} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)} fetchExecuted=false ${shape}`);
+    console.log(`[relay] event=upstream_fetch_start stage=upstream handler=fetch traceId=${traceId} upstreamMethod=${method} targetHost=${targetHostForLog} urlFp=${urlFp} upstreamHeaderNames=${upstreamHeaderNamesForLog || 'none'} hasRange=${hasRange} fetchExecuted=false ${shape}`);
+  } catch {}
 
   try {
     const upstream = await fetch(target.href, {
@@ -207,13 +247,17 @@ async function handleFetch(request) {
 
     // Success diagnostics distinguish the relay (always HTTP 200 here) from
     // the UPSTREAM answer. Never log query values, header values, or bodies —
-    // only hosts, status, redirect shape, and header NAMES.
+    // only hosts, status, redirect shape, fingerprints, and header NAMES.
+    // A 404 here is the SOURCE response (fetchExecuted=true), never a relay
+    // endpoint/validation 404.
     try {
       const finalHost = (() => { try { return new URL(upstream.url).hostname; } catch { return ''; } })();
       const redirected = Boolean(upstream.url) && upstream.url !== target.href;
       const sameHost = finalHost === targetHostForLog;
       const shape = urlShapeForLog(url);
-      console.log(`[relay] event=upstream_response traceId=${traceId} upstreamMethod=${method} targetHost=${targetHostForLog} finalHost=${finalHost || 'unknown'} sameHost=${sameHost} redirected=${redirected} upstreamStatus=${upstream.status} relayHttpStatus=200 responseMode=${STREAMING ? 'stream' : 'envelope'} upstreamHeaderNames=${upstreamHeaderNamesForLog} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)} ${shape}`);
+      const urlFp = await urlFpForLog(target.href);
+      const finalUrlFp = upstream.url ? await urlFpForLog(upstream.url) : urlFp;
+      console.log(`[relay] event=upstream_response stage=upstream handler=fetch traceId=${traceId} upstreamMethod=${method} targetHost=${targetHostForLog} urlFp=${urlFp} finalHost=${finalHost || 'unknown'} finalUrlFp=${finalUrlFp} sameHost=${sameHost} redirected=${redirected} upstreamStatus=${upstream.status} relayHttpStatus=200 fetchExecuted=true responseMode=${STREAMING ? 'stream' : 'envelope'} upstreamHeaderNames=${upstreamHeaderNamesForLog} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)} ${shape}`);
     } catch {}
     // Streaming mode (v1.1): pipe the upstream response through UNBUFFERED —
     // the Worker never holds the whole body in memory, so large files no
@@ -276,7 +320,10 @@ async function handleFetch(request) {
         }
       }
       const kind = classifyUpstreamError(message, causeCode);
-      console.log(`[relay] event=upstream_fetch_failed traceId=${traceId} upstreamMethod=${method} targetHost=${targetHostForLog} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)} upstreamHeaderNames=${upstreamHeaderNamesForLog} errorName=${errorName}${causeCode ? ` cause=${causeCode}` : ''} kind=${kind}`);
+      const urlFp = await urlFpForLog(target.href);
+      // No upstream response exists — report stage + kind, never a fabricated
+      // upstreamStatus. relayHttpStatus=502 is the Worker answer.
+      console.log(`[relay] event=upstream_fetch_failed stage=upstream handler=fetch traceId=${traceId} upstreamMethod=${method} targetHost=${targetHostForLog} urlFp=${urlFp} hasRange=${hasRange} hasCookie=${Boolean(hasCookie)} upstreamHeaderNames=${upstreamHeaderNamesForLog} fetchExecuted=true upstreamStatus=none relayHttpStatus=502 errorName=${errorName}${causeCode ? ` cause=${causeCode}` : ''} kind=${kind}`);
       return json({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION', reason: errorName, kind, ...(causeCode ? { cause: causeCode } : {}) }, 502);
     } catch {}
     return json({ error: 'upstream fetch failed', code: 'UPSTREAM_FETCH_EXCEPTION', reason: errorName }, 502);
@@ -298,11 +345,24 @@ function classifyUpstreamError(message, causeCode) {
 export default {
   async fetch(request, env) {
     if (!(await verifyHmac(request, env))) {
+      // Relay endpoint reached but auth failed — no payload parsing, so no
+      // traceId/upstream status. Distinct from an upstream 401/404.
+      try { console.log(`[relay] event=request_received stage=auth handler=unknown traceId=none relayHttpStatus=401 upstreamStatus=none fetchExecuted=false method=${request.method}`); } catch {}
       return json({ error: 'unauthorized' }, 401);
     }
     const url = new URL(request.url);
-    if (request.method === 'GET' && url.pathname === '/health') return handleHealth();
-    if (request.method === 'POST' && url.pathname === '/fetch') return handleFetch(request);
+    if (request.method === 'GET' && url.pathname === '/health') {
+      try { console.log(`[relay] event=request_received stage=health handler=health traceId=none relayHttpStatus=200 upstreamStatus=none fetchExecuted=false`); } catch {}
+      return handleHealth();
+    }
+    if (request.method === 'POST' && url.pathname === '/fetch') {
+      try { console.log(`[relay] event=request_received stage=routing handler=fetch method=POST path=/fetch`); } catch {}
+      return handleFetch(request);
+    }
+    // Relay endpoint 404: the request never reached the fetch handler and no
+    // upstream fetch executed. Backend maps relay !ok to WORKER_UNHEALTHY —
+    // never to an upstream 404.
+    try { console.log(`[relay] event=request_received stage=routing handler=not-found traceId=none relayHttpStatus=404 upstreamStatus=none fetchExecuted=false method=${request.method} pathLen=${url.pathname.length}`); } catch {}
     return json({ error: 'not found' }, 404);
   },
 };

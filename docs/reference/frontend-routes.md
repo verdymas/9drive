@@ -31,5 +31,6 @@ Source: `frontend/src/App.tsx`.
 | `/storage/webdav` | `WebDavPage` |
 | `/remote-imports` | `RemoteImportsPage` |
 | `/workers` | `WorkersPage` |
+| `/server-browser` | `ServerBrowserPage` (Tools → Server Browser) |
 
 The index and unknown routes redirect to `/all-files`. The entire application is wrapped in `UploadProvider`.
