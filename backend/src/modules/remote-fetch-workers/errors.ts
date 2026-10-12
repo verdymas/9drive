@@ -49,6 +49,10 @@ export const REMOTE_FETCH_WORKER_ERROR_CODES = {
   // This phase: no relay transport is implemented yet — a selected worker
   // fails the job explicitly rather than silently falling back to Direct.
   WORKER_TRANSPORT_NOT_IMPLEMENTED: 'WORKER_TRANSPORT_NOT_IMPLEMENTED',
+  // Provider capability / free-tier safety-budget enforcement.
+  WORKER_CAPABILITY_UNSUPPORTED: 'WORKER_CAPABILITY_UNSUPPORTED',
+  WORKER_BUDGET_EXHAUSTED: 'WORKER_BUDGET_EXHAUSTED',
+  WORKER_BUDGET_APPROACHING: 'WORKER_BUDGET_APPROACHING',
 } as const
 
 export type RemoteFetchWorkerErrorCode = (typeof REMOTE_FETCH_WORKER_ERROR_CODES)[keyof typeof REMOTE_FETCH_WORKER_ERROR_CODES]
@@ -85,4 +89,7 @@ export const REMOTE_FETCH_WORKER_ERROR_MESSAGES: Record<RemoteFetchWorkerErrorCo
   REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED: 'The selected network worker uses an unsupported service.',
   REMOTE_IMPORT_WORKER_UNAVAILABLE: 'The selected network worker is no longer available. Choose another worker or Direct and retry.',
   WORKER_TRANSPORT_NOT_IMPLEMENTED: 'Relay transport for this worker is not implemented yet. Switch this import to Direct or choose a different worker.',
+  WORKER_CAPABILITY_UNSUPPORTED: 'The selected worker does not support this operation (streaming, range, size or duration limit).',
+  WORKER_BUDGET_EXHAUSTED: 'The selected worker reached its configured free-tier safety budget. Usage is paused until the next period or a higher budget.',
+  WORKER_BUDGET_APPROACHING: 'The selected worker is approaching its configured free-tier safety budget.',
 }

@@ -28,6 +28,7 @@ import {
 } from './cloudflare-relay.js'
 import { CloudflareRemoteFetchTransport } from '../transports/cloudflare-transport.js'
 import { RELAY_PROTOCOL_VERSION as CANONICAL_RELAY_PROTOCOL_VERSION } from '../relay-protocol.js'
+import { CLOUDFLARE_CAPABILITIES, PROVIDER_SAFETY_BUDGETS } from '../provider-capabilities.js'
 
 /**
  * Cloudflare Worker relay driver.
@@ -1411,8 +1412,7 @@ const metadata: WorkerDriverMetadata = {
   displayName: 'Cloudflare Worker',
   managed: true,
   authTypes: ['hmac'],
-  fields: [
-    {
+  fields: [    {
       key: 'accountId',
       label: 'Account ID',
       type: 'text',
@@ -1436,6 +1436,8 @@ const metadata: WorkerDriverMetadata = {
       help: 'The name used for the deployed 9Drive relay Worker (1-63 characters: letters, digits, _ or -).',
     },
   ],
+  provider: CLOUDFLARE_CAPABILITIES,
+  safetyBudgets: PROVIDER_SAFETY_BUDGETS.cloudflare,
 }
 
 function createTransport(worker: { endpointUrl: string; authType: RemoteFetchWorkerAuthType; secretDecrypted?: string | null }): import('../types.js').RemoteFetchTransport {
@@ -1463,4 +1465,5 @@ export const cloudflareWorkerDriver: RemoteFetchWorkerDriver = {
   testConnection,
   createTransport,
   getMetadata: () => metadata,
+  getCapabilities: () => CLOUDFLARE_CAPABILITIES,
 }

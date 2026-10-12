@@ -16,6 +16,8 @@ import {
   updateWorker,
 } from './workers.service.js'
 import { listDriverMetadata } from './workers.driver-metadata.js'
+import { getWorkerBudgetStatus } from './worker-usage.service.js'
+import { EVALUATED_ONLY_PROVIDERS } from './provider-capabilities.js'
 
 export const remoteFetchWorkerRouter = Router()
 
@@ -38,6 +40,9 @@ const workerSchema = z
     priority: z.number().int().min(0).max(100000).nullable().optional(),
     isEnabled: z.boolean().optional(),
     isDefault: z.boolean().optional(),
+    // Optional free-tier safety-budget overrides (decimal strings accepted).
+    reqBudgetMonthly: z.string().regex(/^\d+$/).max(32).nullable().optional(),
+    egressBudgetBytesMonthly: z.string().regex(/^\d+$/).max(32).nullable().optional(),
   })
   .strict()
 
@@ -49,7 +54,7 @@ const workerSchema = z
  */
 remoteFetchWorkerRouter.get('/drivers', requireAuth, async (_req: AuthRequest, res, next) => {
   try {
-    return res.json({ drivers: listDriverMetadata() })
+    return res.json({ drivers: listDriverMetadata(), evaluatedOnly: EVALUATED_ONLY_PROVIDERS })
   } catch (error) {
     return next(error)
   }
@@ -80,6 +85,8 @@ remoteFetchWorkerRouter.post('/', requireAuth, async (req: AuthRequest, res, nex
       priority: body.priority ?? null,
       isEnabled: body.isEnabled,
       isDefault: body.isDefault,
+      reqBudgetMonthly: body.reqBudgetMonthly ?? undefined,
+      egressBudgetBytesMonthly: body.egressBudgetBytesMonthly ?? undefined,
     })
     return res.status(201).json(serializeWorker(created))
   } catch (error) {
@@ -120,6 +127,8 @@ remoteFetchWorkerRouter.patch('/:id', requireAuth, async (req: AuthRequest, res,
       priority: body.priority,
       isEnabled: body.isEnabled,
       isDefault: body.isDefault,
+      reqBudgetMonthly: body.reqBudgetMonthly ?? undefined,
+      egressBudgetBytesMonthly: body.egressBudgetBytesMonthly ?? undefined,
     })
     return res.json(serializeWorker(updated))
   } catch (error) {
@@ -167,6 +176,26 @@ remoteFetchWorkerRouter.post('/:id/test', requireAuth, async (req: AuthRequest, 
   try {
     const result = await testWorkerConnection(req.user!.id, String(req.params.id))
     return res.json({ result })
+  } catch (error) {
+    if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
+    return next(error)
+  }
+})
+
+/** Monthly free-tier usage + safety-budget status (bigints stringified). */
+remoteFetchWorkerRouter.get('/:id/usage', requireAuth, async (req: AuthRequest, res, next) => {
+  try {
+    const status = await getWorkerBudgetStatus(String(req.params.id))
+    return res.json({
+      usage: {
+        ...status,
+        requests: status.requests.toString(),
+        egressBytes: status.egressBytes.toString(),
+        failures: status.failures.toString(),
+        maxRequests: status.maxRequests?.toString() ?? null,
+        maxEgressBytes: status.maxEgressBytes?.toString() ?? null,
+      },
+    })
   } catch (error) {
     if (error instanceof AppError) return res.status(error.status).json({ code: error.code, message: error.message })
     return next(error)

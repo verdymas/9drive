@@ -132,6 +132,14 @@ export async function downloadResource(
     // Use generic fetcher (Direct or relay) — never raw followRemoteUrl when a fetcher is available
     return opts.fetcher.downloadToFile(url, targetLocalPath, { maxBytes, signal: opts.signal, requestContext: opts.requestContext, sourceUrl: url, kind: opts.kind })
   }
+  // Direct-only fallback: no fetcher was supplied. Worker-backed jobs must
+  // always supply the job fetcher — this path is for Direct jobs only and is
+  // logged explicitly so a Direct request after a Worker error is attributable
+  // to its own route (never automatic failover within the same job).
+  try {
+    const fallbackHost = new URL(url).hostname
+    console.log(`[remote-import:hls] route=direct-fallback op=downloadResource targetHost=${fallbackHost} kind=${opts.kind ?? 'unknown'}`)
+  } catch { /* logging only */ }
   let written = 0n
   await followRemoteUrl(url, {
     getHopHeaders: hopHeaderResolver(url, opts.requestContext),
@@ -224,6 +232,12 @@ export async function downloadByteRange(
     }
     return written
   }
+  // Direct-only fallback (see downloadResource): worker jobs must pass the job
+  // fetcher; this branch serves Direct jobs and is logged for attribution.
+  try {
+    const fallbackHost = new URL(url).hostname
+    console.log(`[remote-import:hls] route=direct-fallback op=downloadByteRange targetHost=${fallbackHost} range=${rangeHeader}`)
+  } catch { /* logging only */ }
   let written = 0n
   let saw206 = false
   await followRemoteUrl(url, {

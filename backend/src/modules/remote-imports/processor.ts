@@ -46,6 +46,15 @@ async function assertWorkerUsable(record: { workerId: string | null }) {
   if (!driver.createTransport) {
     throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_TRANSPORT_NOT_IMPLEMENTED, 'Relay transport for this worker is not implemented yet. Switch this import to Direct or choose a different worker.', 501)
   }
+  // Free-tier safety-budget gate: exhausted budgets reject before any probe or
+  // download on this job. The job stays on its worker route — never Direct,
+  // never another provider. Best-effort pre-migration (missing table = skip).
+  try {
+    const { assertWorkerBudgetAvailable } = await import('../remote-fetch-workers/worker-usage.service.js')
+    await assertWorkerBudgetAvailable(record.workerId)
+  } catch (error) {
+    if (error instanceof AppError && error.code === REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_BUDGET_EXHAUSTED) throw error
+  }
 }
 
 /**

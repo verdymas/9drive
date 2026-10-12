@@ -25,6 +25,8 @@ import {
   disableWorker,
   enableWorker,
   forceDeleteWorkerLocal,
+  getWorkerUsage,
+  listEvaluatedProviders,
   listWorkerDrivers,
   listWorkers,
   setDefaultWorker,
@@ -33,9 +35,11 @@ import {
   workerStatusBadgeClass,
   workerStatusLabel,
   type CreateWorkerInput,
+  type EvaluatedProvider,
   type WorkerDriverField,
   type WorkerDriverMetadata,
   type WorkerItem,
+  type WorkerUsage,
 } from '@/lib/workers'
 
 /** Form = Service selector + driver-registered fields (+ product toggles). */
@@ -56,6 +60,8 @@ const emptyWorkerForm: WorkerFormState = {
 export function WorkersPage() {
   const [workers, setWorkers] = useState<WorkerItem[]>([])
   const [drivers, setDrivers] = useState<WorkerDriverMetadata[]>([])
+  const [evaluated, setEvaluated] = useState<EvaluatedProvider[]>([])
+  const [usage, setUsage] = useState<Record<string, WorkerUsage>>({})
   const [loading, setLoading] = useState(true)
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
@@ -75,9 +81,26 @@ export function WorkersPage() {
 
   async function load() {
     try {
-      const [workerRows, driverRows] = await Promise.all([listWorkers(), listWorkerDrivers()])
+      const [workerRows, driverRows, evaluatedRows] = await Promise.all([listWorkers(), listWorkerDrivers(), listEvaluatedProviders().catch(() => [] as EvaluatedProvider[])])
       setWorkers(workerRows)
       setDrivers(driverRows)
+      setEvaluated(evaluatedRows)
+      // Best-effort monthly usage per worker (never blocks the table).
+      const usageEntries = await Promise.all(
+        workerRows.map(async (w) => {
+          try {
+            const u = await getWorkerUsage(w.id)
+            return [w.id, u] as const
+          } catch {
+            return null
+          }
+        }),
+      )
+      const next: Record<string, WorkerUsage> = {}
+      for (const entry of usageEntries) {
+        if (entry) next[entry[0]] = entry[1]
+      }
+      setUsage(next)
     } finally {
       setLoading(false)
     }
@@ -114,6 +137,8 @@ export function WorkersPage() {
       fields.region = worker.region ?? ''
       fields.authType = worker.authType
       fields.description = worker.description ?? ''
+      fields.reqBudgetMonthly = worker.reqBudgetMonthly ?? ''
+      fields.egressBudgetBytesMonthly = worker.egressBudgetBytesMonthly ?? ''
     }
     setForm({
       driver: worker.driver,
@@ -150,6 +175,9 @@ export function WorkersPage() {
         payload.secret = form.fields.secret || undefined
         payload.region = form.fields.region || null
         payload.description = form.fields.description || null
+        // Optional safety-budget overrides (decimal strings; blank = driver default).
+        if ((form.fields.reqBudgetMonthly ?? '') !== '') payload.reqBudgetMonthly = form.fields.reqBudgetMonthly
+        if ((form.fields.egressBudgetBytesMonthly ?? '') !== '') payload.egressBudgetBytesMonthly = form.fields.egressBudgetBytesMonthly
       }
       if (editWorker) {
         await updateWorker(editWorker.id, payload)
@@ -253,6 +281,20 @@ export function WorkersPage() {
   const driverName = (key: string) => drivers.find((d) => d.key === key)?.displayName ?? key
   const driverManaged = (key: string) => Boolean(drivers.find((d) => d.key === key)?.managed)
   const transientStatus = (s: string) => s === 'provisioning' || s === 'provision_failed'
+
+  function formatUsage(u: WorkerUsage): string {
+    const req = `${u.requests}${u.maxRequests ? `/${u.maxRequests}` : ''} req`
+    const gb = (bytes: string) => {
+      const n = Number(bytes)
+      if (!Number.isFinite(n)) return bytes
+      if (n >= 1024 * 1024 * 1024) return `${(n / 1024 / 1024 / 1024).toFixed(1)} GiB`
+      if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MiB`
+      return `${n} B`
+    }
+    const egress = `${gb(u.egressBytes)}${u.maxEgressBytes ? `/${gb(u.maxEgressBytes)}` : ''}`
+    const flag = u.exhausted ? ' · paused' : u.approaching ? ' · approaching' : ''
+    return `${req} · ${egress}${flag}`
+  }
 
   /** Render one driver-registered field (label/type/required/help). */
   function renderDriverField(field: WorkerDriverField, editing: boolean) {
@@ -404,7 +446,46 @@ export function WorkersPage() {
             placeholder="Primary relay for Asia"
           />
         </label>
+        {form.driver === 'deno' ? <DenoDeployTutorial /> : null}
+        <div className="grid gap-4 sm:grid-cols-2">
+          <label className="grid gap-1.5">
+            <span className="text-xs font-bold text-slate-500">Monthly request budget (optional)</span>
+            <input
+              className="h-11 rounded-xl border border-slate-200 px-3 text-sm focus:border-blue-500 focus:outline-none"
+              value={form.fields.reqBudgetMonthly ?? ''}
+              onChange={(e) => setField('reqBudgetMonthly', e.target.value)}
+              placeholder="800000 (blank = 800000)"
+              inputMode="numeric"
+            />
+            <span className="text-xs text-slate-400">Conservative cap below the free tier. Usage stops at this threshold.</span>
+          </label>
+          <label className="grid gap-1.5">
+            <span className="text-xs font-bold text-slate-500">Monthly egress budget bytes (optional)</span>
+            <input
+              className="h-11 rounded-xl border border-slate-200 px-3 text-sm focus:border-blue-500 focus:outline-none"
+              value={form.fields.egressBudgetBytesMonthly ?? ''}
+              onChange={(e) => setField('egressBudgetBytesMonthly', e.target.value)}
+              placeholder="17179869184 (blank = 16 GiB)"
+              inputMode="numeric"
+            />
+            <span className="text-xs text-slate-400">Enforced before start and while streaming.</span>
+          </label>
+        </div>
       </>
+    )
+  }
+
+  /** Deno manual-relay deploy steps (no provisioning in this phase). */
+  function DenoDeployTutorial() {
+    return (
+      <Collapsible title="How to deploy the Deno relay" defaultOpen={false}>
+        <ol className="list-none space-y-2 text-xs text-slate-600">
+          <li><b className="text-slate-700">1.</b> Create a Deno Deploy app from <span className="font-mono">backend/src/modules/remote-fetch-workers/drivers/deno-relay/worker.ts</span> (single file, no dependencies).</li>
+          <li><b className="text-slate-700">2.</b> Set the <span className="font-mono">RELAY_SECRET</span> environment variable to a long random value (the same value you paste below).</li>
+          <li><b className="text-slate-700">3.</b> Deploy, copy the app URL (https), and paste it as Endpoint URL with Authentication = HMAC.</li>
+          <li><b className="text-slate-700">4.</b> Free tier is 1M requests/month and 20 GiB egress/month — egress is binding for media. 9Drive stops at your safety budget and cannot see other traffic in the same Deno account.</li>
+        </ol>
+      </Collapsible>
     )
   }
 
@@ -461,6 +542,7 @@ export function WorkersPage() {
                 <th className="px-5 py-3 font-bold">Service</th>
                 <th className="px-5 py-3 font-bold">Endpoint</th>
                 <th className="px-5 py-3 font-bold">Status</th>
+                <th className="px-5 py-3 font-bold">Budget (month)</th>
                 <th className="px-5 py-3 font-bold">Default</th>
                 <th className="px-5 py-3 font-bold">Last Check</th>
                 <th className="px-5 py-3 font-bold">Actions</th>
@@ -469,7 +551,7 @@ export function WorkersPage() {
             <tbody>
               {workers.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="px-5 py-10 text-center text-slate-500">
+                  <td colSpan={8} className="px-5 py-10 text-center text-slate-500">
                     No workers registered yet. Add a worker to route Remote Import traffic through an external relay.
                   </td>
                 </tr>
@@ -487,6 +569,7 @@ export function WorkersPage() {
                     <td className="px-5 py-3.5">
                       <span className={`rounded-full px-2.5 py-0.5 text-xs font-bold ${workerStatusBadgeClass(worker.status)}`}>{workerStatusLabel(worker.status)}</span>
                     </td>
+                    <td className="px-5 py-3.5 text-xs text-slate-600">{usage[worker.id] ? formatUsage(usage[worker.id]) : '—'}</td>
                     <td className="px-5 py-3.5">
                       {worker.isDefault ? (
                         <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-bold text-amber-700">Default</span>
@@ -609,6 +692,24 @@ export function WorkersPage() {
         <p className="mt-4 flex items-center gap-2 text-sm text-amber-700">
           <AlertTriangle className="h-4 w-4" /> One or more workers reported an unhealthy status. Use the test action to re-check.
         </p>
+      ) : null}
+
+      {/* Evaluated-only providers (no selectable driver ships for these). */}
+      {evaluated.length > 0 ? (
+        <Card className="mt-6 p-4 sm:p-5">
+          <h2 className="text-sm font-extrabold text-slate-700">Evaluated providers (not available)</h2>
+          <p className="mt-1 text-xs text-slate-500">
+            Free-tier safety is a requirement, not a label. These providers were evaluated against current official docs and are not selectable in this build.
+          </p>
+          <ul className="mt-3 space-y-2">
+            {evaluated.map((p) => (
+              <li key={p.providerType} className="rounded-xl border border-slate-200 p-3 text-xs text-slate-600">
+                <p className="font-bold text-slate-700">{p.providerType}</p>
+                <p className="mt-1">{p.exclusionReason ?? p.hardStopBehavior}</p>
+              </li>
+            ))}
+          </ul>
+        </Card>
       ) : null}
     </>
   )

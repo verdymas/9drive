@@ -5,8 +5,10 @@
  */
 import { registerDriver } from './driver-registry.js'
 import { cloudflareWorkerDriver } from './drivers/cloudflare.js'
+import { denoWorkerDriver } from './drivers/deno.js'
 
 registerDriver(cloudflareWorkerDriver)
+registerDriver(denoWorkerDriver)
 
 export { remoteFetchWorkerRouter } from './workers.routes.js'
 export { listDriverMetadata } from './workers.driver-metadata.js'

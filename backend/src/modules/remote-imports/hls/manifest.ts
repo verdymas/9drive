@@ -232,6 +232,13 @@ export async function fetchManifestForProbe(
   let finalContentType: string | null = null
   let finalStatus = 200
   let finalContentDisposition: string | null = null
+  // Direct-only fallback: fetcher-backed callers use the branch above.
+  // Logged explicitly so worker-route failures are never confused with a
+  // fallback Direct request (report-only: no automatic failover).
+  try {
+    const fallbackHost = new URL(url).hostname
+    console.log(`[remote-import:hls] route=direct-fallback op=fetchManifestForProbe targetHost=${fallbackHost}`)
+  } catch { /* logging only */ }
   try {
     const result = await followRemoteUrl(url, {
       headers: HLS_MANIFEST_PROFILE_HEADERS,

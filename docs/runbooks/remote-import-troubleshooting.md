@@ -68,7 +68,23 @@ logged — never query values, cookies, or bodies.
 - A Worker-selected job logs `[remote-import:route] route=worker …` once and
   stays on Worker for probe/download/range/retries. A `route=direct` line
   after a Worker error is a separate job/operation (check its own `traceId`),
-  not a fallback — there is no automatic Worker→Direct fallback.
+  not a fallback — there is no automatic Worker→Direct fallback. Direct-only
+  HLS/materializer fallbacks log `route=direct-fallback` explicitly for the
+  same attribution.
+
+## 4b. Worker safety budgets (free-tier guard)
+
+- `GET /workers/:id/usage` shows monthly `requests/egressBytes/failures`
+  against the configured safety budget (bigints as strings) plus
+  `exhausted/approaching` flags. The Workers page shows the same summary.
+- Exhausted workers reject new imports with `WORKER_BUDGET_EXHAUSTED`
+  before any relay request (stays on its route — never Direct, never another
+  provider). Egress is also enforced mid-stream: large bodies abort with the
+  same code instead of silently exceeding the free tier.
+- Retries and failed attempts count toward the request budget.
+- 9Drive budgets cannot see unrelated traffic in the same provider account;
+  keep a conservative margin. Providers hard-stop at their own limits
+  (Cloudflare Error 1027; Deno deployment pause; Vercel deployment pause).
 
 For an eligible stream-through import, a source that ignores a requested range
 falls back to the temporary-spool path before transfer starts. Do not manually

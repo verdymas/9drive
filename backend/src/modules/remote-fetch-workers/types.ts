@@ -11,6 +11,42 @@
 /** Auth strategy for a worker's connection to its relay endpoint. */
 export type RemoteFetchWorkerAuthType = 'hmac' | 'bearer' | 'none'
 
+/** Provider family for a relay driver. `cloudflare` keeps its managed flow;
+ *  `deno` is manual-endpoint in this phase (managed provisioning deferred).
+ *  `vercel` / `netlify` are evaluated-only and have no selectable driver. */
+export type RelayProviderType = 'cloudflare' | 'deno' | 'vercel' | 'netlify' | 'generic'
+
+/** Documented $0-tier budget for a provider (null = unbounded/documented none). */
+export type ProviderFreeTierBudget = {
+  requestsPerMonth: number | null
+  egressBytesPerMonth: number | null
+  /** Short human note, e.g. "20 GiB egress — binding for media". */
+  note?: string
+}
+
+/** Explicit relay capabilities every provider adapter must declare. */
+export type RelayProviderCapabilities = {
+  providerType: RelayProviderType
+  /** True when response streaming (raw upstream passthrough) is supported. */
+  streaming: boolean
+  /** True when Range requests round-trip. */
+  rangeRequests: boolean
+  /** Maximum supported single-request wall-clock (ms, null = undocumented). */
+  maxRequestDurationMs: number | null
+  /** Maximum streamed response bytes (null = no enforced cap). */
+  maxResponseBytes: number | null
+  /** Whether the driver provisions the deployment (managed) or takes a manual URL. */
+  managed: boolean
+  /** Documented free-tier request/egress budget. */
+  freeTier: ProviderFreeTierBudget
+  /** Hard-stop behavior when the free budget is exhausted (for docs/UI). */
+  hardStopBehavior: string
+  /** True when the provider may be selected for imports (false = evaluated-only). */
+  selectable: boolean
+  /** Why a non-selectable provider is excluded (docs/tests). */
+  exclusionReason?: string
+}
+
 /** Health status of a registered worker. */
 export type RemoteFetchWorkerStatus =
   | 'unknown'
@@ -90,6 +126,10 @@ export type WorkerDriverMetadata = {
   managed: boolean
   authTypes: RemoteFetchWorkerAuthType[]
   fields: WorkerDriverField[]
+  /** Provider adapter capabilities (budgets, streaming, duration, selectability). */
+  provider?: RelayProviderCapabilities
+  /** Conservative in-9Drive safety budgets below the published $0 limits. */
+  safetyBudgets?: { maxRequestsPerMonth: number | null; maxEgressBytesPerMonth: number | null }
 }
 
 /** Registration credentials/options for a managed (provisioned) driver. */
@@ -194,4 +234,7 @@ export interface RemoteFetchWorkerDriver {
     authType: RemoteFetchWorkerAuthType
     secretDecrypted?: string | null
   }): RemoteFetchTransport
+
+  /** Provider adapter capabilities for this driver (budgets/streaming/limits). */
+  getCapabilities?(): RelayProviderCapabilities
 }

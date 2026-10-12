@@ -23,6 +23,8 @@ export type WorkerItem = {
   providerConfig: Record<string, string> | null
   capabilitiesJson: Record<string, unknown> | null
   metadataJson: Record<string, unknown> | null
+  reqBudgetMonthly?: string | null
+  egressBudgetBytesMonthly?: string | null
   status: WorkerStatus
   lastHealthCheckAt: string | null
   lastHealthyAt: string | null
@@ -54,6 +56,32 @@ export type WorkerDriverMetadata = {
   managed: boolean
   authTypes: Array<'hmac' | 'bearer' | 'none'>
   fields: WorkerDriverField[]
+  provider?: {
+    providerType: string
+    streaming: boolean
+    rangeRequests: boolean
+    maxRequestDurationMs: number | null
+    maxResponseBytes: number | null
+    managed: boolean
+    freeTier: { requestsPerMonth: number | null; egressBytesPerMonth: number | null; note?: string }
+    hardStopBehavior: string
+    selectable: boolean
+    exclusionReason?: string
+  }
+  safetyBudgets?: { maxRequestsPerMonth: number | null; maxEgressBytesPerMonth: number | null }
+}
+
+/** Evaluated-but-not-selectable providers (Vercel experimental, Netlify excluded). */
+export type EvaluatedProvider = {
+  providerType: string
+  streaming: boolean
+  rangeRequests: boolean
+  maxRequestDurationMs: number | null
+  maxResponseBytes: number | null
+  freeTier: { requestsPerMonth: number | null; egressBytesPerMonth: number | null; note?: string }
+  hardStopBehavior: string
+  selectable: false
+  exclusionReason?: string
 }
 
 export type CreateWorkerInput = {
@@ -71,6 +99,8 @@ export type CreateWorkerInput = {
   description?: string | null
   isEnabled?: boolean
   isDefault?: boolean
+  reqBudgetMonthly?: string | null
+  egressBudgetBytesMonthly?: string | null
 }
 
 export type UpdateWorkerInput = Partial<CreateWorkerInput>
@@ -87,8 +117,31 @@ export async function listWorkers(): Promise<WorkerItem[]> {
 }
 
 export async function listWorkerDrivers(): Promise<WorkerDriverMetadata[]> {
-  const data = await apiFetch<{ drivers: WorkerDriverMetadata[] }>('/workers/drivers')
+  const data = await apiFetch<{ drivers: WorkerDriverMetadata[]; evaluatedOnly?: EvaluatedProvider[] }>('/workers/drivers')
   return data.drivers
+}
+
+export async function listEvaluatedProviders(): Promise<EvaluatedProvider[]> {
+  const data = await apiFetch<{ drivers: WorkerDriverMetadata[]; evaluatedOnly?: EvaluatedProvider[] }>('/workers/drivers')
+  return data.evaluatedOnly ?? []
+}
+
+export type WorkerUsage = {
+  workerId: string
+  driver: string
+  periodMonth: string
+  requests: string
+  egressBytes: string
+  failures: string
+  maxRequests: string | null
+  maxEgressBytes: string | null
+  exhausted: boolean
+  approaching: boolean
+}
+
+export async function getWorkerUsage(id: string): Promise<WorkerUsage> {
+  const data = await apiFetch<{ usage: WorkerUsage }>(`/workers/${id}/usage`)
+  return data.usage
 }
 
 export async function createWorker(input: CreateWorkerInput): Promise<WorkerItem> {

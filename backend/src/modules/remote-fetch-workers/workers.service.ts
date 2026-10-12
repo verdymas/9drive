@@ -28,7 +28,13 @@ export function serializeWorker(row: any) {
       providerConfig = null
     }
   }
-  return { ...rest, credentialConfigured: Boolean(row.secretEncrypted), providerConfig }
+  // Bigints (budgets) stringified for JSON; usage attached by callers when available.
+  const wire: Record<string, unknown> = { ...rest, credentialConfigured: Boolean(row.secretEncrypted), providerConfig }
+  for (const key of ['reqBudgetMonthly', 'egressBudgetBytesMonthly'] as const) {
+    const value = (row as Record<string, unknown>)[key]
+    if (typeof value === 'bigint') wire[key] = value.toString()
+  }
+  return wire
 }
 
 export type CreateWorkerInput = {
@@ -46,6 +52,9 @@ export type CreateWorkerInput = {
   priority?: number | null
   isEnabled?: boolean
   isDefault?: boolean
+  /** Optional safety-budget overrides (strings accepted, bigints stored). */
+  reqBudgetMonthly?: string | bigint | null
+  egressBudgetBytesMonthly?: string | bigint | null
 }
 
 export type UpdateWorkerInput = Partial<CreateWorkerInput> & { secret?: string | null }
@@ -56,7 +65,21 @@ const WORKER_SELECT: Prisma.RemoteFetchWorkerSelect = {
   authType: true, secretEncrypted: true, configEncrypted: true,
   capabilitiesJson: true, metadataJson: true, status: true,
   lastHealthCheckAt: true, lastHealthyAt: true, lastFailedAt: true, lastErrorCode: true,
+  reqBudgetMonthly: true, egressBudgetBytesMonthly: true,
   deletedAt: true, createdAt: true, updatedAt: true,
+}
+
+/** Parse an optional budget override (string/number/bigint) into bigint|null. */
+function parseBudgetOverride(value: string | bigint | number | null | undefined): bigint | null | undefined {
+  if (value === undefined) return undefined
+  if (value === null) return null
+  try {
+    const n = BigInt(value as string | number | bigint)
+    if (n < 0n) return null
+    return n
+  } catch {
+    return null
+  }
 }
 
 function workerNotFound(): AppError {
@@ -129,6 +152,8 @@ export async function createWorker(userId: string, input: CreateWorkerInput) {
     })
     const authType = input.authType ?? 'hmac'
     const isDefault = input.isDefault ?? false
+    const reqBudget = parseBudgetOverride(input.reqBudgetMonthly)
+    const egressBudget = parseBudgetOverride(input.egressBudgetBytesMonthly)
     const created = await prisma.$transaction(async (tx) => {
       if (isDefault) {
         await tx.remoteFetchWorker.updateMany({ where: { isDefault: true, deletedAt: null }, data: { isDefault: false } })
@@ -152,6 +177,8 @@ export async function createWorker(userId: string, input: CreateWorkerInput) {
               ? encryptText(JSON.stringify(input.config))
               : null,
           status: 'unknown',
+          ...(reqBudget !== undefined ? { reqBudgetMonthly: reqBudget } : {}),
+          ...(egressBudget !== undefined ? { egressBudgetBytesMonthly: egressBudget } : {}),
         },
         select: WORKER_SELECT,
       })
@@ -303,6 +330,8 @@ export async function updateWorker(userId: string, id: string, input: UpdateWork
       config: input.config ?? null,
     })
     const isDefault = input.isDefault
+    const reqBudget = parseBudgetOverride(input.reqBudgetMonthly)
+    const egressBudget = parseBudgetOverride(input.egressBudgetBytesMonthly)
     return prisma.$transaction(async (tx) => {
       if (isDefault === true) {
         await tx.remoteFetchWorker.updateMany({ where: { isDefault: true, deletedAt: null, id: { not: id } }, data: { isDefault: false } })
@@ -323,6 +352,8 @@ export async function updateWorker(userId: string, id: string, input: UpdateWork
           // Blank/absent secret → keep existing; non-blank → replace.
           secretEncrypted: input.secret ? encryptText(input.secret) : input.secret === null ? null : undefined,
           configEncrypted: input.config ? encryptText(JSON.stringify(input.config)) : undefined,
+          ...(reqBudget !== undefined ? { reqBudgetMonthly: reqBudget } : {}),
+          ...(egressBudget !== undefined ? { egressBudgetBytesMonthly: egressBudget } : {}),
         },
         select: WORKER_SELECT,
       })

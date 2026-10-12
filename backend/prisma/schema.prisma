@@ -798,10 +798,16 @@ model RemoteFetchWorker {
   lastHealthyAt     DateTime?      @map("last_healthy_at")
   lastFailedAt      DateTime?      @map("last_failed_at")
   lastErrorCode     String?        @map("last_error_code") @db.VarChar(64)
+  // Conservative free-tier safety budgets below published $0 limits.
+  // Null = use driver default. Enforced before start and mid-stream.
+  // 9Drive budgets cannot see unrelated traffic in the same provider account.
+  reqBudgetMonthly        BigInt? @map("req_budget_monthly")
+  egressBudgetBytesMonthly BigInt? @map("egress_budget_bytes_monthly")
   deletedAt         DateTime?      @map("deleted_at")
   createdAt         DateTime       @default(now()) @map("created_at")
   updatedAt         DateTime       @updatedAt @map("updated_at")
   remoteImports     RemoteImport[]
+  usage             RemoteFetchWorkerUsage[]
 
   @@index([driver])
   @@index([isEnabled])
@@ -809,6 +815,26 @@ model RemoteFetchWorker {
   @@index([status])
   @@index([deletedAt])
   @@map("remote_fetch_workers")
+}
+
+// ── Remote Fetch Worker free-tier usage: monthly request/egress accounting.
+// One row per worker per UTC month (`periodMonth` = "YYYY-MM"). Retries and
+// unsuccessful requests count toward the request budget so they cannot bypass
+// it. Egress counts streamed response bytes (relay→9Drive direction).
+model RemoteFetchWorkerUsage {
+  id          String   @id @default(uuid()) @db.Char(36)
+  workerId    String   @map("worker_id") @db.Char(36)
+  periodMonth String   @map("period_month") @db.VarChar(7)
+  requests    BigInt   @default(0)
+  egressBytes BigInt   @default(0) @map("egress_bytes")
+  failures    BigInt   @default(0)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  worker      RemoteFetchWorker @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  @@unique([workerId, periodMonth])
+  @@index([periodMonth])
+  @@map("remote_fetch_worker_usage")
 }
 
 // ── Telegram Synchronization ─────────────────────────────────────────────

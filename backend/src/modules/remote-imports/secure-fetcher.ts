@@ -4,6 +4,7 @@ import { decryptText } from '../../utils/crypto.js'
 import { hasDriver, resolveDriver } from '../remote-fetch-workers/driver-registry.js'
 import { buildDirectTransport, buildTransportForWorker } from '../remote-fetch-workers/transport.js'
 import { urlFingerprintForLog } from '../remote-fetch-workers/relay-protocol.js'
+import { REMOTE_FETCH_WORKER_ERROR_CODES, REMOTE_FETCH_WORKER_ERROR_MESSAGES } from '../remote-fetch-workers/errors.js'
 import type { RemoteFetchTransport, RemoteFetchRequest, RemoteFetchResponse } from '../remote-fetch-workers/types.js'
 import type { RemoteImportRequestContext } from './request-context.js'
 
@@ -54,7 +55,21 @@ export class SecureRemoteFetcher {
         `[remote-import:fetcher] route=worker traceId=${traceId} op=${op} workerId=${this.diagnostics.workerId ?? ''} driver=${this.diagnostics.driver ?? ''} relayHost=${this.diagnostics.relayHost ?? ''} targetHost=${targetHost} urlFp=${urlFp} method=${input.method ?? 'GET'}`,
       )
     }
-    const res = await this.transport.request(input)
+    const res = await this.transport.request(input).catch(async (error) => {
+      // Failed relay attempts still consume free-tier request budget so
+      // retries cannot bypass it. Direct routes are never budgeted.
+      // Best-effort with timeout: accounting must never stall the fetch.
+      if (this.diagnostics.route === 'worker' && this.diagnostics.workerId) {
+        try {
+          const { recordWorkerRequest } = await import('../remote-fetch-workers/worker-usage.service.js')
+          await Promise.race([
+            recordWorkerRequest(this.diagnostics.workerId, { failed: true }),
+            new Promise((resolve) => setTimeout(() => resolve(null), 500)),
+          ])
+        } catch { /* accounting never fails the import */ }
+      }
+      throw error
+    })
     // Log safe outcome — upstream answer, not relay health. The transport logs
     // relayHttpStatus vs upstreamStatus separately for worker routes; this line
     // carries the decoded upstream status plus the fingerprint so the fetcher
@@ -77,6 +92,64 @@ export class SecureRemoteFetcher {
       }
     })()
     console.log(`[remote-import:fetcher] response route=${this.diagnostics.route} traceId=${traceId} op=${op} targetHost=${targetHost} urlFp=${urlFp} finalHost=${finalHost} finalUrlFp=${finalUrlFp} redirectCount=${redirectCount} status=${res.status}`)
+    if (this.diagnostics.route === 'worker' && this.diagnostics.workerId) {
+      // Successful relay request: count it and wrap the stream so egress
+      // bytes are accounted and the safety budget is enforced mid-stream
+      // (large bodies stop instead of silently exceeding the free tier).
+      const workerId = this.diagnostics.workerId
+      try {
+        const { getWorkerBudgetStatus, recordWorkerRequest } = await import('../remote-fetch-workers/worker-usage.service.js')
+        // Best-effort with a tight timeout: accounting must never stall the
+        // fetch (tests/DB-outage). A null budget skips mid-stream enforcement.
+        const budget = await Promise.race([
+          getWorkerBudgetStatus(workerId).catch(() => null),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+        ])
+        const maxEgress = budget?.maxEgressBytes ?? null
+        const baseEgress = budget?.egressBytes ?? 0n
+        if (typeof res.body !== 'string' && res.body && typeof (res.body as AsyncIterable<Uint8Array>)[Symbol.asyncIterator] === 'function') {
+          const source = res.body as AsyncIterable<Uint8Array>
+          let streamed = 0n
+          const recordAtEnd = (bytes: bigint, failed: boolean) =>
+            Promise.race([
+              recordWorkerRequest(workerId, { egressBytes: bytes, failed }),
+              new Promise((resolve) => setTimeout(() => resolve(null), 500)),
+            ]).catch(() => undefined)
+          const wrapped: AsyncIterable<Uint8Array> = {
+            [Symbol.asyncIterator]: async function* () {
+              try {
+                for await (const chunk of source) {
+                  const len = BigInt((chunk as Uint8Array).byteLength ?? Buffer.byteLength(chunk as unknown as string))
+                  streamed += len
+                  if (maxEgress !== null && baseEgress + streamed > maxEgress) {
+                    throw new AppError(
+                      REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_BUDGET_EXHAUSTED,
+                      `${REMOTE_FETCH_WORKER_ERROR_MESSAGES.WORKER_BUDGET_EXHAUSTED} (egress budget exceeded while streaming)`,
+                      409,
+                    )
+                  }
+                  yield chunk as Uint8Array
+                }
+              } finally {
+                // Record even partial streams; failures flag the row.
+                await recordAtEnd(streamed, false)
+              }
+            },
+          }
+          ;(res as { body: unknown }).body = wrapped
+        } else {
+          const egress = typeof res.body === 'string' ? BigInt(Buffer.byteLength(res.body, 'utf8')) : 0n
+          await Promise.race([
+            recordWorkerRequest(workerId, { egressBytes: egress, failed: false }),
+            new Promise((resolve) => setTimeout(() => resolve(null), 500)),
+          ]).catch(() => undefined)
+        }
+      } catch (error) {
+        // Budget-exhausted mid-stream errors propagate (they stop the import
+        // on its worker route); accounting failures are swallowed above.
+        if (error instanceof AppError && error.code === REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_BUDGET_EXHAUSTED) throw error
+      }
+    }
     return res as RemoteFetchResponse & { finalUrl?: string; redirectCount?: number }
   }
 
@@ -195,6 +268,18 @@ export async function createSecureFetcherForWorkerId(
   }
   if (!hasDriver(worker.driver)) {
     throw new AppError('REMOTE_IMPORT_WORKER_DRIVER_UNSUPPORTED', 'The selected network worker uses an unsupported service.', 400)
+  }
+  // Pre-start safety-budget gate: a worker at its configured free-tier budget
+  // rejects before any relay request (stays on its route — never Direct).
+  // Best-effort: budget-table absence (pre-migration) must not break routing.
+  try {
+    const { assertWorkerBudgetAvailable } = await import('../remote-fetch-workers/worker-usage.service.js')
+    await Promise.race([
+      assertWorkerBudgetAvailable(workerId),
+      new Promise<unknown>((resolve) => setTimeout(() => resolve(null), 500)),
+    ])
+  } catch (error) {
+    if (error instanceof AppError && error.code === REMOTE_FETCH_WORKER_ERROR_CODES.WORKER_BUDGET_EXHAUSTED) throw error
   }
   const transport = buildTransportForWorker(
     {
