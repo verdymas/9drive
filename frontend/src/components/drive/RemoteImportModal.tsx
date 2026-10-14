@@ -65,6 +65,8 @@ export function RemoteImportModal({
     folderId,
     accountId,
     workerId,
+    sourcePageUrl,
+    warmupMode,
     fileName,
     submitting,
     error,
@@ -77,6 +79,8 @@ export function RemoteImportModal({
     setHlsOptions,
     updateContext,
     handleUrlChange,
+    handlePageUrlChange,
+    handleWarmupModeChange,
     handleFileNameChange,
     handleModeChange,
     handleCurlChange,
@@ -195,6 +199,24 @@ export function RemoteImportModal({
           ) : null}
           {workerId && workers.find((worker) => worker.id === workerId)?.status === 'unknown' ? <p className="text-xs text-slate-500">This worker has not been tested yet.</p> : null}
         </label>
+
+        <Collapsible title="VPS Browser Warmup (optional)">
+          <p className="rounded-xl bg-slate-50 p-2.5 text-xs font-semibold text-slate-500">
+            Virtual Private Server only. A short-lived headless browser visits the originating page (no Play click) before the first probe, then closes. Disabled by default until proven — leave blank for legacy behavior.
+          </p>
+          <label className="grid gap-1.5 text-sm font-semibold">
+            Originating Page URL
+            <Input value={sourcePageUrl} onChange={(event) => handlePageUrlChange(event.target.value)} placeholder="https://watch.example/page" type="url" />
+          </label>
+          <label className="grid gap-1.5 text-sm font-semibold">
+            Warmup Mode
+            <select className="h-11 rounded-xl border border-slate-200 px-3 text-sm" value={warmupMode} onChange={(event) => handleWarmupModeChange(event.target.value as 'off' | 'auto' | 'required')}>
+              <option value="auto">Auto (warm when VPS + page present)</option>
+              <option value="off">Off</option>
+              <option value="required">Required (fail without warmup)</option>
+            </select>
+          </label>
+        </Collapsible>
 
         <label className="grid gap-2 text-sm font-semibold">
           File Name (optional)

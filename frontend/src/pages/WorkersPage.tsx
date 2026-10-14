@@ -113,8 +113,21 @@ export function WorkersPage() {
   const enabledCount = useMemo(() => workers.filter((w) => w.isEnabled).length, [workers])
   const defaultWorker = useMemo(() => workers.find((w) => w.isDefault), [workers])
 
+  /**
+   * Submit/display default for the manual Authentication select. Drivers with
+   * a single auth type (Virtual Private Server → HMAC-only) always use it —
+   * the select is never left in a state that disagrees with the payload.
+   * Multi-option drivers keep the legacy `none` default (behavior unchanged).
+   */
+  const authDefaultFor = (driverKey: string): string => {
+    const authTypes = drivers.find((d) => d.key === driverKey)?.authTypes ?? []
+    if (authTypes.length === 1) return authTypes[0]
+    return 'none'
+  }
+
   function openCreate() {
-    setForm({ ...emptyWorkerForm, driver: drivers[0]?.key ?? '' })
+    const key = drivers[0]?.key ?? ''
+    setForm({ ...emptyWorkerForm, driver: key, fields: key ? { authType: authDefaultFor(key) } : {} })
     setCreateOpen(true)
   }
 
@@ -171,7 +184,7 @@ export function WorkersPage() {
         payload.config = config
       } else {
         payload.endpointUrl = form.fields.endpointUrl ?? ''
-        payload.authType = (form.fields.authType as CreateWorkerInput['authType']) ?? 'none'
+        payload.authType = (form.fields.authType as CreateWorkerInput['authType']) ?? (authDefaultFor(form.driver) as CreateWorkerInput['authType'])
         payload.secret = form.fields.secret || undefined
         payload.region = form.fields.region || null
         payload.description = form.fields.description || null
@@ -209,7 +222,11 @@ export function WorkersPage() {
       setTestResult(result.status === 'healthy' ? `${worker.name}: connection healthy.` : `${worker.name}: ${workerStatusLabel(result.status)} — ${result.lastErrorCode ?? ''}`)
       await load()
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Connection test failed.')
+      // Surface the stable error code (timeout, auth, protocol, refused) —
+      // never credentials. apiFetch attaches `code` from the API response.
+      const code = (error as Error & { code?: string })?.code
+      const message = error instanceof Error ? error.message : 'Connection test failed.'
+      setMessage(code ? `${message} [${code}]` : message)
     } finally {
       setTestingId(null)
     }
@@ -281,6 +298,22 @@ export function WorkersPage() {
   const driverName = (key: string) => drivers.find((d) => d.key === key)?.displayName ?? key
   const driverManaged = (key: string) => Boolean(drivers.find((d) => d.key === key)?.managed)
   const transientStatus = (s: string) => s === 'provisioning' || s === 'provision_failed'
+
+  /**
+   * Public setup-status page for Virtual Private Server workers, built only
+   * from the operator-controlled, validated endpoint URL. Null unless the
+   * endpoint is a valid https URL — never assembled from request headers.
+   */
+  const systemHealthUrl = (worker: WorkerItem): string | null => {
+    if (worker.driver !== 'vps' || !worker.endpointUrl) return null
+    try {
+      const u = new URL(worker.endpointUrl)
+      if (u.protocol !== 'https:' || u.username || u.password) return null
+      return `${u.toString().replace(/\/+$/, '')}/system-health`
+    } catch {
+      return null
+    }
+  }
 
   function formatUsage(u: WorkerUsage): string {
     const req = `${u.requests}${u.maxRequests ? `/${u.maxRequests}` : ''} req`
@@ -416,12 +449,12 @@ export function WorkersPage() {
             <span className="text-xs font-bold text-slate-500">Authentication</span>
             <select
               className="h-11 rounded-xl border border-slate-200 px-3 text-sm focus:border-blue-500 focus:outline-none"
-              value={form.fields.authType ?? 'hmac'}
+              value={form.fields.authType ?? authDefaultFor(form.driver)}
               onChange={(e) => setField('authType', e.target.value)}
             >
-              <option value="hmac">HMAC</option>
-              <option value="bearer">Bearer token</option>
-              <option value="none">None</option>
+              {(selectedDriver?.authTypes ?? ['hmac', 'bearer', 'none']).includes('hmac') ? <option value="hmac">HMAC</option> : null}
+              {(selectedDriver?.authTypes ?? ['hmac', 'bearer', 'none']).includes('bearer') ? <option value="bearer">Bearer token</option> : null}
+              {(selectedDriver?.authTypes ?? ['hmac', 'bearer', 'none']).includes('none') ? <option value="none">None</option> : null}
             </select>
           </label>
         </div>
@@ -435,6 +468,7 @@ export function WorkersPage() {
             value={form.fields.secret ?? ''}
             onChange={(e) => setField('secret', e.target.value)}
             placeholder={editWorker?.credentialConfigured ? '••••••••••••' : 'Shared secret or bearer token'}
+            required={!editWorker && (form.fields.authType ?? authDefaultFor(form.driver)) !== 'none'}
           />
         </label>
         <label className="grid gap-1.5">
@@ -447,6 +481,7 @@ export function WorkersPage() {
           />
         </label>
         {form.driver === 'deno' ? <DenoDeployTutorial /> : null}
+        {form.driver === 'vps' ? <VpsDeployTutorial /> : null}
         <div className="grid gap-4 sm:grid-cols-2">
           <label className="grid gap-1.5">
             <span className="text-xs font-bold text-slate-500">Monthly request budget (optional)</span>
@@ -454,10 +489,10 @@ export function WorkersPage() {
               className="h-11 rounded-xl border border-slate-200 px-3 text-sm focus:border-blue-500 focus:outline-none"
               value={form.fields.reqBudgetMonthly ?? ''}
               onChange={(e) => setField('reqBudgetMonthly', e.target.value)}
-              placeholder="800000 (blank = 800000)"
+              placeholder={form.driver === 'vps' ? 'blank = unbounded' : '800000 (blank = 800000)'}
               inputMode="numeric"
             />
-            <span className="text-xs text-slate-400">Conservative cap below the free tier. Usage stops at this threshold.</span>
+            <span className="text-xs text-slate-400">{form.driver === 'vps' ? 'Local safety budget only — the VPS has no free-tier. Usage stops at this threshold when set.' : 'Conservative cap below the free tier. Usage stops at this threshold.'}</span>
           </label>
           <label className="grid gap-1.5">
             <span className="text-xs font-bold text-slate-500">Monthly egress budget bytes (optional)</span>
@@ -465,7 +500,7 @@ export function WorkersPage() {
               className="h-11 rounded-xl border border-slate-200 px-3 text-sm focus:border-blue-500 focus:outline-none"
               value={form.fields.egressBudgetBytesMonthly ?? ''}
               onChange={(e) => setField('egressBudgetBytesMonthly', e.target.value)}
-              placeholder="17179869184 (blank = 16 GiB)"
+              placeholder={form.driver === 'vps' ? 'blank = unbounded' : '17179869184 (blank = 16 GiB)'}
               inputMode="numeric"
             />
             <span className="text-xs text-slate-400">Enforced before start and while streaming.</span>
@@ -484,6 +519,21 @@ export function WorkersPage() {
           <li><b className="text-slate-700">2.</b> Set the <span className="font-mono">RELAY_SECRET</span> environment variable to a long random value (the same value you paste below).</li>
           <li><b className="text-slate-700">3.</b> Deploy, copy the app URL (https), and paste it as Endpoint URL with Authentication = HMAC.</li>
           <li><b className="text-slate-700">4.</b> Free tier is 1M requests/month and 20 GiB egress/month — egress is binding for media. 9Drive stops at your safety budget and cannot see other traffic in the same Deno account.</li>
+        </ol>
+      </Collapsible>
+    )
+  }
+
+  /** VPS self-hosted relay deploy steps (Upload ZIP → Dockerfile). */
+  function VpsDeployTutorial() {
+    return (
+      <Collapsible title="How to deploy the VPS relay" defaultOpen={false}>
+        <ol className="list-none space-y-2 text-xs text-slate-600">
+          <li><b className="text-slate-700">1.</b> Build the ZIP with <span className="font-mono">cd backend &amp;&amp; npm run zip:vps-relay</span> (output: <span className="font-mono">backend/artifacts/9drive-vps-relay.zip</span>).</li>
+          <li><b className="text-slate-700">2.</b> In the hosting panel choose <span className="font-semibold text-slate-700">Provider: Upload</span>, upload the ZIP, set <span className="font-semibold text-slate-700">Build Type: Dockerfile</span> (context = ZIP root), expose port <span className="font-mono">3000</span>, attach a domain with HTTPS.</li>
+          <li><b className="text-slate-700">3.</b> Set <span className="font-mono">RELAY_SECRET</span> to a long random value (the same value you paste below as Shared Secret).</li>
+          <li><b className="text-slate-700">4.</b> Paste the HTTPS endpoint URL here with Authentication = HMAC, then Test connection. The VPS has no free-tier — bandwidth bills per your host; local safety budgets below are optional caps.</li>
+          <li><b className="text-slate-700">5.</b> Open <span className="font-mono">https://&lt;your-domain&gt;/system-health</span> anytime to check setup status (ready / missing secret) without logging in.</li>
         </ol>
       </Collapsible>
     )
@@ -565,6 +615,17 @@ export function WorkersPage() {
                     <td className="px-5 py-3.5 text-xs text-slate-600">{driverName(worker.driver)}</td>
                     <td className="max-w-[220px] truncate px-5 py-3.5 font-mono text-xs text-slate-600" title={worker.endpointUrl ?? undefined}>
                       {worker.endpointUrl ?? '—'}
+                      {systemHealthUrl(worker) ? (
+                        <a
+                          href={systemHealthUrl(worker) as string}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-1 inline-flex items-center gap-1 font-sans font-semibold text-blue-600 hover:underline"
+                          title="Open the relay's public setup-status page (no login required)"
+                        >
+                          Open System Health <ExternalLink className="h-3 w-3" />
+                        </a>
+                      ) : null}
                     </td>
                     <td className="px-5 py-3.5">
                       <span className={`rounded-full px-2.5 py-0.5 text-xs font-bold ${workerStatusBadgeClass(worker.status)}`}>{workerStatusLabel(worker.status)}</span>
@@ -624,7 +685,7 @@ export function WorkersPage() {
         <form className="grid gap-4" onSubmit={handleSubmit}>
           <label className="grid gap-1.5">
             <span className="text-xs font-bold text-slate-500">Service</span>
-            <select className="h-11 rounded-xl border border-slate-200 px-3 text-sm focus:border-blue-500 focus:outline-none" value={form.driver} onChange={(event) => setForm((f) => ({ ...f, driver: event.target.value, fields: {} }))} disabled={Boolean(editWorker)} required>
+            <select className="h-11 rounded-xl border border-slate-200 px-3 text-sm focus:border-blue-500 focus:outline-none" value={form.driver} onChange={(event) => setForm((f) => ({ ...f, driver: event.target.value, fields: { authType: authDefaultFor(event.target.value) } }))} disabled={Boolean(editWorker)} required>
               {drivers.length === 0 ? <option value="">No services available</option> : null}
               {drivers.map((driver) => (
                 <option key={driver.key} value={driver.key}>{driver.displayName}</option>

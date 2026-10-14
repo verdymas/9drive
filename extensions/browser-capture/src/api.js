@@ -110,6 +110,7 @@ export function submitResource(entry) {
       mimeType: entry.mime ?? null,
       filename: entry.filename ?? null,
       pageUrl: entry.pageUrl ?? null,
+      sourcePageUrl: entry.sourcePageUrl ?? entry.pageUrl ?? null,
       pageTitle: entry.pageTitle ?? null,
       // Phase 14: optional media-identity summary (title + source + confidence).
       // The full candidate list stays in the extension; the backend stores only

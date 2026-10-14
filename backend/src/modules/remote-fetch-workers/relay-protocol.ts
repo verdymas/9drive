@@ -11,7 +11,11 @@ export const RELAY_PROTOCOL_VERSION = '9drive-relay-v1' as const
 export const RELAY_COOKIE_PROTOCOL_VERSION = '9drive-relay-v2-cookie' as const
 export const RELAY_HEALTH_PATH = '/health' as const
 export const RELAY_FETCH_PATH = '/fetch' as const
+export const RELAY_WARMUP_PATH = '/warmup' as const
 export const RELAY_SIGNATURE_HEADER = 'x-9drive-signature' as const
+/** Payload-bound warmup auth headers (replay-resistant; legacy /fetch keeps method+path only). */
+export const RELAY_WARMUP_TIMESTAMP_HEADER = 'x-9drive-timestamp' as const
+export const RELAY_WARMUP_NONCE_HEADER = 'x-9drive-nonce' as const
 
 /**
  * Streaming mode (v1.1 opt-in): `response: "stream"` asks the relay to answer
@@ -68,9 +72,50 @@ export const RelayHealthResponseSchema = z.object({
       hls: z.boolean().optional(),
       maxBodyBytes: z.number().nullable().optional(),
       protocolVersion: z.string().optional(),
+      browserWarmup: z
+        .object({
+          supported: z.boolean(),
+          configured: z.boolean().optional(),
+        })
+        .optional(),
     })
     .optional(),
 })
+
+/**
+ * VPS Browser Warmup wire contract (backward-compatible addition).
+ * POST /warmup navigates a short-lived headless Chromium to `pageUrl`
+ * (no Play click), closes it, and returns observed media/navigation outcome.
+ * Auth is payload-bound (timestamp + nonce + body hash) — never the legacy
+ * bare `METHOD path` signature used by /fetch.
+ */
+export const RelayWarmupRequestSchema = z.object({
+  protocolVersion: z.literal('9drive-relay-v1'),
+  pageUrl: z.string().url().max(4096),
+  /** Opaque correlation id (never secrets). */
+  traceId: z.string().min(1).max(128).optional(),
+  /** Idempotency key per import attempt (`<importId>~<attempt>:<pageFp>`). */
+  idempotencyKey: z.string().min(1).max(128).optional(),
+  /** Bounded navigation deadline requested by the backend (ms). Relay clamps. */
+  timeoutMs: z.number().int().min(1000).max(60000).optional(),
+})
+
+export type RelayWarmupRequest = z.infer<typeof RelayWarmupRequestSchema>
+
+export const RelayWarmupResponseSchema = z.object({
+  protocolVersion: z.literal('9drive-relay-v1'),
+  status: z.enum(['warmed', 'not_supported', 'failed']),
+  /** Navigation HTTP status of the top-level page (null when unreachable). */
+  navigationStatus: z.number().int().min(100).max(599).nullable().optional(),
+  /** Count of observed media-ish (.vid/.mp4/m3u8) requests during warmup. */
+  mediaObserved: z.number().int().min(0).optional(),
+  /** Whether a genuine media 206 was observed inside the browser (never 206 text/html). */
+  browserMedia206: z.boolean().optional(),
+  traceId: z.string().min(1).max(128).optional(),
+  errorCategory: z.string().max(64).optional(),
+})
+
+export type RelayWarmupResponse = z.infer<typeof RelayWarmupResponseSchema>
 
 /**
  * Safe reason codes for relay payload validation — never contains URL/header/body values.

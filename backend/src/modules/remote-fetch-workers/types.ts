@@ -13,8 +13,9 @@ export type RemoteFetchWorkerAuthType = 'hmac' | 'bearer' | 'none'
 
 /** Provider family for a relay driver. `cloudflare` keeps its managed flow;
  *  `deno` is manual-endpoint in this phase (managed provisioning deferred).
+ *  `vps` is a self-hosted manual-endpoint relay (Virtual Private Server).
  *  `vercel` / `netlify` are evaluated-only and have no selectable driver. */
-export type RelayProviderType = 'cloudflare' | 'deno' | 'vercel' | 'netlify' | 'generic'
+export type RelayProviderType = 'cloudflare' | 'deno' | 'vps' | 'vercel' | 'netlify' | 'generic'
 
 /** Documented $0-tier budget for a provider (null = unbounded/documented none). */
 export type ProviderFreeTierBudget = {
@@ -64,6 +65,7 @@ export type RemoteFetchWorkerCapabilities = {
   hls?: boolean
   maxBodyBytes?: number | null
   protocolVersion?: string
+  browserWarmup?: { supported: boolean; configured?: boolean }
   [key: string]: unknown
 }
 

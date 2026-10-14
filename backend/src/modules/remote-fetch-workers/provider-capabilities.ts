@@ -58,6 +58,23 @@ export const DENO_CAPABILITIES: RelayProviderCapabilities = {
   selectable: true,
 }
 
+export const VPS_CAPABILITIES: RelayProviderCapabilities = {
+  providerType: 'vps',
+  streaming: true,
+  rangeRequests: true,
+  // Self-hosted relay: no provider wall-clock cap; transport timeouts bound the request.
+  maxRequestDurationMs: null,
+  maxResponseBytes: null,
+  managed: false,
+  freeTier: {
+    requestsPerMonth: null,
+    egressBytesPerMonth: null,
+    note: 'Self-hosted VPS: no provider free-tier. Bandwidth/egress costs and capacity are operator-defined. Local safety budgets only.',
+  },
+  hardStopBehavior: 'Operator-defined: concurrency, timeout, and local safety-budget rejections are enforced by the relay and 9Drive; there is no provider pause.',
+  selectable: true,
+}
+
 /** Conservative in-9Drive safety budgets (below published $0 limits). */
 export const PROVIDER_SAFETY_BUDGETS: Record<string, { maxRequestsPerMonth: number | null; maxEgressBytesPerMonth: number | null }> = {
   cloudflare: {
@@ -68,6 +85,11 @@ export const PROVIDER_SAFETY_BUDGETS: Record<string, { maxRequestsPerMonth: numb
   deno: {
     maxRequestsPerMonth: 800_000,
     maxEgressBytesPerMonth: 16 * 1024 * 1024 * 1024,
+  },
+  vps: {
+    // Self-hosted: unbounded by default; operators set explicit local safety budgets per worker.
+    maxRequestsPerMonth: null,
+    maxEgressBytesPerMonth: null,
   },
 }
 

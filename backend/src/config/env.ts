@@ -129,6 +129,15 @@ const envSchema = z.object({
   // Test-connection timeout for driver health checks (matches the connect
   // timeout default of 15s).
   WORKER_TEST_TIMEOUT_SECONDS: z.coerce.number().default(10),
+  // VPS Browser Warmup (short-lived headless Chromium page prep, VPS-only).
+  // Master switch — default OFF until the Phase 1 live gate proves genuine
+  // media bytes. Per-job mode still gates (off|auto|required); this flag can
+  // only disable, never force-enable.
+  VPS_BROWSER_WARMUP_ENABLED: booleanEnv(false),
+  // Bounded navigation deadline requested from the relay (ms, relay clamps).
+  VPS_BROWSER_WARMUP_TIMEOUT_MS: z.coerce.number().int().min(5000).max(60000).default(25000),
+  // Replay window for payload-bound /warmup HMAC (seconds).
+  VPS_BROWSER_WARMUP_REPLAY_WINDOW_SECONDS: z.coerce.number().int().min(30).max(600).default(300),
   // Allows http://localhost endpoints in dev (e.g. a local relay stub). Never
   // true in production — remote relays must use HTTPS.
   WORKER_ALLOW_LOCALHOST_HTTP: z.coerce.boolean().default(false),

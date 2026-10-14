@@ -4,7 +4,7 @@
   "main": "dist/server.js",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc && node scripts/copy-relay-asset.mjs && node scripts/zip-extension.mjs",
+    "build": "tsc && node scripts/copy-relay-asset.mjs && node scripts/zip-extension.mjs && node scripts/zip-vps-relay.mjs",
     "start": "node dist/server.js",
     "start:media": "node dist/media-server.js",
     "dev:media": "tsx watch src/media-server.ts",
@@ -20,6 +20,7 @@
     "test:api-upload": "tsx src/scripts/test-api-upload.ts",
     "test:cloudflare-relay": "tsx scripts/test-cloudflare-relay.ts",
     "zip:extension": "node scripts/zip-extension.mjs",
+    "zip:vps-relay": "node scripts/zip-vps-relay.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

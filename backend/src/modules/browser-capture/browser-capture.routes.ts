@@ -144,6 +144,10 @@ const submitSchema = z.object({
   mimeType: z.string().max(191).nullable().optional(),
   filename: z.string().max(255).nullable().optional(),
   pageUrl: z.string().max(4096).nullable().optional(),
+  // VPS Browser Warmup: originating page bound at capture time (requestId+tab
+  // tracking, never active-tab). Optional for backward compat; falls back to
+  // `pageUrl` when omitted. Validated as http(s), stored as plain Text.
+  sourcePageUrl: z.string().max(4096).nullable().optional(),
   pageTitle: z.string().max(512).nullable().optional(),
   // Phase 14: Media Identity summary from the extension. Top-level fields
   // only — the full candidates list stays in the extension.
@@ -308,6 +312,8 @@ browserCaptureRouter.post('/resources/:id/import', requireAnyIdentity, async (re
       folderId: z.string().nullable().optional(),
       connectedAccountId: z.string().nullable().optional(),
       workerId: z.string().nullable().optional(),
+      sourcePageUrl: z.string().max(4096).nullable().optional(),
+      warmupMode: z.enum(['off', 'auto', 'required']).nullable().optional(),
     }).strict().parse(req.body ?? {})
     const { remoteImport } = await importCapturedResource(req.user.id, String(req.params.id), body)
     return res.status(201).json({ remoteImport: serializeRemoteImport(remoteImport as any) })

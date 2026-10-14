@@ -53,6 +53,13 @@ export const REMOTE_FETCH_WORKER_ERROR_CODES = {
   WORKER_CAPABILITY_UNSUPPORTED: 'WORKER_CAPABILITY_UNSUPPORTED',
   WORKER_BUDGET_EXHAUSTED: 'WORKER_BUDGET_EXHAUSTED',
   WORKER_BUDGET_APPROACHING: 'WORKER_BUDGET_APPROACHING',
+  // VPS Browser Warmup (short-lived Chromium page prep, VPS-only, no fallback).
+  WARMUP_NOT_SUPPORTED: 'WARMUP_NOT_SUPPORTED',
+  WARMUP_REQUIRED_MISSING: 'WARMUP_REQUIRED_MISSING',
+  WARMUP_FAILED: 'WARMUP_FAILED',
+  WARMUP_TIMEOUT: 'WARMUP_TIMEOUT',
+  WARMUP_SECURITY_REJECTED: 'WARMUP_SECURITY_REJECTED',
+  WARMUP_BUSY: 'WARMUP_BUSY',
 } as const
 
 export type RemoteFetchWorkerErrorCode = (typeof REMOTE_FETCH_WORKER_ERROR_CODES)[keyof typeof REMOTE_FETCH_WORKER_ERROR_CODES]
@@ -92,4 +99,10 @@ export const REMOTE_FETCH_WORKER_ERROR_MESSAGES: Record<RemoteFetchWorkerErrorCo
   WORKER_CAPABILITY_UNSUPPORTED: 'The selected worker does not support this operation (streaming, range, size or duration limit).',
   WORKER_BUDGET_EXHAUSTED: 'The selected worker reached its configured free-tier safety budget. Usage is paused until the next period or a higher budget.',
   WORKER_BUDGET_APPROACHING: 'The selected worker is approaching its configured free-tier safety budget.',
+  WARMUP_NOT_SUPPORTED: 'The selected worker does not support browser warmup. Update the relay or disable warmup.',
+  WARMUP_REQUIRED_MISSING: 'Browser warmup is required for this import but no page URL was provided.',
+  WARMUP_FAILED: 'Browser warmup failed before the media probe.',
+  WARMUP_TIMEOUT: 'Browser warmup timed out before the media probe.',
+  WARMUP_SECURITY_REJECTED: 'Browser warmup rejected the page URL for security reasons.',
+  WARMUP_BUSY: 'The relay is already running a browser warmup. Retry shortly.',
 }

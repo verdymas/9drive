@@ -1,0 +1,66 @@
+# 9Drive VPS Relay — Browser Warmup variant (optional, larger image).
+#
+# Use this Dockerfile ONLY when you need VPS Browser Warmup (short-lived
+# headless Chromium page prep). The default `Dockerfile` (node:20-alpine,
+# zero-dep, ~12KB ZIP) stays lean and answers POST /warmup with
+# 501 WARMUP_NOT_SUPPORTED; this variant (node:20-slim + Chromium +
+# puppeteer-core) enables it. Decision: slim glibc for official
+# Chrome-for-Testing support on 1 vCPU / 1 GiB (Alpine musl Chromium proved
+# too heavy/unstable for this workload).
+#
+# Panel: Upload ZIP → Build Type Dockerfile → Dockerfile path:
+#   Dockerfile.warmup (or rename to Dockerfile before upload if the panel
+#   only looks for `Dockerfile`) → port 3000 + HTTPS → env below.
+#
+# Resource target: 1 vCPU / 1 GiB RAM. Chromium adds ~170-400MB RSS during
+# warmup (one at a time, bounded 25s nav, immediate close/reap). If OOMs
+# persist, run warmup on a separate micro-instance rather than weakening the
+# sandbox. Never run untrusted pages as root: this image drops to `node`
+# before listening; Chromium launches with --no-sandbox ONLY because
+# container user-namespaces are unavailable — compensating isolation is the
+# single-tab, incognito-per-warmup, discard-after-close design + SSRF egress
+# checks + authenticated /warmup only. See README §7.
+
+FROM node:20-slim
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+# Chromium + minimal deps for headless page prep (no Play click, no downloads).
+# Pinned for reproducibility; update together with puppeteer-core.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    ca-certificates \
+    fonts-liberation \
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    wget \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY package.json ./
+# Warmup variant needs puppeteer-core (lean base does not install it).
+RUN npm install --omit=dev --no-audit --no-fund || true
+
+COPY server.js ./
+
+# Non-root runtime (same contract as the lean image).
+USER node
+
+ENV PORT=3000
+ENV CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:${PORT:-3000}/healthz || exit 1
+
+CMD ["node", "server.js"]

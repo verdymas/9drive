@@ -44,6 +44,31 @@ const DRIVER: Workers.WorkerDriverMetadata = {
   ],
 }
 
+/** Manual Virtual Private Server driver: HMAC-only, no registration fields. */
+const VPS_DRIVER: Workers.WorkerDriverMetadata = {
+  key: 'vps',
+  displayName: 'Virtual Private Server',
+  managed: false,
+  authTypes: ['hmac'],
+  fields: [],
+}
+
+const VPS_WORKER: Workers.WorkerItem = {
+  ...WORKER_A,
+  id: 'w-vps',
+  name: 'VPS SG #1',
+  driver: 'vps',
+  endpointUrl: 'https://relay.example.com',
+  region: null,
+  description: null,
+  authType: 'hmac',
+  credentialConfigured: false,
+  providerConfig: null,
+  status: 'unknown',
+  lastHealthCheckAt: null,
+  lastHealthyAt: null,
+}
+
 beforeEach(() => {
   vi.restoreAllMocks()
   vi.spyOn(Workers, 'listWorkers').mockResolvedValue([WORKER_A])
@@ -159,6 +184,75 @@ describe('WorkersPage', () => {
     expect(JSON.stringify(update.mock.calls[0][1])).not.toContain('tok')
   })
 
+  it('Virtual Private Server locks Authentication to HMAC and submits hmac even when untouched', async () => {
+    // Regression: the select displayed HMAC while the payload silently sent
+    // `none`, so every VPS save failed with WORKER_DRIVER_CONFIG_INVALID.
+    const create = vi.spyOn(Workers, 'createWorker').mockResolvedValue(VPS_WORKER)
+    vi.spyOn(Workers, 'listWorkerDrivers').mockResolvedValue([DRIVER, VPS_DRIVER])
+    vi.spyOn(Workers, 'listWorkers').mockResolvedValue([])
+    render(<WorkersPage />)
+    await waitFor(() => expect(screen.getByRole('button', { name: /add worker/i })).toBeInTheDocument())
+    await openAddModal()
+    const modal = addModal()
+    await userEvent.selectOptions(within(modal).getByLabelText(/service/i), 'vps')
+    // Only HMAC is offered and it is preselected.
+    const auth = within(modal).getByLabelText(/authentication/i) as HTMLSelectElement
+    expect(auth.value).toBe('hmac')
+    expect(within(auth).getAllByRole('option')).toHaveLength(1)
+    await userEvent.type(within(modal).getByLabelText(/^name/i), 'VPS SG #1')
+    await userEvent.type(within(modal).getByLabelText(/endpoint url/i), 'https://relay.example.com')
+    await userEvent.type(within(modal).getByLabelText(/shared secret/i), 's3cret-value')
+    await userEvent.click(within(modal).getByRole('button', { name: /add worker/i }))
+    await waitFor(() => expect(create).toHaveBeenCalled())
+    expect(create.mock.calls[0][0]).toMatchObject({
+      driver: 'vps',
+      endpointUrl: 'https://relay.example.com',
+      authType: 'hmac',
+      secret: 's3cret-value',
+    })
+    expect(JSON.stringify(create.mock.calls[0][0])).not.toContain('none')
+  })
+
+  it('Virtual Private Server requires the Shared Secret before saving', async () => {
+    const create = vi.spyOn(Workers, 'createWorker').mockResolvedValue(VPS_WORKER)
+    vi.spyOn(Workers, 'listWorkerDrivers').mockResolvedValue([DRIVER, VPS_DRIVER])
+    vi.spyOn(Workers, 'listWorkers').mockResolvedValue([])
+    render(<WorkersPage />)
+    await waitFor(() => expect(screen.getByRole('button', { name: /add worker/i })).toBeInTheDocument())
+    await openAddModal()
+    const modal = addModal()
+    await userEvent.selectOptions(within(modal).getByLabelText(/service/i), 'vps')
+    await userEvent.type(within(modal).getByLabelText(/^name/i), 'VPS SG #1')
+    await userEvent.type(within(modal).getByLabelText(/endpoint url/i), 'https://relay.example.com')
+    // Secret is a required field on create (edit keeps blank-means-keep).
+    expect((within(modal).getByLabelText(/shared secret/i) as HTMLInputElement).required).toBe(true)
+    await userEvent.click(within(modal).getByRole('button', { name: /add worker/i }))
+    expect(create).not.toHaveBeenCalled()
+  })
+
+  it('a Virtual Private Server row shows Test Connection and the System Health link', async () => {
+    vi.spyOn(Workers, 'listWorkers').mockResolvedValue([VPS_WORKER])
+    vi.spyOn(Workers, 'listWorkerDrivers').mockResolvedValue([DRIVER, VPS_DRIVER])
+    render(<WorkersPage />)
+    await waitFor(() => expect(screen.getAllByText('VPS SG #1').length).toBeGreaterThan(0))
+    expect(screen.getByTitle('Test connection')).toBeInTheDocument()
+    const link = screen.getByRole('link', { name: /open system health/i })
+    expect(link).toHaveAttribute('href', 'https://relay.example.com/system-health')
+  })
+
+  it('a failed connection test surfaces the message with its stable error code', async () => {
+    const failure = Object.assign(new Error('The worker rejected the authentication.'), { code: 'WORKER_AUTH_FAILED' })
+    vi.spyOn(Workers, 'testWorker').mockRejectedValue(failure)
+    vi.spyOn(Workers, 'listWorkers').mockResolvedValue([VPS_WORKER])
+    vi.spyOn(Workers, 'listWorkerDrivers').mockResolvedValue([DRIVER, VPS_DRIVER])
+    render(<WorkersPage />)
+    await waitFor(() => expect(screen.getAllByText('VPS SG #1').length).toBeGreaterThan(0))
+    await userEvent.click(screen.getByTitle('Test connection'))
+    await waitFor(() => expect(screen.getByText(/WORKER_AUTH_FAILED/)).toBeInTheDocument())
+    // No credential material in the UI.
+    expect(document.body.textContent).not.toContain('s3cret')
+  })
+
   it('Test Connection posts and shows the result', async () => {
     const test = vi.spyOn(Workers, 'testWorker').mockResolvedValue({ status: 'healthy', lastHealthCheckAt: '2026-08-20T09:00:00.000Z' })
     render(<WorkersPage />)
@@ -186,8 +280,8 @@ describe('WorkersPage', () => {
     render(<WorkersPage />)
     await waitFor(() => expect(screen.getByText('Provision Failed')).toBeInTheDocument())
     expect(screen.queryByTitle('Test connection')).not.toBeInTheDocument()
-    // No fake endpoint is invented — the cell shows a dash.
-    expect(screen.getByText('—')).toBeInTheDocument()
+    // No fake endpoint is invented — no URL is rendered anywhere for the row.
+    expect(screen.queryByText(/https?:\/\//)).not.toBeInTheDocument()
   })
 
   it('Disable posts, reloads, and the disabled default clears itself', async () => {

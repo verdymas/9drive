@@ -369,6 +369,16 @@ model RemoteImport {
   requestContextEncrypted     String?            @map("request_context_encrypted") @db.Text
   displayUrl                  String             @map("display_url") @db.Text
   finalUrlEncrypted           String?            @map("final_url_encrypted") @db.Text
+  // VPS Browser Warmup: originating page for short-lived Chromium navigation.
+  // Encrypted at rest like the source URL; `displayPageUrl` is the safe
+  // host+path label. `warmupMode` is off|auto|required; `warmupStatus` tracks
+  // the once-per-attempt warmup (skipped|requested|warmed|failed).
+  sourcePageUrlEncrypted      String?            @map("source_page_url_encrypted") @db.Text
+  displayPageUrl              String?            @map("display_page_url") @db.Text
+  warmupMode                  String?            @map("warmup_mode") @db.VarChar(16)
+  warmupStatus                String?            @map("warmup_status") @db.VarChar(32)
+  warmupRequestedAt           DateTime?          @map("warmup_requested_at")
+  warmupTraceId               String?            @map("warmup_trace_id") @db.VarChar(128)
   fileName                    String             @map("file_name") @db.VarChar(255)
   // Original source filename from the captured resource (e.g. "master.m3u8")
   // preserved separately from the upload-derived fileName which carries the
@@ -701,6 +711,10 @@ model CapturedResource {
   mimeType                String?       @map("mime_type") @db.VarChar(191)
   filename                String        @db.VarChar(255)
   pageUrl                 String?       @map("page_url") @db.Text
+  // VPS Browser Warmup: originating page bound at capture time (requestId+tab
+  // tracking, never active-tab). Falls back to `pageUrl` when the extension
+  // omits it. Threaded to RemoteImport.sourcePageUrl on import.
+  sourcePageUrl           String?       @map("source_page_url") @db.Text
   pageTitle               String?       @map("page_title") @db.VarChar(512)
   // Safe context only (referer/origin/userAgent) — cookies are NEVER accepted;
   // values validated + encrypted at rest, booleans-only across the API.

@@ -165,10 +165,32 @@ export type SubmitResourceInput = {
   mimeType?: string | null
   filename?: string | null
   pageUrl?: string | null
+  /** VPS Browser Warmup originating page (falls back to pageUrl when omitted). */
+  sourcePageUrl?: string | null
   pageTitle?: string | null
   // Phase 14: compact media-identity summary. Title + source + confidence.
   mediaIdentity?: { title?: string | null; source?: string | null; confidence?: number | null } | null
   requestContext?: Partial<RemoteImportRequestContext> | null
+}
+
+/** Validate an optional originating page URL (http/https, no creds, fragment stripped). */
+function sanitizeOptionalPageUrl(raw: unknown): string | null {
+  if (raw == null) return null
+  if (typeof raw !== 'string') throw new AppError('CAPTURE_PAGE_URL_INVALID', 'The page URL is invalid.', 400)
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+  if (trimmed.length > 4096) throw new AppError('CAPTURE_PAGE_URL_INVALID', 'The page URL is too long.', 400)
+  if (/[\r\n]/.test(trimmed)) throw new AppError('CAPTURE_PAGE_URL_INVALID', 'The page URL is invalid.', 400)
+  let u: URL
+  try {
+    u = new URL(trimmed)
+  } catch {
+    throw new AppError('CAPTURE_PAGE_URL_INVALID', 'The page URL is invalid.', 400)
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new AppError('CAPTURE_PAGE_URL_INVALID', 'The page URL must be http(s).', 400)
+  if (u.username || u.password) throw new AppError('CAPTURE_PAGE_URL_INVALID', 'The page URL must not contain credentials.', 400)
+  u.hash = ''
+  return u.href.slice(0, 4096)
 }
 
 /** Phase 14: cap the title length to match the DB column. */
@@ -220,6 +242,10 @@ export async function submitCapturedResource(input: SubmitResourceInput) {
   const filename = sanitizeCapturedFilename(input.filename ?? deriveFilenameFromUrl(parsedUrl))
   const pageTitle = input.pageTitle ? input.pageTitle.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 512) : null
   const mediaIdentity = sanitizeMediaIdentity(input.mediaIdentity)
+  // Originating page: explicit sourcePageUrl wins, else legacy pageUrl.
+  const rawOriginPage = input.sourcePageUrl ?? input.pageUrl ?? null
+  const originPageUrl = sanitizeOptionalPageUrl(rawOriginPage)
+  const legacyPageUrl = input.pageUrl ? input.pageUrl.slice(0, 4096) : null
 
   const requestContext = validateRequestContext(input.requestContext)
 
@@ -236,6 +262,7 @@ export async function submitCapturedResource(input: SubmitResourceInput) {
         urlEncrypted: encryptText(parsedUrl.href),
         // A re-detection may carry a fresher page title / context.
         pageTitle: pageTitle ?? existing.pageTitle,
+        sourcePageUrl: originPageUrl ?? (existing as { sourcePageUrl?: string | null }).sourcePageUrl ?? null,
         requestContextEncrypted: requestContext ? encryptRequestContext(requestContext) : null,
         // Phase 14: only upgrade identity fields when the new value has a
         // higher confidence than the existing one. A null/lower-confidence
@@ -259,7 +286,8 @@ export async function submitCapturedResource(input: SubmitResourceInput) {
       type: input.type,
       mimeType: input.mimeType ? input.mimeType.slice(0, 191) : null,
       filename,
-      pageUrl: input.pageUrl ? input.pageUrl.slice(0, 4096) : null,
+      pageUrl: legacyPageUrl,
+      sourcePageUrl: originPageUrl,
       pageTitle,
       requestContextEncrypted: requestContext ? encryptRequestContext(requestContext) : null,
       mediaIdentityTitle: mediaIdentity.title,
@@ -351,7 +379,7 @@ export async function deleteCapturedResource(userId: string, resourceId: string)
 export async function importCapturedResource(
   userId: string,
   resourceId: string,
-  input: { filename?: string | null; folderId?: string | null; connectedAccountId?: string | null; workerId?: string | null },
+  input: { filename?: string | null; folderId?: string | null; connectedAccountId?: string | null; workerId?: string | null; sourcePageUrl?: string | null; warmupMode?: 'off' | 'auto' | 'required' | null },
 ) {
   assertCaptureEnabled()
   const resource = await prisma.capturedResource.findFirst({ where: { id: resourceId, userId } })
@@ -368,6 +396,25 @@ export async function importCapturedResource(
 
   const sourceUrl = decryptText(resource.urlEncrypted)
   const requestContext = decryptRequestContext(resource.requestContextEncrypted)
+  // Originating page: explicit import override wins, then the row's stored
+  // sourcePageUrl (bound at capture), then legacy pageUrl. Never active-tab.
+  const originPageUrl =
+    (typeof input.sourcePageUrl === 'string' && input.sourcePageUrl.trim() ? input.sourcePageUrl.trim() : null) ??
+    (resource as { sourcePageUrl?: string | null }).sourcePageUrl ??
+    resource.pageUrl ??
+    null
+  const warmupMode = input.warmupMode ?? 'auto'
+  // Warmup runs before the first probe below (HLS + opaque re-probe). The
+  // queued job re-warms once per attempt before its own probe (processor).
+  const { maybeWarmupBeforeProbe } = await import('../remote-imports/vps-warmup.service.js')
+  await maybeWarmupBeforeProbe({
+    importId: null,
+    attempt: 1,
+    workerId: input.workerId ?? null,
+    sourcePageUrl: originPageUrl,
+    warmupMode,
+    traceBase: resource.id,
+  })
 
   // HLS captures enter the HLS pipeline ONLY when the fetched response
   // confirms HLS. The captured `type` is a hint, never authoritative: the
@@ -461,6 +508,8 @@ export async function importCapturedResource(
     folderId: input.folderId ?? null,
     connectedAccountId: input.connectedAccountId ?? null,
     workerId: input.workerId ?? null,
+    sourcePageUrl: originPageUrl,
+    warmupMode,
     // Priority chain: user override wins; otherwise the captured filename is
     // passed as detectedFileName because it is only a suggestion. The backend
     // resolver may replace opaque transport names before persistence.

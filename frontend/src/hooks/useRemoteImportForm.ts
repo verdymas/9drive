@@ -77,6 +77,8 @@ export function useRemoteImportForm({ open, onClose, onCreated, defaultFolderId,
   const [folderId, setFolderId] = useState<string>(defaultFolderId ?? '')
   const [accountId, setAccountId] = useState('')
   const [workerId, setWorkerId] = useState('')
+  const [sourcePageUrl, setSourcePageUrl] = useState('')
+  const [warmupMode, setWarmupMode] = useState<'off' | 'auto' | 'required'>('auto')
   const [fileName, setFileName] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
@@ -92,6 +94,8 @@ export function useRemoteImportForm({ open, onClose, onCreated, defaultFolderId,
   const hasUserEditedRef = useRef(false)
   const contextRef = useRef<RequestContextInput>({})
   const workerIdRef = useRef('')
+  const pageUrlRef = useRef('')
+  const warmupModeRef = useRef<'off' | 'auto' | 'required'>('auto')
 
   function updateContext(patch: Partial<RequestContextInput>) {
     const next = { ...contextRef.current, ...patch }
@@ -114,6 +118,10 @@ export function useRemoteImportForm({ open, onClose, onCreated, defaultFolderId,
     const defaultWorkerId = workers.find((worker) => worker.isDefault)?.id ?? ''
     setWorkerId(defaultWorkerId)
     workerIdRef.current = defaultWorkerId
+    setSourcePageUrl('')
+    pageUrlRef.current = ''
+    setWarmupMode('auto')
+    warmupModeRef.current = 'auto'
     setFileName('')
     setError('')
     setProbe({ status: 'idle' })
@@ -137,6 +145,20 @@ export function useRemoteImportForm({ open, onClose, onCreated, defaultFolderId,
     }
   }, [])
 
+  function handlePageUrlChange(value: string) {
+    setSourcePageUrl(value)
+    pageUrlRef.current = value
+    setError('')
+    if (url.trim()) handleUrlChange(url)
+  }
+
+  function handleWarmupModeChange(next: 'off' | 'auto' | 'required') {
+    setWarmupMode(next)
+    warmupModeRef.current = next
+    setError('')
+    if (url.trim()) handleUrlChange(url)
+  }
+
   async function runProbe(targetUrl: string, token: number) {
     const controller = new AbortController()
     abortRef.current?.abort()
@@ -144,7 +166,11 @@ export function useRemoteImportForm({ open, onClose, onCreated, defaultFolderId,
     setProbe({ status: 'detecting' })
     setError('')
     try {
-      const { data } = await probeRemoteUrl(targetUrl, controller.signal, contextRef.current, workerIdRef.current || null)
+      const pageTrimmed = pageUrlRef.current.trim()
+      const { data } = await probeRemoteUrl(targetUrl, controller.signal, contextRef.current, workerIdRef.current || null, {
+        sourcePageUrl: pageTrimmed || undefined,
+        warmupMode: pageTrimmed ? warmupModeRef.current : undefined,
+      })
       if (token !== probeTokenRef.current) return
       setProbe({ status: 'detected', result: data })
       setDetectedFileName(data.fileName)
@@ -287,6 +313,7 @@ export function useRemoteImportForm({ open, onClose, onCreated, defaultFolderId,
     setSubmitting(true)
     setError('')
     try {
+      const pageTrimmed = pageUrlRef.current.trim()
       if (mode === 'curl') {
         await createRemoteImport({
           sourceMode: 'curl',
@@ -298,6 +325,7 @@ export function useRemoteImportForm({ open, onClose, onCreated, defaultFolderId,
           detectedFileName: detectedFileName || null,
           mimeType: probe.status === 'detected' ? probe.result.mimeType : null,
           hls: hlsOptions ?? undefined,
+          ...(pageTrimmed ? { sourcePageUrl: pageTrimmed, warmupMode: warmupModeRef.current } : {}),
         })
       } else {
         const attached = Object.values(contextRef.current).some((value) => value != null && value !== '')
@@ -312,6 +340,7 @@ export function useRemoteImportForm({ open, onClose, onCreated, defaultFolderId,
           mimeType: probe.status === 'detected' ? probe.result.mimeType : null,
           hls: hlsOptions ?? undefined,
           requestContext: attached ? contextRef.current : undefined,
+          ...(pageTrimmed ? { sourcePageUrl: pageTrimmed, warmupMode: warmupModeRef.current } : {}),
         })
       }
       onCreated()
@@ -332,6 +361,8 @@ export function useRemoteImportForm({ open, onClose, onCreated, defaultFolderId,
     folderId,
     accountId,
     workerId,
+    sourcePageUrl,
+    warmupMode,
     fileName,
     submitting,
     error,
@@ -345,6 +376,8 @@ export function useRemoteImportForm({ open, onClose, onCreated, defaultFolderId,
     setHlsOptions,
     updateContext,
     handleUrlChange,
+    handlePageUrlChange,
+    handleWarmupModeChange,
     handleFileNameChange,
     handleModeChange,
     handleCurlChange,

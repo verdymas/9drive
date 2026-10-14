@@ -118,6 +118,40 @@ export async function processRemoteImportJob(job: Job<RemoteImportJobData>) {
     await assertWorkerUsable(record)
     const fetcher = await createSecureFetcherForWorkerId(record.workerId, { requestContext, sourceUrl })
 
+    // ── VPS Browser Warmup (once per attempt, BEFORE the first probe). ──────
+    // Skipped for resume paths that never re-probe (uploading/remuxing/
+    // registering convert retries). HLS jobs warm here too — before any
+    // manifest fetch. Retries with a fresh attempt re-warm; the service +
+    // relay idempotency key dedupes concurrent duplicates. No fallback.
+    const resumeStage = (record as { retryFromStage?: string | null }).retryFromStage ?? null
+    if (resumeStage !== 'uploading' && resumeStage !== 'remuxing' && resumeStage !== 'registering') {
+      const pageEncrypted = (record as { sourcePageUrlEncrypted?: string | null }).sourcePageUrlEncrypted ?? null
+      const warmupMode = (record as { warmupMode?: string | null }).warmupMode ?? 'auto'
+      let pageUrl: string | null = null
+      if (pageEncrypted) {
+        try {
+          pageUrl = decryptText(pageEncrypted)
+        } catch {
+          pageUrl = null
+        }
+      }
+      if (pageUrl) {
+        const { maybeWarmupBeforeProbe } = await import('./vps-warmup.service.js')
+        await maybeWarmupBeforeProbe({
+          importId,
+          attempt: record.attempt ?? 1,
+          workerId: record.workerId,
+          sourcePageUrl: pageUrl,
+          warmupMode,
+          traceBase: importId,
+        })
+        console.log(`[remote-import:warmup] event=probe.status traceId=${importId}:warmup attempt=${record.attempt ?? 1} probe=starting`)
+      } else if (warmupMode === 'required') {
+        const { REMOTE_FETCH_WORKER_ERROR_CODES } = await import('../remote-fetch-workers/errors.js')
+        throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WARMUP_REQUIRED_MISSING, 'Browser warmup is required but no page URL was provided.', 400)
+      }
+    }
+
     // ── HLS imports skip the direct-download path entirely. ─────────────────
     if (isHlsRecord(record)) {
       const result = await processHlsImport(context, fetcher, { assertWorkerUsable })

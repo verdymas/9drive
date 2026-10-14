@@ -87,6 +87,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       displayType: displayTypeFor(cls.type, null),
       mime: null,
       pageUrl: info.pageUrl ?? tab?.url ?? null,
+      sourcePageUrl: info.pageUrl ?? tab?.url ?? null,
       filename: detectedName,
       filenameSource: result.source,
       estimatedSize: null,
@@ -231,6 +232,11 @@ chrome.webRequest.onHeadersReceived.addListener(
         + ` selectedFilename=${result.filename}`,
     )
 
+    // VPS Browser Warmup: originating page bound at detection time via
+    // requestId tab tracking (originUrl/initiator) — never the active tab at
+    // import time. `sourcePageUrl` is the navigable warmup target; `pageUrl`
+    // stays for backward compat (both carry the same originating value here).
+    const sourcePageUrl = pageUrl
     const entry = {
       url: finalUrl,
       originalUrl,
@@ -239,6 +245,7 @@ chrome.webRequest.onHeadersReceived.addListener(
       displayType: displayTypeFor(cls.type, mimeHeader),
       mime: mimeHeader ?? null,
       pageUrl,
+      sourcePageUrl,
       filename: result.filename,
       filenameSource: result.source,
       pageMetadata,
@@ -453,6 +460,7 @@ async function syncCapture(entry, safeContext = {}) {
       mimeType: entry.mime,
       filename: entry.filename,
       pageUrl: entry.pageUrl,
+      sourcePageUrl: entry.sourcePageUrl ?? entry.pageUrl ?? null,
       pageTitle: entry.pageMetadata?.title ?? null,
       // Phase 14: send a compact media-identity summary so the backend can
       // surface "from JSON-LD" / "from og:title" in the Remote Imports UI.

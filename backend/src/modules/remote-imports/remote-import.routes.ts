@@ -80,10 +80,23 @@ remoteImportRouter.post('/probe', requireAuth, async (req: AuthRequest, res, nex
       url: z.string().min(1).max(4096),
       requestContext: requestContextSchema,
       workerId: z.string().nullable().optional(),
+      sourcePageUrl: z.string().max(4096).nullable().optional(),
+      warmupMode: z.enum(['off', 'auto', 'required']).nullable().optional(),
     }).parse(req.body)
 
     assertRequestContextEnabled()
     const requestContext = validateBodyContext(body.requestContext)
+    // VPS Browser Warmup runs BEFORE the first probe (not just before download).
+    // Failures in `required` mode throw typed errors; `auto` skips silently.
+    const { maybeWarmupBeforeProbe } = await import('./vps-warmup.service.js')
+    await maybeWarmupBeforeProbe({
+      importId: null,
+      attempt: 1,
+      workerId: body.workerId ?? null,
+      sourcePageUrl: body.sourcePageUrl ?? null,
+      warmupMode: body.warmupMode ?? 'auto',
+      traceBase: req.user!.id,
+    })
     const result = await probeRemoteUrl(body.url, req.user!.id, requestContext ?? undefined, { workerId: body.workerId ?? null })
     // The internal signed fetch URL must never cross the API boundary.
     return res.json({ data: probeResultForWire(result) })
@@ -176,6 +189,10 @@ remoteImportRouter.post('/', requireAuth, async (req: AuthRequest, res, next) =>
         mimeType: z.string().max(191).nullable().optional(),
         // HLS import knobs (from the probe's `sourceType` classification).
         hls: hlsOptionsSchema,
+        // VPS Browser Warmup: originating page for short-lived Chromium
+        // navigation (kept separate from `referer`, a fetch header).
+        sourcePageUrl: z.string().max(4096).nullable().optional(),
+        warmupMode: z.enum(['off', 'auto', 'required']).nullable().optional(),
       })
       .superRefine((val, ctx) => {
         if (val.sourceMode === 'url' && !val.url) {
@@ -214,6 +231,8 @@ remoteImportRouter.post('/', requireAuth, async (req: AuthRequest, res, next) =>
       detectedFileName: body.detectedFileName,
       mimeType: body.mimeType,
       hls: body.hls,
+      sourcePageUrl: body.sourcePageUrl ?? null,
+      warmupMode: body.warmupMode ?? null,
     })
     return res.status(201).json(serializeRemoteImport(created))
   } catch (error) {
@@ -302,12 +321,16 @@ remoteImportRouter.patch('/:id/download-url', requireAuth, async (req: AuthReque
         .strict()
         .optional(),
       workerId: z.string().nullable().optional(),
+      sourcePageUrl: z.string().max(4096).nullable().optional(),
+      warmupMode: z.enum(['off', 'auto', 'required']).nullable().optional(),
     }).parse(req.body)
     const patch: UpdateRemoteImportSourceInput = {
       sourceUrl: body.url,
       requestContext: body.requestContext ?? undefined,
     }
     if ('workerId' in body) patch.workerId = body.workerId ?? null
+    if ('sourcePageUrl' in body) patch.sourcePageUrl = body.sourcePageUrl ?? null
+    if ('warmupMode' in body) patch.warmupMode = body.warmupMode ?? null
     const row = await updateRemoteImportSourceUrl(String(req.params.id), req.user!.id, patch)
     return res.json(serializeRemoteImport(row))
   } catch (error) {

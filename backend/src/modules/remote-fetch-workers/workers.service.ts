@@ -138,19 +138,26 @@ export async function getWorker(id: string): Promise<RemoteFetchWorker> {
   return findWorker(id)
 }
 
+/** Default auth when the client omits it: the driver's sole auth type (e.g. VPS → HMAC), else HMAC. Explicit values are still validated by the driver. */
+function defaultAuthForDriver(driver: { getMetadata(): { authTypes: RemoteFetchWorkerAuthType[] } }): RemoteFetchWorkerAuthType {
+  const authTypes = driver.getMetadata().authTypes
+  if (authTypes.length === 1) return authTypes[0]
+  return 'hmac'
+}
+
 export async function createWorker(userId: string, input: CreateWorkerInput) {
   const driver = resolveDriver(input.driver)
   const managed = driver.getMetadata().managed
 
   // Manual registration (future self-hosted relays): legacy path unchanged.
   if (!managed) {
+    const authType = input.authType ?? defaultAuthForDriver(driver)
     const validated = await driver.validateConfig({
       endpointUrl: input.endpointUrl ?? null,
-      authType: input.authType ?? 'hmac',
+      authType,
       secret: input.secret ?? null,
       config: input.config ?? null,
     })
-    const authType = input.authType ?? 'hmac'
     const isDefault = input.isDefault ?? false
     const reqBudget = parseBudgetOverride(input.reqBudgetMonthly)
     const egressBudget = parseBudgetOverride(input.egressBudgetBytesMonthly)

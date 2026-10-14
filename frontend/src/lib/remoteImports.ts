@@ -9,6 +9,11 @@ export type RemoteImportItem = {
   /** Original source filename (e.g. captured "master.m3u8") when the import
    *  came from a captured resource; null otherwise. */
   sourceFileName?: string | null
+  /** Safe host+path label of the warmup originating page (never query/tokens). */
+  displayPageUrl?: string | null
+  /** Warmup policy + once-per-attempt status (safe enums only). */
+  warmupMode?: string | null
+  warmupStatus?: string | null
   displayUrl: string
   status: RemoteImportStatus
   stage: RemoteImportStage
@@ -92,6 +97,13 @@ export type CreateRemoteImportInput = {
    * the wire only ever carries `attached` booleans.
    */
   requestContext?: RequestContextInput
+  /**
+   * VPS Browser Warmup: originating page for short-lived Chromium navigation
+   * (VPS-only, kept separate from Referer). Null/omitted = no warmup.
+   */
+  sourcePageUrl?: string | null
+  /** Warmup policy: off|auto|required (default auto on the backend). */
+  warmupMode?: 'off' | 'auto' | 'required' | null
 }
 
 /** User-supplied access headers for a protected source (spec §6). */
@@ -197,10 +209,22 @@ export type ProbeResult = {
  * source needs; they never leave the backend. `workerId` selects the
  * relay transport — null/undefined = Direct.
  */
-export function probeRemoteUrl(url: string, signal?: AbortSignal, requestContext?: RequestContextInput, workerId?: string | null) {
+export function probeRemoteUrl(
+  url: string,
+  signal?: AbortSignal,
+  requestContext?: RequestContextInput,
+  workerId?: string | null,
+  extra?: { sourcePageUrl?: string | null; warmupMode?: 'off' | 'auto' | 'required' | null },
+) {
   return apiFetch<{ data: ProbeResult }>('/remote-imports/probe', {
     method: 'POST',
-    body: JSON.stringify({ url, ...(requestContext ? { requestContext } : {}), ...(workerId ? { workerId } : {}) }),
+    body: JSON.stringify({
+      url,
+      ...(requestContext ? { requestContext } : {}),
+      ...(workerId ? { workerId } : {}),
+      ...(extra?.sourcePageUrl ? { sourcePageUrl: extra.sourcePageUrl } : {}),
+      ...(extra?.warmupMode ? { warmupMode: extra.warmupMode } : {}),
+    }),
     signal,
   })
 }
@@ -283,6 +307,10 @@ export type UpdateRemoteImportSourcePatch = {
    * route.
    */
   workerId?: string | null
+  /** New originating page for VPS Browser Warmup (`null` clears). */
+  sourcePageUrl?: string | null
+  /** New warmup policy. */
+  warmupMode?: 'off' | 'auto' | 'required' | null
 }
 
 /**

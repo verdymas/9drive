@@ -6,9 +6,11 @@
 import { registerDriver } from './driver-registry.js'
 import { cloudflareWorkerDriver } from './drivers/cloudflare.js'
 import { denoWorkerDriver } from './drivers/deno.js'
+import { vpsWorkerDriver } from './drivers/vps.js'
 
 registerDriver(cloudflareWorkerDriver)
 registerDriver(denoWorkerDriver)
+registerDriver(vpsWorkerDriver)
 
 export { remoteFetchWorkerRouter } from './workers.routes.js'
 export { listDriverMetadata } from './workers.driver-metadata.js'

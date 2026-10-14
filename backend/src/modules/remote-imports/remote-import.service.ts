@@ -59,6 +59,14 @@ export type CreateRemoteImportInput = {
   hls?: CreateRemoteImportHlsOptions | null
   /** User-supplied referer/origin/user-agent/cookie for protected sources. */
   requestContext?: RemoteImportRequestContext | null
+  /**
+   * VPS Browser Warmup: originating page for short-lived Chromium navigation.
+   * Optional, http(s) only, stored encrypted; kept separate from `referer`
+   * (a fetch header). Null = no warmup (legacy behavior).
+   */
+  sourcePageUrl?: string | null
+  /** Warmup policy: off|auto|required (default auto). Persisted for retries. */
+  warmupMode?: 'off' | 'auto' | 'required' | null
 }
 
 /**
@@ -89,6 +97,22 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
   // connects to — a strict-firewall host may be unresolvable from the backend
   // even though the relay can reach it (the relay edge enforces host → IP).
   await validateRemoteUrl(input.sourceUrl, { resolveDns: !workerId })
+
+  // VPS Browser Warmup page URL: optional, validated here (http/https, no
+  // creds, fragment stripped). Invalid → 400, never silently dropped. Kept
+  // separate from `referer` (a fetch header); encrypted at rest below.
+  let sanitizedPageUrl: string | null = null
+  let displayPageUrlValue: string | null = null
+  if (input.sourcePageUrl != null && String(input.sourcePageUrl).trim() !== '') {
+    const { sanitizeSourcePageUrl, displayPageUrl } = await import('../remote-fetch-workers/browser-warmup.js')
+    try {
+      sanitizedPageUrl = sanitizeSourcePageUrl(input.sourcePageUrl)
+    } catch {
+      throw new AppError('INVALID_REQUEST', 'The page URL is invalid.', 400)
+    }
+    displayPageUrlValue = sanitizedPageUrl ? (displayPageUrl(sanitizedPageUrl) ?? sanitizedPageUrl) : null
+  }
+  const warmupModeValue = input.warmupMode === 'off' || input.warmupMode === 'required' ? input.warmupMode : 'auto'
 
   let folderId = input.folderId ?? null
   if (folderId) {
@@ -135,6 +159,14 @@ export async function createRemoteImport(input: CreateRemoteImportInput) {
       sourceUrlEncrypted: encryptText(input.sourceUrl),
       requestContextEncrypted: input.requestContext ? encryptRequestContext(input.requestContext) : null,
       displayUrl: displayUrl(input.sourceUrl),
+      ...(sanitizedPageUrl
+        ? {
+            sourcePageUrlEncrypted: encryptText(sanitizedPageUrl),
+            displayPageUrl: displayPageUrlValue,
+            warmupMode: warmupModeValue,
+            warmupStatus: 'pending',
+          }
+        : { warmupMode: warmupModeValue }),
       fileName: finalFileName,
       sourceFileName: input.sourceFileName?.slice(0, 255) ?? null,
       mimeType: input.mimeType || null,
@@ -262,12 +294,14 @@ export function serializeRemoteImport(importRow: any) {
     finalUrlEncrypted: _final,
     resumeSessionEncrypted: _session,
     internalError: _internal,
+    sourcePageUrlEncrypted: _pageEncrypted,
     ...rest
   } = importRow
   return {
     ...rest,
     // Never the encrypted blob NOR the decrypted values — booleans only, so
     // the UI can say "Request context attached" without ever seeing secrets.
+    // Page URL surfaces as a safe host+path label only (never query/tokens).
     requestContext: serializeRequestContext(decryptRequestContext(importRow.requestContextEncrypted)),
     totalBytes: importRow.totalBytes?.toString() ?? null,
     downloadedBytes: importRow.downloadedBytes.toString(),
@@ -542,6 +576,13 @@ export type UpdateRemoteImportSourceInput = {
    * that worker. Omit to keep the current route.
    */
   workerId?: string | null
+  /**
+   * New originating page for VPS Browser Warmup. `null` clears (disables
+   * warmup for the retry); omit to keep. Validated like creation.
+   */
+  sourcePageUrl?: string | null
+  /** New warmup policy. Omit to keep. */
+  warmupMode?: 'off' | 'auto' | 'required' | null
 }
 
 /**
@@ -563,8 +604,8 @@ export async function updateRemoteImportSourceUrl(importId: string, userId: stri
   if (row.status !== 'failed' && row.status !== 'cancelled' && row.status !== 'queued') {
     throw new AppError('REMOTE_IMPORT_NOT_EDITABLE', 'Only failed, cancelled, or queued imports can be edited.', 409)
   }
-  if (patch.sourceUrl == null && patch.requestContext == null && !('workerId' in patch)) {
-    throw new AppError('INVALID_REQUEST', 'Provide a URL, a request context, a network route, or a combination.', 400)
+  if (patch.sourceUrl == null && patch.requestContext == null && !('workerId' in patch) && patch.sourcePageUrl === undefined && patch.warmupMode === undefined) {
+    throw new AppError('INVALID_REQUEST', 'Provide a URL, a request context, a network route, a page URL, or a combination.', 400)
   }
 
   // Resolve the NEW route first: validation + DNS routing both follow it.
@@ -618,6 +659,38 @@ export async function updateRemoteImportSourceUrl(importId: string, userId: stri
   }
   const validatedCtx = validateRequestContext(merged)
 
+  // Warmup page patch: null clears, string replaces (validated), undefined keeps.
+  let nextPageEncrypted: string | null | undefined
+  let nextDisplayPage: string | null | undefined
+  let nextWarmupMode: string | undefined
+  let nextWarmupStatus: string | null | undefined
+  if (patch.sourcePageUrl !== undefined || patch.warmupMode !== undefined) {
+    const { sanitizeSourcePageUrl, displayPageUrl } = await import('../remote-fetch-workers/browser-warmup.js')
+    if (patch.sourcePageUrl !== undefined) {
+      if (patch.sourcePageUrl == null || String(patch.sourcePageUrl).trim() === '') {
+        nextPageEncrypted = null
+        nextDisplayPage = null
+        nextWarmupStatus = null
+      } else {
+        let sanitized: string | null
+        try {
+          sanitized = sanitizeSourcePageUrl(patch.sourcePageUrl)
+        } catch {
+          throw new AppError('INVALID_REQUEST', 'The page URL is invalid.', 400)
+        }
+        nextPageEncrypted = sanitized ? encryptText(sanitized) : null
+        nextDisplayPage = sanitized ? (displayPageUrl(sanitized) ?? sanitized) : null
+        nextWarmupStatus = sanitized ? 'pending' : null
+      }
+    }
+    if (patch.warmupMode !== undefined) {
+      if (patch.warmupMode != null && patch.warmupMode !== 'off' && patch.warmupMode !== 'auto' && patch.warmupMode !== 'required') {
+        throw new AppError('INVALID_REQUEST', 'Invalid warmup mode.', 400)
+      }
+      nextWarmupMode = patch.warmupMode ?? 'auto'
+    }
+  }
+
   const nextAttempt = row.attempt + 1
   let jobId: string
   try {
@@ -640,6 +713,10 @@ export async function updateRemoteImportSourceUrl(importId: string, userId: stri
       sourceUrlEncrypted: encryptText(nextSourceUrl),
       requestContextEncrypted: validatedCtx ? encryptRequestContext(validatedCtx) : null,
       displayUrl: displayUrl(nextSourceUrl),
+      ...(nextPageEncrypted !== undefined
+        ? { sourcePageUrlEncrypted: nextPageEncrypted, displayPageUrl: nextDisplayPage ?? null, warmupStatus: nextWarmupStatus ?? null, warmupRequestedAt: null, warmupTraceId: null }
+        : {}),
+      ...(nextWarmupMode !== undefined ? { warmupMode: nextWarmupMode } : {}),
       workerId: nextWorkerId,
       workerNameSnapshot,
       finalUrlEncrypted: null,
