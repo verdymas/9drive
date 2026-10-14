@@ -60,14 +60,24 @@ export async function maybeWarmupBeforeProbe(input: {
   traceBase?: string | null
 }): Promise<WarmupDecision> {
   const mode: WarmupMode = parseWarmupMode(input.warmupMode ?? 'auto')
-  if (mode === 'off') return { warmed: false, skipped: true, skipReason: 'disabled' }
+  const skipTraceId = opTraceId(input.traceBase ?? input.importId, 'warmup-skip')
+  const logSkip = (reason: string) => {
+    // Safe, joinable diagnostics: never URLs, cookies, or secrets.
+    console.log(`[remote-import:warmup] event=warmup.skipped traceId=${skipTraceId} importId=${input.importId ?? 'probe'} attempt=${input.attempt ?? 1} mode=${mode} reason=${reason} workerId=${input.workerId ?? 'none'} hasPageUrl=${Boolean((input.sourcePageUrl ?? '').trim())}`)
+  }
+  if (mode === 'off') {
+    logSkip('disabled')
+    return { warmed: false, skipped: true, skipReason: 'disabled' }
+  }
   if (!input.workerId) {
     if (mode === 'required') throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WARMUP_REQUIRED_MISSING, 'Browser warmup requires a Virtual Private Server worker.', 400)
+    logSkip('direct-route')
     return { warmed: false, skipped: true, skipReason: 'direct-route' }
   }
   const rawPage = (input.sourcePageUrl ?? '').trim()
   if (!rawPage) {
     if (mode === 'required') throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WARMUP_REQUIRED_MISSING, 'Browser warmup is required but no page URL was provided.', 400)
+    logSkip('missing-page-url')
     return { warmed: false, skipped: true, skipReason: 'missing-page-url' }
   }
   let pageUrl: string
@@ -75,25 +85,30 @@ export async function maybeWarmupBeforeProbe(input: {
     const sanitized = sanitizeSourcePageUrl(rawPage)
     if (!sanitized) {
       if (mode === 'required') throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WARMUP_REQUIRED_MISSING, 'Browser warmup is required but no page URL was provided.', 400)
+      logSkip('missing-page-url')
       return { warmed: false, skipped: true, skipReason: 'missing-page-url' }
     }
     pageUrl = sanitized
   } catch {
     if (mode === 'required') throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WARMUP_SECURITY_REJECTED, 'The warmup page URL was rejected.', 400)
+    logSkip('invalid-page-url')
     return { warmed: false, skipped: true, skipReason: 'invalid-page-url' }
   }
 
   const worker = await prisma.remoteFetchWorker.findFirst({ where: { id: input.workerId, deletedAt: null } })
   if (!worker) {
     if (mode === 'required') throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.REMOTE_IMPORT_WORKER_UNAVAILABLE, 'The selected network worker is no longer available.', 409)
+    logSkip('worker-missing')
     return { warmed: false, skipped: true, skipReason: 'worker-missing' }
   }
   if (worker.driver !== 'vps') {
     if (mode === 'required') throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WARMUP_NOT_SUPPORTED, 'Browser warmup is only supported for Virtual Private Server.', 400)
+    logSkip('non-vps-driver')
     return { warmed: false, skipped: true, skipReason: 'non-vps-driver' }
   }
   if (!env.VPS_BROWSER_WARMUP_ENABLED) {
     if (mode === 'required') throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WARMUP_NOT_SUPPORTED, 'Browser warmup is disabled on this server.', 400)
+    logSkip('master-disabled')
     return { warmed: false, skipped: true, skipReason: 'master-disabled' }
   }
   let capabilities: unknown = null
@@ -109,6 +124,7 @@ export async function maybeWarmupBeforeProbe(input: {
   }
   if (!workerSupportsWarmup(capabilities)) {
     if (mode === 'required') throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WARMUP_NOT_SUPPORTED, 'The selected worker does not support browser warmup. Update the relay or disable warmup.', 400)
+    logSkip('relay-no-capability')
     return { warmed: false, skipped: true, skipReason: 'relay-no-capability' }
   }
 
