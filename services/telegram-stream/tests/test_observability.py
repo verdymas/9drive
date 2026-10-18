@@ -76,6 +76,55 @@ def test_ready_reflects_live_counters() -> None:
     assert body["total_streams"] == 1
 
 
+def test_ready_surfaces_prefetch_flag_and_cdn_counter() -> None:
+    """P0 scaffolding must be operator-visible: configured depth + CDN hits."""
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    obs.TOTAL_CDN_REDIRECTS = 0
+    obs.inc_cdn_redirect()
+    with TestClient(create_app()) as client:
+        body = client.get("/ready").json()
+    assert body["total_cdn_redirects"] == 1
+    assert body["prefetch_depth_configured"] == 0
+
+
+def test_startup_log_reports_effective_config() -> None:
+    """P1: boot logs the numbers that decide what is on the wire."""
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        with TestClient(create_app()):
+            pass
+    payloads = [json.loads(line) for line in buf.getvalue().strip().splitlines() if line.strip()]
+    startup = next(p for p in payloads if p.get("event") == "startup")
+    assert startup["effective_request_size_bytes"] == 512 * 1024
+    assert startup["resolver_ttl_seconds"] == 60
+    assert startup["prefetch_depth_configured"] == 0
+
+
+def test_startup_warning_when_chunk_size_is_clamped(monkeypatch: pytest.MonkeyPatch) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.core.config import settings
+    from app.main import create_app
+
+    monkeypatch.setattr(settings, "chunk_size_bytes", 9000)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        with TestClient(create_app()):
+            pass
+    payloads = [json.loads(line) for line in buf.getvalue().strip().splitlines() if line.strip()]
+    warning = next(p for p in payloads if p.get("event") == "startup_warning")
+    assert warning["warning_code"] == "CHUNK_SIZE_CLAMPED"
+    assert warning["configured_chunk_size_bytes"] == 9000
+    assert warning["effective_request_size_bytes"] == 8192
+
+
 def test_stream_metrics_finish() -> None:
     m = obs.StreamMetrics(
         request_id="r1",
@@ -85,6 +134,9 @@ def test_stream_metrics_finish() -> None:
         file_size=100,
         range_start=0,
         range_end=99,
+        resolve_ms=123,
+        dc_id=5,
+        iterator="_DirectDownloadIter",
     )
     m.mark_first_byte()
     m.add_chunk(64)
@@ -98,3 +150,7 @@ def test_stream_metrics_finish() -> None:
     assert payload["chunks"] == 2
     assert payload["status"] == 206
     assert payload["cancelled"] is False
+    assert payload["resolve_ms"] == 123
+    assert payload["dc_id"] == 5
+    assert payload["iterator"] == "_DirectDownloadIter"
+    assert payload["prefetch_depth"] == 0

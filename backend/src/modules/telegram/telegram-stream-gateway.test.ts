@@ -169,6 +169,9 @@ describe('telegramStreamGateway.streamFile', () => {
     expect(h.Range).toBe('bytes=0-4')
     expect(h['X-Stream-Signature']).toMatch(/^[0-9a-f]{64}$/)
     expect(h['X-Stream-Timestamp']).toMatch(/^\d+$/)
+    // The generated correlation id goes upstream and is echoed on the response.
+    expect(h['X-Request-Id']).toMatch(/^[0-9a-f]{32}$/)
+    expect(res.headers['x-request-id']).toBe(h['X-Request-Id'])
   })
 
   it('attaches Content-Disposition when options.disposition is set', async () => {
@@ -244,6 +247,95 @@ describe('telegramStreamGateway.streamFile', () => {
     expect(res.headers['content-type']).not.toMatch(/^video\//)
     expect(res.endedBody).toBe(body)
     expect(res.writeCount).toBe(0)
+  })
+
+  it('reuses a sane inbound X-Request-Id verbatim and echoes it', async () => {
+    fetchMock.mockResolvedValueOnce(
+      makeFetchResponse({
+        status: 200,
+        headers: { 'content-length': '5' },
+        body: makeReadable() as unknown as ReadableStream<Uint8Array>,
+      }),
+    )
+    const res = new FakeResponse()
+    ;(res as unknown as { req: { get: (name: string) => string | undefined } }).req = {
+      get: (name: string) => (name.toLowerCase() === 'x-request-id' ? 'trace-abc.123' : undefined),
+    }
+    await telegramStreamGateway.streamFile(
+      {
+        providerFileId: 'telegram://-1001/42',
+        connectedAccountId: 'acct-1',
+        mimeType: 'video/mp4',
+        sizeBytes: 5,
+      },
+      undefined,
+      res as unknown as import('express').Response,
+    )
+    const h = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>
+    expect(h['X-Request-Id']).toBe('trace-abc.123')
+    expect(res.headers['x-request-id']).toBe('trace-abc.123')
+  })
+
+  it('sanitizes a hostile inbound request id instead of forwarding it raw', async () => {
+    fetchMock.mockResolvedValueOnce(
+      makeFetchResponse({
+        status: 200,
+        headers: { 'content-length': '5' },
+        body: makeReadable() as unknown as ReadableStream<Uint8Array>,
+      }),
+    )
+    const res = new FakeResponse()
+    ;(res as unknown as { req: { get: (name: string) => string | undefined } }).req = {
+      get: () => 'bad id\r\ninjected: yes',
+    }
+    await telegramStreamGateway.streamFile(
+      {
+        providerFileId: 'telegram://-1001/42',
+        connectedAccountId: 'acct-1',
+        mimeType: 'video/mp4',
+        sizeBytes: 5,
+      },
+      undefined,
+      res as unknown as import('express').Response,
+    )
+    const h = (fetchMock.mock.calls[0][1] as RequestInit).headers as Record<string, string>
+    expect(h['X-Request-Id']).toBe('badidinjectedyes')
+    expect(res.headers['x-request-id']).toBe('badidinjectedyes')
+  })
+
+  it('keeps the upstream Content-Range on a 416 (audit §3.4 must-fix)', async () => {
+    const body = JSON.stringify({
+      error: { code: 'RANGE_NOT_SATISFIABLE', message: 'Requested range is not satisfiable.' },
+    })
+    fetchMock.mockResolvedValueOnce(
+      makeFetchResponse({
+        status: 416,
+        headers: { 'content-type': 'application/json', 'content-range': 'bytes */100' },
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(body))
+            controller.close()
+          },
+        }),
+      }),
+    )
+
+    const res = new FakeResponse()
+    await telegramStreamGateway.streamFile(
+      {
+        providerFileId: 'telegram://-1001/42',
+        connectedAccountId: 'acct-1',
+        mimeType: 'video/mp4',
+        sizeBytes: 100,
+      },
+      'bytes=200-299',
+      res as unknown as import('express').Response,
+    )
+
+    expect(res.statusCode).toBe(416)
+    expect(res.headers['content-range']).toBe('bytes */100')
+    expect(res.headers['content-type']).toBe('application/json')
+    expect(res.endedBody).toBe(body)
   })
 
   it('isTelegramStreamConfigured returns true when both env vars are set', () => {

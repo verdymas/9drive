@@ -16,7 +16,7 @@ import type { File as FileRecord, ConnectedAccount } from '@prisma/client'
 
 import { env } from '../../config/env.js'
 import { parseTelegramRemoteId } from './telegram.service.js'
-import { mirrorReauthRequired } from './telegram-stream-gateway.js'
+import { mirrorReauthRequired, resolveRequestId } from './telegram-stream-gateway.js'
 import { signStreamRequest } from './telegram-stream-auth.js'
 
 type FileWithAccount = FileRecord & { connectedAccount: ConnectedAccount }
@@ -57,12 +57,14 @@ export async function fetchTelegramStreamAsReadable(
   }
   if (range) upstreamHeaders['Range'] = range
 
-  // Correlation: a short per-request id is forwarded so the streaming
-  // service's logs can be cross-referenced with the gateway log line.
-  // Never a secret.
-  const requestId =
-    (file as unknown as { __requestId?: string }).__requestId ?? undefined
-  if (requestId) upstreamHeaders['X-Request-Id'] = requestId
+  // Correlation: reuse the caller's id when present (the `__requestId`
+  // convention), else mint one. Always forwarded so the streaming service's
+  // JSON logs are joinable with the response the client actually saw — and
+  // returned below so the WebDAV layer can echo it. Never a secret.
+  const requestId = resolveRequestId(
+    (file as unknown as { __requestId?: string }).__requestId,
+  )
+  upstreamHeaders['X-Request-Id'] = requestId
 
   const abort = new AbortController()
   const r = await fetch(url, { method: 'GET', headers: upstreamHeaders, signal: abort.signal })
@@ -72,7 +74,7 @@ export async function fetchTelegramStreamAsReadable(
   if (r.status === 503) {
     const body = await r.text()
     await mirrorReauthRequired(providerId, body)
-    return { status: r.status, headers: {}, body: Readable.from([body]) }
+    return { status: r.status, headers: { 'x-request-id': requestId }, body: Readable.from([body]) }
   }
 
   // Translate the upstream Headers into a plain dict. Lowercased keys.
@@ -87,6 +89,8 @@ export async function fetchTelegramStreamAsReadable(
       headers[lower] = value
     }
   })
+  // Always echo the id, even when an error envelope came back without one.
+  headers['x-request-id'] = r.headers.get('x-request-id') ?? requestId
 
   if (!r.body) {
     return { status: r.status, headers, body: Readable.from([]) }

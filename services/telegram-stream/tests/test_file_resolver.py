@@ -65,3 +65,30 @@ async def test_invalidate_forces_re_resolve() -> None:
     await resolver.invalidate("acct-1", "-1001", 42)
     await resolver.resolve(client, "acct-1", "-1001", 42)
     assert client.input_entity_calls == 2
+
+
+async def test_expired_ttl_forces_re_resolve() -> None:
+    """A TTL of 0 means every lookup is a miss — the cache is not a bypass."""
+    client = StubClient({42: _Message(_Document(size=100, mime_type=None, dc_id=2))})
+    resolver = FileResolver(ttl_seconds=0.0)
+    await resolver.resolve(client, "acct-1", "-1001", 42)
+    await resolver.resolve(client, "acct-1", "-1001", 42)
+    assert client.input_entity_calls == 2
+
+
+def test_effective_resolver_ttl_clamps(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "resolver_ttl_seconds", 5)
+    assert settings.effective_resolver_ttl_seconds == 15
+    monkeypatch.setattr(settings, "resolver_ttl_seconds", 9999)
+    assert settings.effective_resolver_ttl_seconds == 600
+    monkeypatch.setattr(settings, "resolver_ttl_seconds", 120)
+    assert settings.effective_resolver_ttl_seconds == 120
+
+
+def test_engine_resolver_uses_configured_ttl() -> None:
+    from app.core.config import settings
+    from app.telegram import engine
+
+    assert engine.resolver.ttl_seconds == float(settings.effective_resolver_ttl_seconds)

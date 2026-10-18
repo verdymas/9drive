@@ -39,6 +39,11 @@ class FileResolver:
         self._cache: dict[tuple[str, str, int], _CacheEntry] = {}
         self._ttl = ttl_seconds
 
+    @property
+    def ttl_seconds(self) -> float:
+        """The cache TTL actually in effect."""
+        return self._ttl
+
     async def resolve(
         self,
         client: TelegramClientLike,
@@ -66,9 +71,9 @@ class FileResolver:
         document = getattr(message, "document", None)
         if document is None:
             raise FileNotFoundError(f"message {message_id} has no document")
-        # The real `InputDocumentFileLocation` is built by the byte streamer
-        # from a `FileId` decode; this module just hands back the document
-        # payload and the file metadata.
+        # The byte engine builds the `InputDocumentFileLocation` from this
+        # payload (and reads the metadata below without touching Telethon);
+        # this module just hands the document back.
         return ResolvedLocation(
             raw_location=document,
             file_size=int(getattr(document, "size", 0)),

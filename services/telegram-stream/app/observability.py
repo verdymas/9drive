@@ -104,6 +104,15 @@ class StreamMetrics:
     cancelled: bool = False
     error: str | None = None
     status: int | None = None
+    # P0 observability: measured around resolve_document in stream.py.
+    resolve_ms: int | None = None
+    dc_id: int | None = None
+    # Telethon iterator class that served the bytes (e.g. _DirectDownloadIter).
+    iterator: str | None = None
+    # Applied read-ahead depth (0 when the sequential path ran).
+    prefetch_depth: int = 0
+    # Upstream bytes read before the requested range (≤ 4 KiB after P3).
+    prefix_bytes: int = 0
 
     def mark_first_byte(self) -> None:
         if self.first_byte_at is None:
@@ -139,6 +148,11 @@ class StreamMetrics:
             cancelled=self.cancelled,
             error=self.error,
             status=self.status,
+            resolve_ms=self.resolve_ms,
+            dc_id=self.dc_id,
+            iterator=self.iterator,
+            prefetch_depth=self.prefetch_depth,
+            prefix_bytes=self.prefix_bytes,
         )
 
 
@@ -149,6 +163,7 @@ TOTAL_STREAMS = 0
 TOTAL_CANCELLATIONS = 0
 TOTAL_FILE_REFERENCE_REFRESHES = 0
 TOTAL_FLOOD_WAITS = 0
+TOTAL_CDN_REDIRECTS = 0
 
 
 def inc_active() -> None:
@@ -175,3 +190,8 @@ def inc_file_reference_refresh() -> None:
 def inc_flood_wait() -> None:
     global TOTAL_FLOOD_WAITS
     TOTAL_FLOOD_WAITS += 1
+
+
+def inc_cdn_redirect() -> None:
+    global TOTAL_CDN_REDIRECTS
+    TOTAL_CDN_REDIRECTS += 1

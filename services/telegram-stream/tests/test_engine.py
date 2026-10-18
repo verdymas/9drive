@@ -9,7 +9,7 @@ import pytest
 from app.core.config import settings
 from app.core.errors import AppError
 from app.observability import StreamMetrics
-from app.telegram.engine import _classify, _peer, iter_bytes
+from app.telegram.engine import _classify, _peer, effective_request_size, iter_bytes
 from app.telegram.file_resolver import ResolvedLocation
 
 
@@ -46,9 +46,22 @@ class FakeClient:
 
 
 class AlignedDownload:
-    """A Telegram-like iterator that rejects invalid upload.getFile offsets."""
+    """A Telegram-like iterator that rejects invalid upload.getFile requests.
 
-    def __init__(self, *, offset: int, request_size: int, file_size: int) -> None:
+    Mirrors the live wire constraints (verified against Telegram with a
+    direct RPC probe): the offset must be 4 KiB-aligned, the limit must be a
+    power-of-two multiple of 4 KiB, and the request must not cross a 1 MiB
+    window — `(offset % 1 MiB) + request_size <= 1 MiB`; violations raise
+    `LimitInvalidError`, exactly like the server.
+    """
+
+    def __init__(self, *, offset: int, request_size: int, file_size: int | None) -> None:
+        if (
+            offset % 4096
+            or (request_size & (request_size - 1)) != 0
+            or (offset % (1024 * 1024)) + request_size > 1024 * 1024
+        ):
+            raise RuntimeError("LimitInvalidError")
         self._offset = offset
         self._request_size = request_size
         self._file_size = file_size
@@ -60,11 +73,11 @@ class AlignedDownload:
         return self
 
     async def __anext__(self) -> bytes:
-        if self._offset % self._request_size:
-            raise RuntimeError("LimitInvalidError")
-        if self._cursor >= self._file_size:
+        if self._file_size is not None and self._cursor >= self._file_size:
             raise StopAsyncIteration
-        size = min(self._request_size, self._file_size - self._cursor)
+        size = self._request_size
+        if self._file_size is not None:
+            size = min(size, self._file_size - self._cursor)
         self.max_chunk_size = max(self.max_chunk_size, size)
         chunk = bytes((self._cursor + i) & 0xFF for i in range(size))
         self._cursor += size
@@ -75,21 +88,30 @@ class AlignedDownload:
 
 
 class AlignedClient:
-    """Records the upstream request and emits data from its requested offset."""
+    """Records upstream requests; every `iter_download` call gets its own stream."""
 
     def __init__(self) -> None:
-        self.kwargs: dict = {}
-        self.download: AlignedDownload | None = None
+        self.requests: list[dict] = []
+        self.downloads: list[AlignedDownload] = []
         self.raw = self
 
     def iter_download(self, location, **kwargs):  # noqa: ANN001, ANN201
-        self.kwargs = kwargs
-        self.download = AlignedDownload(
+        self.requests.append(kwargs)
+        download = AlignedDownload(
             offset=kwargs["offset"],
             request_size=kwargs["request_size"],
-            file_size=kwargs["file_size"],
+            file_size=kwargs.get("file_size"),
         )
-        return self.download
+        self.downloads.append(download)
+        return download
+
+    @property
+    def kwargs(self) -> dict:
+        return self.requests[-1]
+
+    @property
+    def download(self) -> AlignedDownload:
+        return self.downloads[-1]
 
 
 def _metrics() -> StreamMetrics:
@@ -129,9 +151,19 @@ async def test_request_size_is_clamped_to_telethon_max_and_offset_is_aligned(mon
     assert client.kwargs["offset"] == 0
 
 
+def test_effective_request_size_clamps_and_aligns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The startup log and the byte engine must agree about the wire size."""
+    monkeypatch.setattr(settings, "chunk_size_bytes", 4 * 1024 * 1024)
+    assert effective_request_size() == 512 * 1024
+    monkeypatch.setattr(settings, "chunk_size_bytes", 100_000)
+    assert effective_request_size() == 65_536  # rounded to divide the 1 MiB window
+    monkeypatch.setattr(settings, "chunk_size_bytes", 1000)
+    assert effective_request_size() == 4096
+
+
 async def test_jellyfin_arbitrary_range_aligns_upstream_and_yields_exact_bytes() -> None:
     """Passing the raw HTTP start to Telegram would raise LimitInvalidError."""
-    start = 41_639_936
+    start = 41_639_936  # a 4 KiB multiple: no discarded prefix
     end = 75_194_367
     request_size = 512 * 1024
     client = AlignedClient()
@@ -149,34 +181,48 @@ async def test_jellyfin_arbitrary_range_aligns_upstream_and_yields_exact_bytes()
         emitted += len(chunk)
         assert len(chunk) <= request_size
 
-    assert client.kwargs["offset"] == 41_418_752
-    assert client.kwargs["offset"] % request_size == 0
-    assert client.kwargs["request_size"] == request_size
-    assert client.kwargs["chunk_size"] == request_size
     assert first_byte == start & 0xFF
     assert emitted == 33_554_432
     assert metrics.bytes_emitted == emitted
-    assert client.download is not None and client.download.closed
-    assert client.download.max_chunk_size == request_size
+    assert metrics.prefix_bytes == 0
+    assert all(d.closed for d in client.downloads)
+    assert max(d.max_chunk_size for d in client.downloads) == request_size
+    # The start sits mid-window: a 512 KiB request from it would cross the
+    # 1 MiB boundary, so the head up to the window edge (303_104 =
+    # 1 MiB - 745_472) is split into power-of-two pieces and the main
+    # iterator resumes on the grid at 41,943,040.
+    assert [r["offset"] for r in client.requests] == [
+        start,
+        start + 262_144,
+        start + 262_144 + 32_768,
+        start + 303_104,
+    ]
+    assert [r["request_size"] for r in client.requests] == [262_144, 32_768, 8_192, request_size]
+    for r in client.requests:
+        assert r["offset"] % 4096 == 0
+        assert r["request_size"] & (r["request_size"] - 1) == 0  # power of two
+        assert (r["offset"] % (1024 * 1024)) + r["request_size"] <= 1024 * 1024
+        assert r["chunk_size"] == r["request_size"]
+        assert "file_size" not in r and r.get("limit") is None
 
 
 @pytest.mark.parametrize("start", [0, 1, 4_095, 4_096, 512 * 1024 - 1, 512 * 1024, 1024 * 1024 - 1, 1024 * 1024])
 async def test_arbitrary_starts_keep_client_bytes_exact_while_aligning_upstream(start: int) -> None:
-    request_size = 512 * 1024
     client = AlignedClient()
     location = ResolvedLocation(raw_location=object(), file_size=start + 4, mime_type=None, dc_id=5)
+    metrics = _metrics()
 
     output = b""
-    async for chunk in iter_bytes(client, location, start=start, length=4, metrics=_metrics()):
+    async for chunk in iter_bytes(client, location, start=start, length=4, metrics=metrics):
         output += chunk
 
-    assert client.kwargs["offset"] == start - (start % request_size)
+    assert client.requests[0]["offset"] == start - (start % 4096)
+    assert metrics.prefix_bytes == start % 4096
     assert output == bytes((start + i) & 0xFF for i in range(4))
 
 
 async def test_open_ended_range_can_start_at_an_arbitrary_offset() -> None:
     start = 41_639_936
-    request_size = 512 * 1024
     client = AlignedClient()
     location = ResolvedLocation(raw_location=object(), file_size=start + 1_048_576, mime_type=None, dc_id=5)
 
@@ -187,9 +233,80 @@ async def test_open_ended_range_can_start_at_an_arbitrary_offset() -> None:
             first_byte = chunk[0]
         emitted += len(chunk)
 
-    assert client.kwargs["offset"] == start - (start % request_size)
+    assert client.requests[0]["offset"] == start - (start % 4096)
     assert first_byte == start & 0xFF
     assert emitted == 1_048_576
+
+
+async def test_unaligned_seek_aligns_to_4k_and_never_forces_the_generic_iterator() -> None:
+    """The wire call must keep `limit=None`/no `file_size` on a 4 KiB-aligned
+    offset: that triple is what keeps Telethon on `_DirectDownloadIter`
+    instead of re-fetching each chunk's unaligned head."""
+    start = 475_712 - 12_287  # arbitrary unaligned offset
+    client = AlignedClient()
+    location = ResolvedLocation(raw_location=object(), file_size=start + 1000, mime_type=None, dc_id=5)
+
+    output = b""
+    async for chunk in iter_bytes(client, location, start=start, length=4, metrics=_metrics()):
+        output += chunk
+
+    assert client.requests[0]["offset"] == start - (start % 4096)
+    assert client.requests[0]["offset"] % 4096 == 0
+    assert "file_size" not in client.requests[0]
+    assert client.requests[0].get("limit") is None
+    assert client.requests[0]["chunk_size"] == client.requests[0]["request_size"]
+    assert output == bytes((start + i) & 0xFF for i in range(4))
+
+
+async def test_mid_window_start_fits_head_then_returns_to_the_grid() -> None:
+    """A start inside a 1 MiB window splits the head up to the window edge
+    into power-of-two pieces, then the main iterator resumes on the grid;
+    every request stays window-safe and the emitted bytes stay exact."""
+    start = 1_052_672 + 1_234  # 4 KiB-aligned target with a 1,234-byte prefix
+    length = 2_000_000
+    client = AlignedClient()
+    location = ResolvedLocation(raw_location=object(), file_size=start + length + 10, mime_type=None, dc_id=5)
+    metrics = _metrics()
+
+    output = b""
+    async for chunk in iter_bytes(client, location, start=start, length=length, metrics=metrics):
+        output += chunk
+
+    assert output == bytes((start + i) & 0xFF for i in range(length))
+    assert metrics.prefix_bytes == 1_234
+    assert [r["offset"] for r in client.requests] == [
+        1_052_672,  # head pieces from the 4 KiB boundary up to the window edge
+        1_576_960,
+        1_839_104,
+        1_970_176,
+        2_035_712,
+        2_068_480,
+        2_084_864,
+        2_093_056,
+        2_097_152,  # next window, back on the request grid
+    ]
+    assert [r["request_size"] for r in client.requests] == [
+        524_288, 262_144, 131_072, 65_536, 32_768, 16_384, 8_192, 4_096, 524_288,
+    ]
+    assert all(d.closed for d in client.downloads)
+
+
+async def test_start_near_window_end_stays_in_one_window() -> None:
+    """Even 100 bytes before a window edge, no request crosses it: a 4 KiB
+    fitted head covers the remainder, then the main iterator starts at the
+    next window boundary."""
+    start = (1024 * 1024) - 100
+    length = 4_000
+    client = AlignedClient()
+    location = ResolvedLocation(raw_location=object(), file_size=start + length + 10, mime_type=None, dc_id=5)
+
+    output = b""
+    async for chunk in iter_bytes(client, location, start=start, length=length, metrics=_metrics()):
+        output += chunk
+
+    assert output == bytes((start + i) & 0xFF for i in range(length))
+    assert [r["offset"] for r in client.requests] == [1_044_480, 1_048_576]
+    assert [r["request_size"] for r in client.requests] == [4_096, 524_288]
 
 
 def test_peer_gets_the_100_marker_exactly_once() -> None:

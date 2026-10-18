@@ -218,16 +218,19 @@ async function runWarmupOnce(input: {
   }
   if (res.status === 400) {
     await markWarmup(input.importId, 'failed', traceId)
+    console.log(`[remote-import:warmup] event=browser.closed traceId=${traceId} pageFp=${pageFp} outcome=security-rejected-skipped status=400`)
     if (input.mode === 'required') throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WARMUP_SECURITY_REJECTED, 'The warmup page URL was rejected.', 400)
     return { warmed: false, skipped: true, skipReason: 'security-rejected', traceId }
   }
   if (res.status === 501) {
     await markWarmup(input.importId, 'failed', traceId)
+    console.log(`[remote-import:warmup] event=browser.closed traceId=${traceId} pageFp=${pageFp} outcome=not-supported-skipped status=501`)
     if (input.mode === 'required') throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WARMUP_NOT_SUPPORTED, 'The relay does not support browser warmup.', 400)
     return { warmed: false, skipped: true, skipReason: 'relay-no-capability', traceId }
   }
   if (!res.ok) {
     await markWarmup(input.importId, 'failed', traceId)
+    console.log(`[remote-import:warmup] event=browser.closed traceId=${traceId} pageFp=${pageFp} outcome=relay-error-skipped status=${res.status}`)
     if (input.mode === 'required') throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WARMUP_FAILED, 'Browser warmup failed before the probe.', 502)
     return { warmed: false, skipped: true, skipReason: `relay-${res.status}`, traceId }
   }
@@ -236,12 +239,14 @@ async function runWarmupOnce(input: {
     json = await res.json()
   } catch {
     await markWarmup(input.importId, 'failed', traceId)
+    console.log(`[remote-import:warmup] event=browser.closed traceId=${traceId} pageFp=${pageFp} outcome=invalid-response-skipped`)
     if (input.mode === 'required') throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WARMUP_FAILED, 'Browser warmup returned an invalid response.', 502)
     return { warmed: false, skipped: true, skipReason: 'invalid-response', traceId }
   }
   const parsed = RelayWarmupResponseSchema.safeParse(json)
   if (!parsed.success) {
     await markWarmup(input.importId, 'failed', traceId)
+    console.log(`[remote-import:warmup] event=browser.closed traceId=${traceId} pageFp=${pageFp} outcome=invalid-response-skipped`)
     if (input.mode === 'required') throw new AppError(REMOTE_FETCH_WORKER_ERROR_CODES.WARMUP_FAILED, 'Browser warmup returned an invalid response.', 502)
     return { warmed: false, skipped: true, skipReason: 'invalid-response', traceId }
   }

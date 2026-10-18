@@ -99,6 +99,27 @@ def test_zero_size_returns_404(client, secret) -> None:
     assert r.json()["error"]["code"] == "FILE_NOT_FOUND"
 
 
+def test_request_id_round_trips_and_stream_end_carries_p0_fields(client, secret) -> None:
+    """P0 acceptance: the backend-supplied id survives end-to-end, and
+    stream_end carries the new measurement fields for a normal stream."""
+    headers = signed_headers(method="GET", path="/v1/stream", provider_id=PROVIDER,
+                              channel_id=CHANNEL, message_id=MESSAGE, range_header=None, secret=secret)
+
+    output = io.StringIO()
+    with redirect_stdout(output):
+        r = client.get(_stream_path(), headers={"X-Request-Id": "trace-42", **headers})
+
+    assert r.status_code == 200
+    assert r.headers["X-Request-Id"] == "trace-42"
+    events = [json.loads(line) for line in output.getvalue().splitlines() if line.strip()]
+    end = next(event for event in events if event.get("event") == "stream_end")
+    assert end["request_id"] == "trace-42"
+    assert end["dc_id"] == 5
+    assert isinstance(end["resolve_ms"], int) and end["resolve_ms"] >= 0
+    assert "iterator" in end
+    assert end["prefetch_depth"] == 0
+
+
 def test_resolve_failure_logs_error_code_without_exposing_redacted_code_field(client, secret, monkeypatch) -> None:
     async def fail_resolve(*, provider_id: str, channel_id: str, message_id: int):
         raise AppError("TELEGRAM_LAYER_MISMATCH", "Telegram sent an unsupported object.", 502)

@@ -12,6 +12,7 @@
  * That split is what lets the streaming service stay generic and keeps
  * the WebDAV semantics in one place.
  */
+import { randomUUID } from 'node:crypto'
 import { Readable } from 'node:stream'
 
 import { env } from '../../config/env.js'
@@ -19,6 +20,16 @@ import type { Response } from 'express'
 
 import { signStreamRequest, isTelegramStreamConfigured } from './telegram-stream-auth.js'
 import { markTelegramReauthRequired, parseTelegramRemoteId } from './telegram.service.js'
+
+/**
+ * Correlation id for one stream request: the caller's when it is present and
+ * sane, otherwise a short generated one. Sanitized so a hostile inbound
+ * header can never reach `setHeader`/fetch as a malformed value.
+ */
+export function resolveRequestId(candidate: string | undefined | null): string {
+  const cleaned = candidate?.replace(/[^0-9A-Za-z._-]/g, '').slice(0, 64)
+  return cleaned || randomUUID().replaceAll('-', '')
+}
 
 export interface TelegramStreamGatewayFile {
   providerFileId: string
@@ -33,6 +44,8 @@ export interface TelegramStreamGatewayFile {
 export interface StreamOptions {
   disposition?: string
   range?: string | null
+  /** Caller-supplied correlation id; falls back to X-Request-Id, then a fresh id. */
+  requestId?: string
 }
 
 interface UpstreamResponse {
@@ -62,6 +75,12 @@ export class TelegramStreamGateway {
     res: Response,
     options: StreamOptions = {},
   ): Promise<void> {
+    // Correlation travels with the request so a torn stream can be traced
+    // through the service's JSON logs: echoed on every response, including
+    // errors, and forwarded upstream where stream.py reuses it verbatim.
+    const requestId = resolveRequestId(options.requestId ?? res.req?.get('x-request-id'))
+    res.setHeader('X-Request-Id', requestId)
+
     if (!isTelegramStreamConfigured()) {
       // No streaming service configured — surface a clear 503 so the
       // caller can decide whether to fall back to a full GET.
@@ -96,6 +115,7 @@ export class TelegramStreamGateway {
     const upstreamHeaders: Record<string, string> = {
       'X-Stream-Timestamp': String(ts),
       'X-Stream-Signature': signature,
+      'X-Request-Id': requestId,
     }
     if (range) upstreamHeaders['Range'] = range
 
@@ -122,6 +142,11 @@ export class TelegramStreamGateway {
     if (upstream.status < 200 || upstream.status >= 300) {
       const body = upstream.body ? await new Response(upstream.body).text() : ''
       if (upstream.status === 503) await mirrorReauthRequired(providerId, body)
+      // A 416 must keep `Content-Range: bytes */{total}` — it is the retry
+      // contract strict clients (rclone, ExoPlayer) depend on, not media
+      // metadata (audit §3.4).
+      const contentRange = upstream.headers.get('content-range')
+      if (contentRange) res.setHeader('Content-Range', contentRange)
       const upstreamContentType = upstream.headers.get('content-type')
       res.setHeader(
         'Content-Type',

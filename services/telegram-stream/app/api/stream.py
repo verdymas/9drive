@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 import uuid
 from typing import AsyncGenerator
 
@@ -167,6 +168,7 @@ async def stream(
 
     # Resolve BEFORE committing a status: a revoked session or a deleted
     # message must become 503/404, never a well-formed 206 carrying nothing.
+    resolve_started = time.perf_counter()
     try:
         client, location = await resolve_document(
             provider_id=providerId, channel_id=channelId, message_id=int(messageId or 0)
@@ -176,6 +178,8 @@ async def stream(
         raise
     except ValueError as exc:
         raise AppError("INVALID_MESSAGE_ID", "messageId must be an integer.", 400) from exc
+    metrics.resolve_ms = int((time.perf_counter() - resolve_started) * 1000)
+    metrics.dc_id = location.dc_id
 
     start, end = rng if rng is not None else (0, knownSize - 1)
     length = end - start + 1

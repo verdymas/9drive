@@ -9,11 +9,29 @@ from fastapi.responses import JSONResponse
 from app.api import health, stream
 from app.core.errors import AppError, register_error_handlers
 from app.core.config import settings
-from app.telegram.engine import clients
+from app.observability import emit
+from app.telegram.engine import clients, effective_request_size
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Log the config that matters once at boot (numbers only, no secrets) so a
+    # misconfigured chunk size can never silently change what is on the wire.
+    effective = effective_request_size()
+    if effective != settings.chunk_size_bytes:
+        emit(
+            "startup_warning",
+            # `code` is a redaction key; use the error_code convention.
+            warning_code="CHUNK_SIZE_CLAMPED",
+            configured_chunk_size_bytes=settings.chunk_size_bytes,
+            effective_request_size_bytes=effective,
+        )
+    emit(
+        "startup",
+        effective_request_size_bytes=effective,
+        resolver_ttl_seconds=settings.effective_resolver_ttl_seconds,
+        prefetch_depth_configured=settings.effective_prefetch_depth,
+    )
     yield
     await clients.shutdown()
 

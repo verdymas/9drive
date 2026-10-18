@@ -6,6 +6,7 @@ from fastapi import APIRouter
 # Import the module, not the names: `from ... import ACTIVE_STREAMS` binds the
 # int once at import and /ready would report 0 forever.
 from app import observability as obs
+from app.core.config import settings
 
 router = APIRouter()
 
@@ -29,4 +30,7 @@ async def ready() -> dict[str, object]:
         "total_cancellations": obs.TOTAL_CANCELLATIONS,
         "total_file_reference_refreshes": obs.TOTAL_FILE_REFERENCE_REFRESHES,
         "total_flood_waits": obs.TOTAL_FLOOD_WAITS,
+        "total_cdn_redirects": obs.TOTAL_CDN_REDIRECTS,
+        # P2 setting scaffolding: visible for operators, not consumed yet.
+        "prefetch_depth_configured": settings.effective_prefetch_depth,
     }

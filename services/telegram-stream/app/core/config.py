@@ -27,8 +27,28 @@ class Settings(BaseSettings):
     chunk_size_bytes: int = 512 * 1024
     log_level: str = "info"
 
+    # Read-ahead depth for `iter_bytes` (P2 in the roadmap). Parsed and
+    # clamped for /ready visibility, but NOT consumed by the data path yet:
+    # 0 keeps today's strictly sequential reads (one in-flight RPC per stream).
+    prefetch_depth: int = 0
+
+    # FileResolver cache TTL. Each miss costs two RPCs before the first byte,
+    # so high-latency links may want a longer TTL; invalidate-on-stale
+    # file_reference still overrides the TTL immediately.
+    resolver_ttl_seconds: int = 60
+
     # HMAC clock-skew window in seconds.
     signature_max_skew_seconds: int = 30
+
+    @property
+    def effective_prefetch_depth(self) -> int:
+        """Clamped view of `prefetch_depth` (P2 will consume this value)."""
+        return max(0, min(4, self.prefetch_depth))
+
+    @property
+    def effective_resolver_ttl_seconds(self) -> int:
+        """Clamped view of `resolver_ttl_seconds` (15-600)."""
+        return max(15, min(600, self.resolver_ttl_seconds))
 
 
 settings = Settings()
